@@ -23,7 +23,7 @@ level to ``SIGNED``, ``ANCHORED`` and ``WORM``. See ``docs/ARCHITECTURE.md`` sec
 
 Only the dependency-free surface is imported here. ``cryptography``, ``psycopg``,
 ``pymongo`` and the web frameworks are optional extras, so their modules are reachable by
-path (``signledger.crypto.signatures``, ``signledger.backends.postgres``, ...) but are
+path (``signledger.crypto.signatures``, ``signledger.backends.postgresql``, ...) but are
 never pulled in by ``import signledger``.
 """
 

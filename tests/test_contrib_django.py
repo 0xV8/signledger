@@ -11,7 +11,9 @@ The test that matters most here is
 does not match its models breaks every ``manage.py migrate`` that installs it.
 """
 
+import ast
 import json
+import pathlib
 from typing import Any, Dict, Iterator, List
 
 import django
@@ -37,6 +39,7 @@ if not settings.configured:
 
 from django.core.exceptions import ImproperlyConfigured  # noqa: E402
 from django.core.management import call_command  # noqa: E402
+from django.core.management.base import SystemCheckError  # noqa: E402
 from django.http import HttpResponse, JsonResponse  # noqa: E402
 from django.test import Client, override_settings  # noqa: E402
 from django.urls import path  # noqa: E402
@@ -105,8 +108,16 @@ def build_ledger() -> Ledger:
 
 @pytest.fixture(scope="session", autouse=True)
 def django_database() -> Iterator[None]:
-    """Apply the app's shipped migration to the in-memory database."""
-    call_command("migrate", verbosity=0, run_syncdb=False)
+    """Apply the app's shipped migration to the in-memory database.
+
+    Run under a valid configuration, and with ``skip_checks=False`` so this is the same
+    code path ``manage.py migrate`` takes - ``call_command`` alone defaults
+    ``skip_checks`` to ``True``, which the command line never does. ``migrate`` declares
+    ``requires_system_checks = "__all__"``, so this also proves the app's own check does
+    not break the migration a deployment has to run.
+    """
+    with audited():
+        call_command("migrate", verbosity=0, run_syncdb=False, skip_checks=False)
     yield
 
 
@@ -159,17 +170,21 @@ def test_makemigrations_detects_no_missing_migrations() -> None:
     """A shipped app whose migration does not match its models breaks every
     ``manage.py migrate`` that installs it."""
     try:
-        call_command(
-            "makemigrations", "signledger_django", check=True, dry_run=True, verbosity=0
-        )
+        with audited():
+            call_command(
+                "makemigrations",
+                "signledger_django",
+                check=True,
+                dry_run=True,
+                verbosity=0,
+                skip_checks=False,
+            )
     except SystemExit as exit_code:  # pragma: no cover - only on a real mismatch
         pytest.fail(f"models and shipped migrations disagree (exit {exit_code})")
 
 
 def test_the_initial_migration_ships_inside_the_package() -> None:
     """A migration that only exists in the repo is not a migration users get."""
-    import pathlib
-
     from signledger.contrib.django.migrations import __path__ as migrations_path
 
     assert (pathlib.Path(migrations_path[0]) / "0001_initial.py").is_file()
@@ -247,6 +262,135 @@ def test_resetting_releases_the_memoised_ledger() -> None:
 def test_an_unknown_audit_failure_policy_is_rejected() -> None:
     with audited(AUDIT_FAILURE_POLICY="maybe"), pytest.raises(ConfigurationError):
         Client().get("/items")
+
+
+# ======================================================================================
+# Django system checks
+#
+# A missing LEDGER_FACTORY is fatal: every single request 500s. Before this section
+# existed, ``manage.py check`` and ``manage.py migrate`` both reported success and the
+# operator found out from production traffic. The deliberately-late ``get_ledger()`` in
+# the middleware stays late - it has to, so a post-fork ``reset_ledger()`` is noticed -
+# so the *only* place this can be caught before traffic is a system check.
+# ======================================================================================
+
+
+def test_manage_py_check_fails_when_the_ledger_factory_is_missing() -> None:
+    """The headline of Defect G1: this used to exit 0 and 500 on every request."""
+    with override_settings(SIGNLEDGER={}), pytest.raises(SystemCheckError) as caught:
+        call_command("check")
+    assert "LEDGER_FACTORY" in str(caught.value)
+
+
+def test_manage_py_check_fails_when_signledger_is_not_configured_at_all() -> None:
+    with override_settings(SIGNLEDGER=None), pytest.raises(SystemCheckError):
+        call_command("check")
+
+
+def test_manage_py_check_fails_when_the_factory_path_does_not_import() -> None:
+    """A typo in the dotted path is as fatal as leaving the setting out."""
+    with override_settings(
+        SIGNLEDGER={"LEDGER_FACTORY": "myapp.audit.does_not_exist"}
+    ), pytest.raises(SystemCheckError):
+        call_command("check")
+
+
+def test_manage_py_check_fails_when_the_factory_is_neither_callable_nor_a_path() -> None:
+    """A built ledger assigned straight to the setting is a real mistake to make.
+
+    It is not callable and it has no ``rsplit``, so left to ``import_string`` it would
+    crash the check framework itself with an ``AttributeError``.
+    """
+    with override_settings(
+        SIGNLEDGER={"LEDGER_FACTORY": Ledger(backend=MemoryBackend())}
+    ), pytest.raises(SystemCheckError):
+        call_command("check")
+
+
+def test_manage_py_migrate_also_refuses_a_missing_ledger_factory() -> None:
+    """``migrate`` declares ``requires_system_checks = "__all__"``.
+
+    Deploy scripts run ``migrate`` far more reliably than they run ``check``, so this is
+    the one that actually stops a broken release. ``skip_checks=False`` because
+    ``call_command`` defaults it to ``True`` while ``manage.py`` leaves it ``False``;
+    without it this asserts nothing about what a deployment actually runs.
+    """
+    with override_settings(SIGNLEDGER={}), pytest.raises(SystemCheckError):
+        call_command("migrate", verbosity=0, run_syncdb=False, skip_checks=False)
+
+
+def test_manage_py_check_passes_with_a_working_factory() -> None:
+    with audited():
+        call_command("check")
+
+
+def test_manage_py_check_passes_with_a_dotted_path_factory() -> None:
+    with override_settings(
+        SIGNLEDGER={"LEDGER_FACTORY": "test_contrib_django.build_ledger"}
+    ):
+        call_command("check")
+
+
+def test_the_check_resolves_the_factory_without_calling_it() -> None:
+    """Checking must not build a ledger.
+
+    ``manage.py check`` runs in the master process, before any fork. Opening the audit
+    store here is the very hazard the late ``get_ledger()`` exists to avoid.
+    """
+    with audited():
+        call_command("check")
+        assert "ledger" not in CURRENT
+
+
+def test_the_check_runs_under_the_compatibility_tag() -> None:
+    """Registered with a tag so ``manage.py check -t compatibility`` includes it."""
+    with override_settings(SIGNLEDGER={}), pytest.raises(SystemCheckError):
+        call_command("check", tags=["compatibility"])
+
+
+def test_a_missing_factory_reports_one_silenceable_error_id() -> None:
+    """The id is the handle for ``SILENCED_SYSTEM_CHECKS``, so it is part of the API."""
+    from signledger.contrib.django.apps import check_ledger_factory
+
+    with override_settings(SIGNLEDGER={}):
+        assert [error.id for error in check_ledger_factory(None)] == [
+            "signledger_django.E001"
+        ]
+
+
+def test_an_unimportable_factory_has_its_own_error_id() -> None:
+    from signledger.contrib.django.apps import check_ledger_factory
+
+    with override_settings(SIGNLEDGER={"LEDGER_FACTORY": "myapp.audit.nope"}):
+        assert [error.id for error in check_ledger_factory(None)] == [
+            "signledger_django.E002"
+        ]
+
+
+def test_a_factory_of_the_wrong_type_has_its_own_error_id() -> None:
+    from signledger.contrib.django.apps import check_ledger_factory
+
+    with override_settings(SIGNLEDGER={"LEDGER_FACTORY": 42}):
+        assert [error.id for error in check_ledger_factory(None)] == [
+            "signledger_django.E003"
+        ]
+
+
+def test_the_check_reports_nothing_at_all_for_a_good_configuration() -> None:
+    from signledger.contrib.django.apps import check_ledger_factory
+
+    with audited():
+        assert check_ledger_factory(None) == []
+
+
+def test_the_check_never_echoes_the_configured_value_back() -> None:
+    """Contract section 10: a settings value can be a DSN with a password in it."""
+    from signledger.contrib.django.apps import check_ledger_factory
+
+    secret = "myapp.audit.postgres://user:hunter2@db/audit"
+    with override_settings(SIGNLEDGER={"LEDGER_FACTORY": secret}):
+        rendered = " ".join(str(error) for error in check_ledger_factory(None))
+    assert "hunter2" not in rendered
 
 
 # ======================================================================================
@@ -638,3 +782,46 @@ def test_an_index_row_names_its_chain_position_when_printed() -> None:
     with audited():
         Client().get("/items")
         assert str(AuditIndex.objects.get()).endswith("#0")
+
+
+# ======================================================================================
+# The fork hazard, documented in every integration rather than just this one
+#
+# This app's middleware has always carried a comment explaining why the ledger is looked
+# up per request: a ledger built before a WSGI server forks hands every worker the same
+# handle. Flask and FastAPI have the identical hazard and said nothing about it. Measured
+# with PostgreSQL under ``gunicorn --preload -w 4``: protocol desync, 60-second hangs,
+# and a ledger holding more entries than there were successful responses.
+#
+# These assertions live in the Django test module because that is where the warning that
+# was copied outward already had a home. They read the shipped source with ``ast`` rather
+# than importing, so they hold whether or not Flask and FastAPI are installed.
+# ======================================================================================
+
+#: Every integration whose ledger can outlive a fork, and therefore must warn about it.
+FORK_EXPOSED_MODULES = ["flask.py", "fastapi.py"]
+
+CONTRIB = pathlib.Path(__file__).resolve().parent.parent / "signledger" / "contrib"
+
+
+def module_docstring(filename: str) -> str:
+    source = (CONTRIB / filename).read_text(encoding="utf-8")
+    return (ast.get_docstring(ast.parse(source)) or "").lower()
+
+
+@pytest.mark.parametrize("filename", FORK_EXPOSED_MODULES)
+def test_the_integration_names_the_fork_hazard(filename: str) -> None:
+    assert "fork" in module_docstring(filename)
+
+
+@pytest.mark.parametrize("filename", FORK_EXPOSED_MODULES)
+def test_the_integration_names_the_flag_that_causes_it(filename: str) -> None:
+    """``--preload`` is the switch that turns this from unlikely into guaranteed."""
+    assert "preload" in module_docstring(filename)
+
+
+@pytest.mark.parametrize("filename", FORK_EXPOSED_MODULES)
+def test_the_fork_warning_says_what_to_do_instead(filename: str) -> None:
+    """A warning that only says "don't" leaves the reader with no next step."""
+    doc = module_docstring(filename)
+    assert "post-fork" in doc or "per worker" in doc or "per-worker" in doc

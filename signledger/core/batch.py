@@ -176,9 +176,20 @@ class BatchProcessor:
         # ledger's own chain and signer rather than a second configuration that could
         # drift out of step with it.
         self.backend = ledger.backend
-        self.ledger_id = ledger.ledger_id
         self._chain = ledger._chain
         self._signer = ledger._signer if ledger._enable_signatures else None
+
+    @property
+    def ledger_id(self) -> str:
+        """Read through to the ledger, never a snapshot.
+
+        This was a copy taken in ``__init__``. Once ``Ledger`` learned to adopt the store's
+        identity at cold start (:meth:`~signledger.core.ledger.Ledger._adopt_or_refuse`), a
+        processor built before that adoption held the abandoned id - so one ledger answered
+        two different identities depending on whether the caller went through ``append`` or
+        through a batch, and only the batch failed.
+        """
+        return str(self._ledger.ledger_id)
 
     def append_batch(
         self, items: Iterable[Union[BatchItem, Dict[str, Any]]]
@@ -293,9 +304,16 @@ class BatchProcessor:
         return self._finish(draft)
 
     def _reseal(self, entry: Entry, sequence: int, previous: Optional[str]) -> Entry:
-        """Re-link an already validated entry onto a tip that moved, and re-sign it."""
+        """Re-link an already validated entry onto a tip that moved, and re-sign it.
+
+        ``ledger_id`` is re-stamped along with the position. The tip moving is exactly the
+        moment an adoption can have happened, and an entry prepared under the identity this
+        process minted would otherwise be written into a chain that identity does not own -
+        stamped forever with a name the store never agreed to.
+        """
         draft = entry.model_copy(
             update={
+                "ledger_id": self.ledger_id,
                 "sequence": sequence,
                 "previous_hash": (
                     self._genesis(entry.timestamp) if previous is None else previous
@@ -348,6 +366,11 @@ class BatchProcessor:
                     committed,
                 ) from err
             committed.append(entry)
+            # The ledger now has a stake in this chain, so any later tip belonging to
+            # someone else is a fork rather than a cold start. Without this, a processor
+            # would keep adopting foreign identities forever and silently splice two
+            # independent logs - strictly worse than the refusal it replaced.
+            self._ledger._has_appended = True
             # Same bounded, off-thread queue ``Ledger.append`` uses. A subscriber must not
             # go blind because the caller switched to the bulk path, and it must not be
             # able to slow a batch down either.
@@ -362,16 +385,22 @@ class BatchProcessor:
                 actual, sequence = None, 0
             else:
                 if tip.ledger_id != self.ledger_id:
-                    # Two writers that each started against an empty store minted their
-                    # own identity and neither could detect the clash. Continuing another
-                    # ledger's chain under this one's identity splices two logs together,
-                    # and every hash in the result verifies perfectly.
-                    raise ConfigurationError(
-                        "the chain in this store belongs to a different ledger; refusing "
-                        "to continue it under this ledger's identity"
-                    )
+                    # Delegated, not duplicated. This used to be a verbatim copy of the
+                    # ledger's refusal, so when ``Ledger`` learned to adopt an identity it
+                    # minted itself and had not yet written under, the batch path kept
+                    # refusing - and the README's own bulk example stayed broken for every
+                    # worker that lost the race for entry zero.
+                    #
+                    # Continuing another ledger's chain under this one's identity splices
+                    # two logs together and every hash in the result verifies perfectly, so
+                    # the decision has to live in exactly one place.
+                    self._ledger._adopt_or_refuse(tip)
                 actual, sequence = tip.hash, tip.sequence + 1
-            if actual == step.predecessor:
+            if actual == step.predecessor and step.entry.ledger_id == self.ledger_id:
+                # The identity check is not redundant with the position check. An adoption
+                # a line above changes who this ledger is WITHOUT moving the tip, so the
+                # prepared entry can still sit at the right position while carrying the
+                # name this process invented and then gave up.
                 return step.entry
             # Another writer moved the tip between preparation and this transaction, so
             # the projection is stale. Re-link against what the transaction actually read

@@ -12,15 +12,27 @@ with the block's line number in the source file.
 Blocks that would need a live PostgreSQL, MongoDB or web server are not skipped by
 guesswork: nothing in the documented examples requires one, and if that changes, the
 example needs a marker rather than the test needing an exception.
+
+2.0.0 shipped with only the ``python`` fences covered, and the ``bash`` fences rotted
+exactly the way v1's Python did: the README documented ``export ... -o bundle.json``
+against a parser whose option was ``--bundle``, so the documented session exited 2 and
+then verified a bundle nothing had written. The command-line examples are executed too
+now, for the same reason the Python ones are.
 """
 
+import importlib
+import inspect
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 from typing import List, NamedTuple
 
 import pytest
+
+import signledger
+from signledger.cli import build_parser
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -78,6 +90,46 @@ def _python_blocks() -> List[Block]:
 
 
 PYTHON_BLOCKS = _python_blocks()
+
+
+#: Fence languages whose contents are shell commands.
+SHELL_LANGUAGES = frozenset({"bash", "console", "sh", "shell"})
+
+_SIGNLEDGER_LINE = re.compile(r"^\s*signledger\s+(\S.*)$")
+
+
+class Command(NamedTuple):
+    """One documented ``signledger`` invocation, split into argv."""
+
+    path: str
+    line: int
+    argv: List[str]
+
+    def __str__(self) -> str:  # what pytest prints as the parametrization id
+        return f"{self.path}:{self.line} signledger {' '.join(self.argv)}"
+
+
+def _documented_commands() -> List[Command]:
+    """Every ``signledger …`` line in a shell fence, with its 1-based source line.
+
+    Only lines that invoke ``signledger`` are collected, so the ``pip install`` and
+    ``pytest`` lines in the same fences are read and never run.
+    """
+    found: List[Command] = []
+    for name in DOC_FILES:
+        for block in _blocks(name):
+            if block.language not in SHELL_LANGUAGES:
+                continue
+            for offset, text in enumerate(block.source.splitlines(), start=1):
+                match = _SIGNLEDGER_LINE.match(text)
+                if match is not None:
+                    found.append(
+                        Command(name, block.line + offset, shlex.split(match.group(1)))
+                    )
+    return found
+
+
+DOCUMENTED_COMMANDS = _documented_commands()
 
 
 class TestDocumentedExamplesRun:
@@ -194,6 +246,29 @@ with Ledger() as ledger:
 print(result.ok, result.committed)
 """
         assert _run(source, tmp_path).stdout.strip().endswith("True 3")
+
+    def test_workers_sharing_one_ledger_id_write_one_verifiable_chain(
+        self, tmp_path: Path
+    ) -> None:
+        """The Deployment section's claim: one `ledger_id`, one chain, four entries."""
+        source = """
+import os, tempfile
+from signledger import Ledger
+from signledger.backends import SQLiteBackend
+
+store = os.path.join(tempfile.mkdtemp(), "audit.db")
+LEDGER_ID = "billing-api"
+
+for worker in range(4):
+    with Ledger(SQLiteBackend(store), ledger_id=LEDGER_ID) as ledger:
+        ledger.append({"worker": worker, "event": "request"})
+
+with Ledger(SQLiteBackend(store), ledger_id=LEDGER_ID) as ledger:
+    report = ledger.check_integrity()
+
+print(report.ok, report.entries_verified)
+"""
+        assert _run(source, tmp_path).stdout.strip().endswith("True 4")
 
 
 def _run(source: str, cwd: Path) -> subprocess.CompletedProcess:
@@ -325,3 +400,132 @@ class TestEveryShippedExampleRuns:
         }
         missing = sorted(name for name in called if not hasattr(Ledger, name))
         assert missing == []
+
+
+class TestDocumentedCommandLinesAreRealCommandLines:
+    """Parse every documented invocation, so a renamed flag cannot rot the docs quietly.
+
+    Cheap enough to run against every shell fence anywhere in the documentation, which
+    is the point: this catches a rename in a fence nothing else touches.
+    """
+
+    def test_the_documentation_contains_command_line_examples(self) -> None:
+        """Guards the sweep below: an empty list would make it pass vacuously."""
+        assert len(DOCUMENTED_COMMANDS) >= 6
+
+    @pytest.mark.parametrize("command", DOCUMENTED_COMMANDS, ids=str)
+    def test_the_documented_invocation_is_accepted_by_the_parser(
+        self, command: Command
+    ) -> None:
+        try:
+            namespace = build_parser().parse_args(command.argv)
+        except SystemExit as refusal:
+            raise AssertionError(
+                f"{command.path} line {command.line}: `signledger "
+                f"{' '.join(command.argv)}` is not a command line signledger accepts "
+                f"(argparse exited {refusal.code})"
+            ) from None
+
+        assert namespace.command == command.argv[0]
+
+
+class TestTheDocumentedCommandLineSessionRuns:
+    """Parsing is not running, so run the documented session end to end.
+
+    The README's command-line block is one session against one store: it checkpoints,
+    exports and then verifies the exported bundle. Running the lines in documented order
+    is what catches a command that parses, exits 2 for another reason, and leaves the
+    next line reading a file that was never written.
+
+    A future ``signledger`` line that needs state this seed does not create belongs
+    behind a marker, the same way a Python block that needs a live server would.
+    """
+
+    #: The store every documented command names. Three entries, so `verify` has
+    #: something to verify and `export` is not refused for being empty.
+    SEED = """
+from signledger.backends.sqlite import SQLiteBackend
+from signledger.core.ledger import Ledger
+
+with Ledger(SQLiteBackend("audit.db")) as ledger:
+    for index in range(3):
+        ledger.append({"event": "seed", "index": index})
+"""
+
+    def test_every_documented_command_exits_zero(self, tmp_path: Path) -> None:
+        _run(self.SEED, tmp_path)
+
+        for command in DOCUMENTED_COMMANDS:
+            result = subprocess.run(
+                [sys.executable, "-m", "signledger", *command.argv],
+                cwd=str(tmp_path),
+                env={**_env(), "PYTHONPATH": str(REPO_ROOT)},
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            assert result.returncode == 0, (
+                f"{command.path} line {command.line}: `signledger "
+                f"{' '.join(command.argv)}` exited {result.returncode}\n"
+                f"--- stderr ---\n{result.stderr}"
+            )
+
+
+class TestThePackageDocstringPointsAtModulesThatExist:
+    """``import signledger`` documents where the optional surfaces live. Check them.
+
+    The docstring sent readers to ``signledger.backends.postgres``. The module is
+    ``signledger.backends.postgresql``; the short alias was deliberately deleted, and
+    nothing noticed the docstring still named it. A dotted path in prose is the one kind
+    of import the interpreter never checks, so check it here instead.
+    """
+
+    #: Dotted paths in the package docstring. Every segment is lower case, so
+    #: ``signledger.crypto.signatures`` matches and ``signledger.Ledger`` does not.
+    DOTTED = re.compile(r"\bsignledger(?:\.[a-z_][a-z0-9_]*)+")
+
+    MODULE_PATHS = sorted(set(DOTTED.findall(signledger.__doc__ or "")))
+
+    def test_the_docstring_names_module_paths(self) -> None:
+        """Guards the sweep below, and guards against `python -OO` stripping it."""
+        assert len(self.MODULE_PATHS) >= 2
+
+    @pytest.mark.parametrize("dotted", MODULE_PATHS)
+    def test_the_module_path_can_be_imported(self, dotted: str) -> None:
+        importlib.import_module(dotted)
+
+
+class TestTheDeploymentSectionIsAnchoredToTheApi:
+    """Deployment guidance is a claim about the API, so check it against the API.
+
+    The numbers in that section came from measured server runs and nothing here can
+    re-measure them. What this can do is refuse to let the section point at a knob that
+    does not exist - which is precisely how v1's documentation went wrong.
+    """
+
+    HEADING = "## Deployment"
+
+    def _section(self) -> str:
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        assert self.HEADING in text, "the README documents no deployment guidance"
+        return text.split(self.HEADING, 1)[1].split("\n## ", 1)[0]
+
+    def test_the_readme_documents_how_to_deploy_it(self) -> None:
+        assert self._section().strip()
+
+    def test_the_deployment_section_names_the_argument_it_tells_you_to_pass(self) -> None:
+        assert "ledger_id" in self._section()
+
+    def test_that_argument_is_a_real_keyword_only_argument(self) -> None:
+        """`ledger_id=` is documented as a keyword. It has to actually be one."""
+        from signledger import Ledger
+
+        parameter = inspect.signature(Ledger.__init__).parameters["ledger_id"]
+
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_the_deployment_section_says_which_platform_the_numbers_came_from(
+        self,
+    ) -> None:
+        """An unqualified benchmark is the same defect as an unmeasured one."""
+        assert "macOS arm64" in self._section()

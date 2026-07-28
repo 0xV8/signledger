@@ -11,6 +11,20 @@ Three things here are not optional and each of them was a real v1 defect:
 
 Connections are per-thread and tracked in a lock-protected registry, so ``close()``
 really closes all of them rather than leaking every worker thread's handle.
+
+Four more were found by running the library rather than reading it, and each is held
+down by a test in ``tests/test_sqlite_concurrency.py``:
+
+* ``PRAGMA journal_mode = WAL`` is **not** covered by ``PRAGMA busy_timeout`` - SQLite
+  does not consult the busy handler for a journal-mode change - so four workers opening
+  one fresh file meant three of them raised. It is retried, and the mode the pragma
+  *answers with* is what decides success.
+* every ``PRAGMA`` cursor is closed. It holds an open statement, and on an interpreter
+  without refcounting that statement is still open at the first ``COMMIT``.
+* a constructor that gives up closes the connection it opened, rather than leaving an fd
+  for the cycle collector and a ``ResourceWarning`` for some unrelated test.
+* ``capabilities()`` probes for the append-only triggers instead of asserting them, and
+  the schema is never re-created around an entries table that already exists.
 """
 
 import sqlite3
@@ -85,6 +99,12 @@ _CHECKPOINT_COLUMNS: Tuple[str, ...] = (
 #: sqlite3 error text that means "another writer got there first", not "your data is bad".
 _CONFLICT_MARKERS = ("locked", "busy")
 
+#: The journal mode the backend runs in, and the answer ``PRAGMA journal_mode`` must give.
+_WAL_MODE = "wal"
+
+#: Suffixes of the two ``BEFORE`` triggers that make the entries table append-only.
+_APPEND_ONLY_TRIGGER_SUFFIXES = ("_no_update", "_no_delete")
+
 
 class SQLiteBackend:
     """A durable, append-only ledger store in a single SQLite database."""
@@ -102,6 +122,9 @@ class SQLiteBackend:
         self.entries_table = validate_identifier(entries_table, kind="entries table name")
         self.checkpoints_table = validate_identifier(
             checkpoints_table, kind="checkpoints table name"
+        )
+        self._trigger_names = frozenset(
+            f"{self.entries_table}{suffix}" for suffix in _APPEND_ONLY_TRIGGER_SUFFIXES
         )
         self.timeout = timeout
         self._closed = False
@@ -127,9 +150,18 @@ class SQLiteBackend:
             self._access_lock = _NullLock()
 
         first = self._open_connection()
-        with self._registry_lock:
-            self._connections[_SHARED_KEY if self._shared else threading.get_ident()] = first
-        self._create_schema(first)
+        try:
+            with self._registry_lock:
+                self._connections[_SHARED_KEY if self._shared else threading.get_ident()] = first
+            self._create_schema(first)
+        except BaseException:
+            # The caller never receives this instance, so nothing else can ever close
+            # ``first``. Left alone it holds an fd until the cycle collector runs and
+            # then raises ``ResourceWarning: unclosed database`` from inside whatever
+            # unrelated code was executing at the time - which, with
+            # ``filterwarnings = ["error"]``, is a red test somewhere else entirely.
+            self.close()
+            raise
 
     # -- connections -------------------------------------------------------------------
 
@@ -154,15 +186,55 @@ class SQLiteBackend:
             check_same_thread=False,
             isolation_level=None,  # we issue BEGIN IMMEDIATE / COMMIT ourselves
         )
+        try:
+            self._configure(connection)
+        except BaseException:
+            # Nothing holds this handle yet, so a pragma that raises would strand it.
+            connection.close()
+            raise
+        return connection
+
+    def _configure(self, connection: sqlite3.Connection) -> None:
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(f"PRAGMA busy_timeout = {int(self.timeout * 1000)}")
+        _pragma(connection, "PRAGMA foreign_keys = ON")
+        _pragma(connection, f"PRAGMA busy_timeout = {int(self.timeout * 1000)}")
         if not self._in_memory:
-            connection.execute("PRAGMA journal_mode = WAL")
+            self._enable_wal(connection)
             # WAL defaults to synchronous=NORMAL, which does not fsync on commit. The
             # backend advertises durable_fsync, so it must actually be durable.
-            connection.execute("PRAGMA synchronous = FULL")
-        return connection
+            _pragma(connection, "PRAGMA synchronous = FULL")
+
+    def _enable_wal(self, connection: sqlite3.Connection) -> None:
+        """Put the file into WAL mode, tolerating another process doing it right now.
+
+        SQLite does **not** run the busy handler for a journal-mode change, so the
+        ``busy_timeout`` set on the line above does not cover this statement: four
+        gunicorn workers starting together on one fresh file meant three of them got
+        SQLITE_BUSY straight out of ``__init__`` and the master never came up. The retry
+        is the same bounded, exponential one the append path uses - contention is not a
+        data error, it is someone else being first.
+
+        The pragma's *answer* is what decides success, not the absence of an exception.
+        Once any process has switched the file, every later ``PRAGMA journal_mode = WAL``
+        replies ``wal`` without needing the write lock at all: that is a win, not a race
+        to re-run. A store that replies with some other mode never switched, and running
+        a journal the backend does not advertise is exactly the silent divergence this
+        library exists to refuse.
+        """
+
+        def attempt() -> str:
+            return _pragma_value(connection, "PRAGMA journal_mode = WAL")
+
+        try:
+            mode = retry_on_conflict(attempt, _is_conflict)
+        except StorageError as err:
+            raise StorageError(
+                "open failed: the database file is locked by another writer"
+            ) from err
+        if mode != _WAL_MODE:
+            raise StorageError(
+                f"open failed: journal mode is {mode!r}, not {_WAL_MODE!r}"
+            )
 
     def _connection(self) -> sqlite3.Connection:
         """Return this thread's connection, opening and registering one if needed."""
@@ -192,8 +264,38 @@ class SQLiteBackend:
             self._create_schema_once(connection)
 
     def _create_schema_once(self, connection: sqlite3.Connection) -> None:
+        # One transaction, not ``executescript``. ``executescript`` commits between
+        # statements, so a second process opening the same fresh file could see the
+        # entries table after it was created but before its triggers landed - which is
+        # indistinguishable from a table whose triggers an insider removed. Wrapped in
+        # ``BEGIN IMMEDIATE`` the schema appears whole or not at all, and concurrent
+        # creators serialise on the write lock (which *is* covered by busy_timeout).
+        connection.execute("BEGIN IMMEDIATE").close()
+        try:
+            fresh = not _object_exists(connection, "table", self.entries_table)
+            for statement in self._schema_statements(fresh=fresh):
+                connection.execute(statement).close()
+        except BaseException:
+            connection.rollback()
+            raise
+        connection.commit()
+
+    def _schema_statements(self, *, fresh: bool) -> List[str]:
+        """The DDL for this store. Triggers only when the entries table is being made.
+
+        An entries table that already exists is not re-armed. ``CREATE TRIGGER IF NOT
+        EXISTS`` used to put the append-only triggers back on every open, which silently
+        repaired the single most informative piece of evidence a ledger can carry - that
+        somebody with DDL rights removed them. It is reported instead: the triggers stay
+        gone, :meth:`capabilities` stops claiming ``append_only_enforced``, and
+        ``assurance_level()`` therefore stops saying ``worm``.
+
+        Opening still *succeeds*, deliberately. Refusing would make a tampered ledger
+        unreadable by the one tool able to describe the damage, and ``signledger verify``
+        on exactly such a store is the flow this library exists for.
+        """
         entries, checkpoints = self.entries_table, self.checkpoints_table
-        connection.executescript(
+        statements = [
             f"""
             CREATE TABLE IF NOT EXISTS {entries} (
                 sequence            INTEGER NOT NULL,
@@ -213,11 +315,10 @@ class SQLiteBackend:
                 UNIQUE (previous_hash),
                 UNIQUE (entry_id),
                 UNIQUE (hash)
-            );
-
-            CREATE INDEX IF NOT EXISTS {entries}_timestamp_us
-                ON {entries} (timestamp_us);
-
+            )
+            """,
+            f"CREATE INDEX IF NOT EXISTS {entries}_timestamp_us ON {entries} (timestamp_us)",
+            f"""
             CREATE TABLE IF NOT EXISTS {checkpoints} (
                 ledger_id      TEXT    NOT NULL,
                 sequence       INTEGER NOT NULL,
@@ -229,23 +330,32 @@ class SQLiteBackend:
                 signature      TEXT,
                 key_id         TEXT,
                 format_version INTEGER NOT NULL
-            );
-
-            -- Append-only enforcement. A row that can be edited in place is not evidence
-            -- of anything, so the database itself refuses UPDATE and DELETE.
-            CREATE TRIGGER IF NOT EXISTS {entries}_no_update
-            BEFORE UPDATE ON {entries}
-            BEGIN
-                SELECT RAISE(ABORT, 'signledger: entries are append-only');
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS {entries}_no_delete
-            BEFORE DELETE ON {entries}
-            BEGIN
-                SELECT RAISE(ABORT, 'signledger: entries are append-only');
-            END;
-            """
-        )
+            )
+            """,
+        ]
+        if fresh:
+            # Append-only enforcement. A row that can be edited in place is not evidence
+            # of anything, so the database itself refuses UPDATE and DELETE. No
+            # ``IF NOT EXISTS``: the table was just created, so the only way one of these
+            # names is taken is that something else in the file already owns it, and a
+            # store that cannot arm its own triggers must say so rather than shrug.
+            statements += [
+                f"""
+                CREATE TRIGGER {entries}_no_update
+                BEFORE UPDATE ON {entries}
+                BEGIN
+                    SELECT RAISE(ABORT, 'signledger: entries are append-only');
+                END
+                """,
+                f"""
+                CREATE TRIGGER {entries}_no_delete
+                BEFORE DELETE ON {entries}
+                BEGIN
+                    SELECT RAISE(ABORT, 'signledger: entries are append-only');
+                END
+                """,
+            ]
+        return statements
 
     # -- append ------------------------------------------------------------------------
 
@@ -357,18 +467,46 @@ class SQLiteBackend:
     def size_bytes(self) -> int:
         """On-disk size of the database, pages included."""
         connection = self._connection()
-        page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
-        page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(_pragma_value(connection, "PRAGMA page_count"))
+        page_size = int(_pragma_value(connection, "PRAGMA page_size"))
         return page_count * page_size
 
     # -- capabilities ------------------------------------------------------------------
 
     def capabilities(self) -> FrozenSet[str]:
-        """Report what this deployment actually enforces, never what it aspires to."""
-        tokens = {CAP_ATOMIC_APPEND, CAP_UNIQUE_CHAIN_LINK, CAP_APPEND_ONLY_ENFORCED}
-        if not self._in_memory and _synchronous_is_durable(self._connection()):
-            tokens.add(CAP_DURABLE_FSYNC)
+        """Report what this deployment actually enforces, never what it aspires to.
+
+        Every token here is **probed**. ``append_only_enforced`` used to be asserted
+        unconditionally, one line above a properly probed ``durable_fsync``, so a store
+        whose triggers had been dropped still reported the top assurance level - a
+        library whose whole job is saying what its guarantees are worth, saying the wrong
+        thing about the one guarantee an insider can remove in a single statement.
+        """
+        tokens = {CAP_ATOMIC_APPEND, CAP_UNIQUE_CHAIN_LINK}
+        with _translating("capabilities"):
+            connection = self._connection()
+            if self._append_only_is_enforced(connection):
+                tokens.add(CAP_APPEND_ONLY_ENFORCED)
+            if not self._in_memory and _synchronous_is_durable(connection):
+                tokens.add(CAP_DURABLE_FSYNC)
         return frozenset(tokens)
+
+    def _append_only_is_enforced(self, connection: sqlite3.Connection) -> bool:
+        """True only when **both** append-only triggers are attached right now.
+
+        Half the guarantee is none of it: a table that refuses UPDATE but permits DELETE
+        is a table an insider can truncate, and truncation is the attack a bare hash
+        chain cannot see.
+        """
+        cursor = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+            (self.entries_table,),
+        )
+        try:
+            found = {str(row[0]) for row in cursor.fetchall()}
+        finally:
+            cursor.close()
+        return self._trigger_names <= found
 
     # -- checkpoints -------------------------------------------------------------------
 
@@ -500,9 +638,41 @@ def _is_conflict(err: BaseException) -> bool:
     return False
 
 
+def _pragma(connection: sqlite3.Connection, statement: str) -> None:
+    """Run a ``PRAGMA`` and close the cursor it hands back.
+
+    ``connection.execute`` returns a cursor whose statement is still open, and
+    ``PRAGMA journal_mode`` returns a row, so the statement really is mid-flight.
+    CPython's refcounting reclaims the cursor on the next line and hides that; PyPy does
+    not, and the first ``COMMIT`` fails with "cannot commit transaction - SQL statements
+    in progress" - every on-disk append, from the very first one.
+    """
+    connection.execute(statement).close()
+
+
+def _pragma_value(connection: sqlite3.Connection, statement: str) -> str:
+    """Run a ``PRAGMA``, return its single answer, and close the cursor either way."""
+    cursor = connection.execute(statement)
+    try:
+        return str(cursor.fetchone()[0]).lower()
+    finally:
+        cursor.close()
+
+
+def _object_exists(connection: sqlite3.Connection, kind: str, name: str) -> bool:
+    """True when the schema already holds an object of ``kind`` called ``name``."""
+    cursor = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1", (kind, name)
+    )
+    try:
+        return cursor.fetchone() is not None
+    finally:
+        cursor.close()
+
+
 def _synchronous_is_durable(connection: sqlite3.Connection) -> bool:
     """True when SQLite fsyncs on commit (``synchronous`` is FULL or EXTRA)."""
-    return int(connection.execute("PRAGMA synchronous").fetchone()[0]) >= 2
+    return int(_pragma_value(connection, "PRAGMA synchronous")) >= 2
 
 
 class _NullLock:

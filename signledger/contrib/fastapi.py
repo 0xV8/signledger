@@ -31,6 +31,54 @@ lets it observe the request body as the endpoint reads it, instead of draining t
 and leaving the endpoint with nothing - and what lets ``fail_closed`` actually work: the
 audit write happens *before* the response start is forwarded, because once the client has
 its status line nothing later can take it back.
+
+Build the ledger per worker, after the fork
+-------------------------------------------
+
+A ``Ledger`` owns live handles - a psycopg connection, a SQLite file descriptor. Those do
+not survive ``fork()`` being shared: the kernel duplicates the descriptor, so every worker
+ends up driving **one** connection. The snippet above builds the ledger at import time,
+which is safe only because ``uvicorn --workers`` imports the application separately in
+each worker. Run it under ``gunicorn -k uvicorn.workers.UvicornWorker --preload`` and it
+is built once in the master instead, before the fork, and every worker inherits it.
+Measured on PostgreSQL under ``gunicorn --preload -w 4``: protocol desync (``the last
+operation didn't produce records``), 60-second hangs, and a ledger holding more entries
+than there were successful responses.
+
+So: **construct the ledger inside an application factory**, which each worker runs for
+itself::
+
+    def create_app():
+        app = FastAPI()
+        app.add_middleware(
+            SignLedgerAuditMiddleware, ledger=Ledger(backend=SQLiteBackend("audit.db"))
+        )
+        return app
+
+    # uvicorn --factory myapp:create_app --workers 4
+
+If the application object has to exist before the fork - ``--preload``, or a module-level
+``app`` some tooling insists on - replace the ledger in a post-fork hook, so the inherited
+one is never used. ``add_middleware`` hands back no instance to reach, so wrap the app
+yourself; this middleware is plain ASGI, which is all ``--preload`` leaves you::
+
+    # myapp.py
+    api = FastAPI()
+    audit = SignLedgerAuditMiddleware(api, ledger=None)   # keep the handle
+    app = audit
+
+    # gunicorn.conf.py
+    preload_app = True
+
+    def post_fork(server, worker):
+        from myapp import audit
+        audit.recorder.ledger = Ledger(backend=SQLiteBackend("audit.db"))
+
+Until that hook runs the ledger is ``None`` and every request fails closed, which is the
+correct way round: a worker that cannot audit must not answer ``200``.
+
+The same applies to any pre-fork work: ``uwsgi`` without ``--lazy-apps``, and
+``os.fork()`` in a custom supervisor.
 """
 
 import functools

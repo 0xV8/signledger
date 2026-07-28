@@ -301,6 +301,87 @@ policy = RedactionPolicy()
 print(policy.payload({"user": "alice", "password": "hunter2"}))
 ```
 
+## Deployment
+
+Everything below was measured, on **macOS arm64** (CPython 3.12, gunicorn 26.0.0,
+uvicorn 0.51, PostgreSQL 14). There is no Linux measurement yet, so nothing here is
+claimed for Linux. Topologies that are not in the table were not tested.
+
+### Every worker must be given the same `ledger_id`
+
+`Ledger()` without `ledger_id=` mints one. That is fine for a single process and wrong
+for a pre-forked server: identity then depends on which worker reached an empty store
+first. Read one stable value from configuration and pass it in every worker.
+
+```python
+import os, tempfile
+from signledger import Ledger
+from signledger.backends import SQLiteBackend
+
+store = os.path.join(tempfile.mkdtemp(), "audit.db")
+LEDGER_ID = "billing-api"  # from config, identical in every worker
+
+for worker in range(4):  # what four workers each do, serialised here
+    with Ledger(SQLiteBackend(store), ledger_id=LEDGER_ID) as ledger:
+        ledger.append({"worker": worker, "event": "request"})
+
+with Ledger(SQLiteBackend(store), ledger_id=LEDGER_ID) as ledger:
+    report = ledger.check_integrity()
+
+print(report.ok, report.entries_verified)  # True 4
+```
+
+Every clean run in the table below started against a store that already held entry 0.
+Deploy the same way: create the ledger once, then start the workers.
+
+### Open the database connection inside the worker, never before the fork
+
+A PostgreSQL connection is not usable from more than one process. Under
+`gunicorn --preload` a module-level backend is created in the master and inherited by
+every child, which puts several processes on one socket. That configuration was measured
+and did not come out clean: failed appends and read timeouts, 139 of 300 requests served.
+The requirement holds whatever the backend does internally, because it is a property of
+`fork()` rather than of any pooling:
+
+- with gunicorn, either drop `--preload`, or build the backend in a `post_fork` hook;
+- uvicorn `--workers` was clean against PostgreSQL — each worker imports the application
+  itself instead of inheriting an open connection.
+
+SQLite is unaffected — `gunicorn --preload -w 8` on SQLite was clean at 800/800 — but
+the rule costs nothing there either.
+
+### Verified clean
+
+Chain verified means `check_integrity()` returned ok, sequences were contiguous from 0,
+one `ledger_id`, and no duplicate `sequence` or `previous_hash`.
+
+| Server | Workers | Store | Requests | 2xx | Chain |
+|---|---|---|---|---|---|
+| gunicorn / Flask | `-w 1 --threads 8` | SQLite | 300 | 300 | 300 verified |
+| gunicorn / Flask | `-w 4` | SQLite | 300 | 300 | 301 verified |
+| gunicorn / Flask | `-w 8` | SQLite | 800 | 800 | 801 verified |
+| gunicorn / Flask | `-w 12` | PostgreSQL | 300 | 300 | 301 verified |
+| uvicorn / FastAPI | `--workers 4` | SQLite | 300 | 300 | 301 verified |
+| uvicorn / FastAPI | `--workers 4` | PostgreSQL | 1000 | 1000 | 1001 verified |
+| gunicorn / Django | `-w 4` | PostgreSQL | 300 | 300 | 301 verified |
+
+The Django row also had 300 distinct rows in its `AuditIndex` table, each tying back to a
+chain hash.
+
+A cold start — `gunicorn -w 4` against a database file that **did not exist yet** — was
+also measured clean at 300/300. It was not, before: two separate defects meant four
+workers racing to create one store produced a total outage. Both are fixed and both are
+pinned by tests, but seeding the store first is still the cheaper habit.
+
+### Which store
+
+SQLite is a real answer for multi-worker on **one host**: the `-w 4` and `-w 8` rows above
+are separate processes writing one file, and the chain came out intact. It stops being an
+answer the moment a second host writes — a network filesystem does not give SQLite the
+locking it depends on.
+
+PostgreSQL is the answer across hosts, and the only one tested for that.
+
 ## Compatibility
 
 SemVer across three independent surfaces: the Python API, the on-disk schema, and the hash
@@ -333,7 +414,9 @@ PostgreSQL and MongoDB tests skip unless a live server is reachable; set
 `SIGNLEDGER_TEST_POSTGRES_DSN` / `SIGNLEDGER_TEST_MONGO_URI` to point at your own. Nothing
 in the suite mocks a database.
 
-Every fenced `python` block in this file is executed by `tests/test_docs_execute.py`.
+Every fenced `python` block in this file is executed by `tests/test_docs_execute.py`, and
+every `signledger` line in a `bash` block is parsed and run there too — a renamed flag
+breaks the suite instead of breaking the docs.
 
 Coverage is gated at 100% line *and* branch. That figure is only real with both databases
 running — without them 582 tests skip and it falls to ~91%, so CI runs them as services

@@ -1109,3 +1109,323 @@ def test_the_verifier_survives_a_backend_that_goes_away():
         assert instance._verifier.is_alive()
     finally:
         instance.close()
+
+
+# --------------------------------------------------------------------------------------
+# cold start: several processes, one empty store
+# --------------------------------------------------------------------------------------
+
+
+def _two_cold_started_ledgers(tmp_path):
+    """Two ledgers opened against the *same empty* store, each having minted its own id.
+
+    This is a `gunicorn -w 4` cold start, made deterministic: the race in production is
+    only about which worker reaches entry zero first, and here that is decided by the
+    order the test appends in rather than by the scheduler.
+    """
+    path = str(tmp_path / "ledger.db")
+    return Ledger(SQLiteBackend(path)), Ledger(SQLiteBackend(path))
+
+
+def test_two_cold_started_workers_start_out_disagreeing_about_the_identity(tmp_path):
+    """The premise of the whole defect: against an empty store there is nothing to adopt,
+    so every process invents a different uuid4."""
+    first, second = _two_cold_started_ledgers(tmp_path)
+    try:
+        assert first.ledger_id != second.ledger_id
+    finally:
+        first.close()
+        second.close()
+
+
+def test_a_worker_that_loses_the_race_to_entry_zero_can_still_append(tmp_path):
+    """Measured on 2.0.0: Flask + `gunicorn -w 4` + SQLite served 129 of 300 requests and
+    FastAPI + `uvicorn --workers 4` + PostgreSQL served exactly 75 of 300 - one worker
+    alive out of four. The three losers minted an id nobody had written, found a tip that
+    disagreed, and raised ConfigurationError on every append for the life of the process.
+    Nothing was actually wrong: the store simply already had a name."""
+    first, second = _two_cold_started_ledgers(tmp_path)
+    try:
+        second.append({"event": "second-wins-the-race"})
+
+        assert first.append({"event": "first-arrives-late"}).sequence == 1
+    finally:
+        first.close()
+        second.close()
+
+
+def test_the_loser_adopts_the_identity_the_store_ended_up_with(tmp_path):
+    first, second = _two_cold_started_ledgers(tmp_path)
+    try:
+        second.append({"event": "second-wins-the-race"})
+        first.append({"event": "first-arrives-late"})
+
+        assert first.ledger_id == second.ledger_id
+    finally:
+        first.close()
+        second.close()
+
+
+def test_the_repaired_workers_leave_exactly_one_contiguous_chain(tmp_path):
+    """The repair is only worth anything if the result is still one verifiable log."""
+    first, second = _two_cold_started_ledgers(tmp_path)
+    try:
+        second.append({"n": 0})
+        first.append({"n": 1})
+        second.append({"n": 2})
+        first.append({"n": 3})
+
+        entries = list(first.iter_entries())
+        assert [entry.sequence for entry in entries] == [0, 1, 2, 3]
+        assert len({entry.ledger_id for entry in entries}) == 1
+        assert first.check_integrity().ok
+        assert second.check_integrity().ok
+    finally:
+        first.close()
+        second.close()
+
+
+def test_the_repair_is_not_a_property_of_one_backend():
+    """Same story on any store: it is the ledger's identity that was frozen too early."""
+    store = MemoryBackend()
+    first, second = Ledger(store), Ledger(store)
+    try:
+        second.append({"n": 0})
+        first.append({"n": 1})
+
+        assert first.ledger_id == second.ledger_id
+        assert first.check_integrity().ok
+    finally:
+        first.close()
+        second.close()
+
+
+def test_a_ledger_id_the_caller_chose_is_never_silently_replaced(tmp_path):
+    """The fail-closed refusal is correct and stays. An operator who named this ledger
+    meant it, and adopting some other chain's identity would splice two logs into one
+    while every hash in the result stayed perfectly valid."""
+    path = str(tmp_path / "ledger.db")
+    writer = Ledger(SQLiteBackend(path))
+    claimant = Ledger(SQLiteBackend(path), ledger_id="ledger-of-record")
+    try:
+        writer.append({"event": "first"})
+
+        with pytest.raises(ConfigurationError):
+            claimant.append({"event": "second"})
+    finally:
+        claimant.close()
+        writer.close()
+
+
+def test_a_refused_ledger_keeps_the_identity_it_was_given(tmp_path):
+    path = str(tmp_path / "ledger.db")
+    writer = Ledger(SQLiteBackend(path))
+    claimant = Ledger(SQLiteBackend(path), ledger_id="ledger-of-record")
+    try:
+        writer.append({"event": "first"})
+        with pytest.raises(ConfigurationError):
+            claimant.append({"event": "second"})
+
+        assert claimant.ledger_id == "ledger-of-record"
+    finally:
+        claimant.close()
+        writer.close()
+
+
+def test_a_ledger_that_has_already_written_refuses_a_foreign_tip():
+    """The repair is for a worker that never wrote anything under its own name. A ledger
+    whose own entries are already in the store is looking at a chain that forked
+    underneath it, which is an integrity event and must stay loud."""
+    from datetime import datetime, timezone
+
+    from signledger.backends.base import build_next_entry
+    from signledger.crypto.hashing import HashChain
+
+    store = MemoryBackend()
+    instance = Ledger(store)
+    try:
+        instance.append({"n": 0})
+        store.append_atomic(
+            lambda tip: build_next_entry(
+                tip,
+                ledger_id="a-ledger-that-is-not-this-one",
+                created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                data={"n": 1},
+                chain=HashChain(),
+            )
+        )
+
+        with pytest.raises(ConfigurationError):
+            instance.append({"n": 2})
+    finally:
+        instance.close()
+
+
+def test_the_refusal_to_continue_a_foreign_chain_names_the_remedy(tmp_path):
+    """2.0.0 said only that it was refusing. An operator watching three of four workers
+    return 500 had nothing telling them to configure a stable ledger_id."""
+    path = str(tmp_path / "ledger.db")
+    writer = Ledger(SQLiteBackend(path))
+    claimant = Ledger(SQLiteBackend(path), ledger_id="ledger-of-record")
+    try:
+        writer.append({"event": "first"})
+
+        with pytest.raises(ConfigurationError) as raised:
+            claimant.append({"event": "second"})
+
+        assert "ledger_id=" in str(raised.value)
+        assert "every process" in str(raised.value)
+    finally:
+        claimant.close()
+        writer.close()
+
+
+def test_the_construction_time_refusal_names_the_remedy(tmp_path):
+    path = str(tmp_path / "ledger.db")
+    writer = Ledger(SQLiteBackend(path))
+    writer.append({"event": "first"})
+    writer.close()
+
+    with pytest.raises(ConfigurationError) as raised:
+        Ledger(SQLiteBackend(path), ledger_id="a-different-ledger")
+
+    assert "ledger_id=" in str(raised.value)
+    assert "every process" in str(raised.value)
+
+
+def test_a_refusal_to_continue_a_foreign_chain_never_quotes_a_payload(tmp_path):
+    """Contract section 10: no exception message may carry entry payload data."""
+    path = str(tmp_path / "ledger.db")
+    writer = Ledger(SQLiteBackend(path))
+    claimant = Ledger(SQLiteBackend(path), ledger_id="ledger-of-record")
+    try:
+        writer.append({"event": "first"})
+
+        with pytest.raises(ConfigurationError) as raised:
+            claimant.append({"cardholder": "4111111111111111"})
+
+        assert "4111111111111111" not in str(raised.value)
+        assert "cardholder" not in str(raised.value)
+    finally:
+        claimant.close()
+        writer.close()
+
+
+# --------------------------------------------------------------------------------------
+# a construction that fails still releases the store
+# --------------------------------------------------------------------------------------
+
+
+def test_a_construction_refused_by_the_store_closes_the_store(tmp_path):
+    """close() owns the backend, so a constructor that raises must not be the one path
+    that leaks it. Measured on 2.0.0: 227 descriptors held open across 1000 failed
+    constructions, because nothing ever closed the connection the ledger had adopted."""
+    from signledger.core.exceptions import StorageError
+
+    path = str(tmp_path / "ledger.db")
+    seed = Ledger(SQLiteBackend(path))
+    seed.append({"n": 0})
+    seed.close()
+
+    orphan = SQLiteBackend(path)
+    with pytest.raises(ConfigurationError):
+        Ledger(orphan, ledger_id="a-different-ledger")
+
+    with pytest.raises(StorageError):
+        orphan.count()
+
+
+def test_a_construction_refused_by_its_own_arguments_closes_the_store():
+    """The argument checks run before a single entry is written, but the store handed in
+    is already open by then - and only the ledger is left holding it."""
+    from signledger.core.exceptions import StorageError
+
+    store = MemoryBackend()
+    with pytest.raises(ConfigurationError):
+        Ledger(store, enable_signatures=True)
+
+    with pytest.raises(StorageError):
+        store.count()
+
+
+def test_a_construction_refused_for_its_hash_algorithm_closes_the_store():
+    from signledger.core.exceptions import StorageError
+
+    store = MemoryBackend()
+    with pytest.raises(ConfigurationError):
+        Ledger(store, hash_algorithm="md5")
+
+    with pytest.raises(StorageError):
+        store.count()
+
+
+@pytest.fixture
+def paired_postgres_stores():
+    """Two independent handles onto **one** freshly created PostgreSQL ledger store.
+
+    Two connections to one table pair is what four ``uvicorn`` workers are, minus the
+    scheduler. Nothing here is mocked - contract section 11 - and the tables are dropped
+    afterwards, or a full run leaves a pile of ``sl_*`` behind.
+    """
+    import os
+    import socket
+    import uuid
+    from urllib.parse import urlsplit
+
+    pytest.importorskip("psycopg", reason="psycopg (v3) is not installed")
+    import psycopg
+
+    from signledger.backends.postgresql import PostgresBackend
+
+    dsn = os.environ.get(
+        "SIGNLEDGER_TEST_POSTGRES_DSN",
+        "postgresql://postgres@localhost:5432/signledger_test",
+    )
+    parts = urlsplit(dsn)
+    host, port = parts.hostname or "localhost", parts.port or 5432
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            pass
+    except OSError as err:
+        pytest.skip(f"no live PostgreSQL server at {host}:{port} ({type(err).__name__})")
+    try:
+        psycopg.connect(dsn, connect_timeout=2).close()
+    except Exception as err:
+        pytest.skip(f"cannot connect to PostgreSQL at {host}:{port} ({type(err).__name__})")
+
+    table = "sl_" + uuid.uuid4().hex[:12]
+    entries, checkpoints = f"{table}_entries", f"{table}_checkpoints"
+    stores = [
+        PostgresBackend(dsn, entries_table=entries, checkpoints_table=checkpoints)
+        for _ in range(2)
+    ]
+    try:
+        yield stores
+    finally:
+        for store in stores:
+            store.close()
+        with psycopg.connect(dsn, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                for name in (entries, checkpoints, f"{table}_entries_state"):
+                    cursor.execute(f'DROP TABLE IF EXISTS "{name}" CASCADE')
+            connection.commit()
+
+
+@pytest.mark.postgres
+def test_a_cold_start_race_repairs_itself_on_postgresql(paired_postgres_stores):
+    """The deployment that was actually measured: FastAPI + `uvicorn --workers 4` +
+    PostgreSQL served exactly 75 of 300 requests - one worker in four, forever."""
+    first, second = (Ledger(store) for store in paired_postgres_stores)
+    try:
+        assert first.ledger_id != second.ledger_id
+
+        second.append({"n": 0})
+        first.append({"n": 1})
+        second.append({"n": 2})
+
+        assert first.ledger_id == second.ledger_id
+        assert [entry.sequence for entry in first.iter_entries()] == [0, 1, 2]
+        assert first.check_integrity().ok
+    finally:
+        first.close()
+        second.close()

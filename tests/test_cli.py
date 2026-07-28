@@ -24,6 +24,7 @@ from signledger.cli import (
     EXIT_INVALID,
     EXIT_OK,
     MIGRATION_FORMAT,
+    build_parser,
     find_forks,
     main,
     migration_signing_payload,
@@ -1313,6 +1314,45 @@ def test_exporting_a_ledger_writes_the_bundle_file(tmp_path: Any, capsys: Any) -
     code, _, _ = run(["export", "--backend", sqlite_uri(path), "--bundle", str(bundle)], capsys)
 
     assert (code, bundle.exists()) == (EXIT_OK, True)
+
+
+def test_the_short_output_flag_names_the_bundle(tmp_path: Any, capsys: Any) -> None:
+    """``-o`` is the flag the published README documents, so it has to be a flag.
+
+    1.0.0's README named an option that did not exist; readers copying the line got
+    ``exit 2`` and then a ``verify-bundle`` on a file nothing had written.
+    """
+    path = tmp_path / "ledger.db"
+    bundle = tmp_path / "bundle.json"
+    write_ledger(path, count=3)
+
+    code, _, _ = run(["export", "--backend", sqlite_uri(path), "-o", str(bundle)], capsys)
+
+    assert (code, bundle.exists()) == (EXIT_OK, True)
+
+
+def test_the_short_output_flag_is_the_same_option_as_bundle() -> None:
+    """An alias that lands in a different attribute is a second bug, not a fix."""
+    parser = build_parser()
+
+    short = parser.parse_args(["export", "-b", "memory://", "-o", "written.json"])
+    long = parser.parse_args(["export", "-b", "memory://", "--bundle", "written.json"])
+
+    assert (short.bundle, long.bundle) == ("written.json", "written.json")
+
+
+def test_a_bundle_written_by_the_short_flag_verifies_offline(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """The README's next line is ``verify-bundle bundle.json``; it must find one."""
+    path = tmp_path / "ledger.db"
+    bundle = tmp_path / "bundle.json"
+    write_ledger(path, count=3)
+    run(["export", "--backend", sqlite_uri(path), "-o", str(bundle)], capsys)
+
+    code, _, _ = run(["verify-bundle", str(bundle)], capsys)
+
+    assert code == EXIT_OK
 
 
 def test_a_bundle_declares_the_format_it_is_written_in(tmp_path: Any, capsys: Any) -> None:

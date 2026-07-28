@@ -21,6 +21,43 @@ What v1 got wrong here, and what is different:
   ledger, and body capture is off unless asked for.
 * A failed audit write fails the request by default. An unaudited request that returns
   ``200`` is a silent hole in the trail.
+
+Build the ledger per worker, after the fork
+-------------------------------------------
+
+A ``Ledger`` owns live handles - a psycopg connection, a SQLite file descriptor. Those do
+not survive ``fork()`` being shared: the kernel duplicates the descriptor, so every worker
+ends up driving **one** connection. The snippet above builds the ledger at import time,
+which is safe only because gunicorn imports the application separately in each worker.
+Add ``--preload`` and it is built once in the master instead, before the fork, and every
+worker inherits it. Measured on PostgreSQL under ``gunicorn --preload -w 4``: protocol
+desync (``the last operation didn't produce records``), 60-second hangs, and a ledger
+holding more entries than there were successful responses.
+
+So: **construct the ledger inside an application factory**, which each worker runs for
+itself::
+
+    def create_app():
+        app = Flask(__name__)
+        SignLedgerAudit(app, ledger=Ledger(backend=SQLiteBackend("audit.db")))
+        return app
+
+    # gunicorn "create_app()"
+
+If the application object has to exist before the fork - ``--preload``, or a module-level
+``app`` some tooling insists on - replace the ledger in a post-fork hook, so the inherited
+one is never used::
+
+    # gunicorn.conf.py
+    preload_app = True
+
+    def post_fork(server, worker):
+        from myapp import app
+        audit = app.extensions["signledger"]
+        audit.recorder.ledger = Ledger(backend=SQLiteBackend("audit.db"))
+
+The same applies to any pre-fork work: ``uwsgi`` without ``--lazy-apps``, and
+``os.fork()`` in a custom supervisor.
 """
 
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple

@@ -20,10 +20,21 @@ Every decision below is a v1 defect that had to stop being possible.
 * **A connection is rolled back before it goes back to the pool, on every path.** v1
   returned connections still carrying a failed transaction, so the next borrower inherited
   ``current transaction is aborted`` and the ledger wedged.
+* **Schema creation holds the same advisory lock the append path holds**, and the
+  append-only guard is only created when it is absent. ``IF NOT EXISTS`` is a check, not a
+  lock: eight processes starting together raced on ``pg_type`` with the tables missing and
+  deadlocked on ``pg_proc`` with them present, and both escaped as *raw psycopg
+  exceptions* rather than ``StorageError``.
+* **The pool knows which process opened its sockets.** ``os.fork()`` duplicates
+  descriptors, so ``gunicorn --preload`` gave four workers one set of TCP connections and
+  they interleaved the wire protocol: hung requests, rows delivered to the wrong query, and
+  a ledger holding more entries than there were acknowledged appends. A child disowns what
+  it inherited - without closing it, which would kill the parent's session too.
 * **``ORDER BY sequence``**, never ``ORDER BY timestamp``.
 """
 
 import hashlib
+import os
 import threading
 from contextlib import contextmanager
 from datetime import datetime
@@ -106,12 +117,29 @@ _DURABLE_COMMIT_MODES = frozenset({"on", "remote_apply", "remote_write", "local"
 # --------------------------------------------------------------------------------------
 
 
+#: Sockets this process inherited from a parent across ``os.fork()`` and has disowned.
+#:
+#: They are held forever, on purpose. The file descriptors belong to the parent as much as
+#: to the child, so letting libpq finalise one would send a real termination message down a
+#: session the parent is still using - the same damage :meth:`_ConnectionPool.putconn` with
+#: ``discard=True`` would do. Forgetting them is not enough; they have to be *kept* and
+#: never touched. The cost is bounded by ``maxconn`` per fork, and a worker forks once.
+_INHERITED_SOCKETS: List[psycopg.Connection] = []
+
+
 class _ConnectionPool:
     """A bounded, thread-safe pool of PostgreSQL connections.
 
     Threaded, not "simple": every operation is guarded by a condition variable, so two
     worker threads cannot be handed the same connection. v1 used a non-threadsafe pool
     from a threaded web server, which interleaves two transactions on one socket.
+
+    **And fork-aware.** A condition variable stops two *threads* sharing a socket; it says
+    nothing about two *processes*. ``gunicorn --preload`` builds the pool once and forks
+    the workers onto it, so every worker held the same descriptors and interleaved its
+    wire protocol with three siblings: measured, that was 60-second hung requests, rows
+    from one process's query arriving for another's, and a ledger holding 266 entries
+    against 139 acknowledged appends.
     """
 
     def __init__(self, dsn: str, *, minconn: int = 1, maxconn: int = 8, **kwargs: Any) -> None:
@@ -130,6 +158,8 @@ class _ConnectionPool:
         self._idle: List[psycopg.Connection] = []
         self._opened = 0
         self._closed = False
+        #: The process these sockets were opened in. Anything else means a fork happened.
+        self._pid = os.getpid()
         for _ in range(minconn):
             self._idle.append(self._connect())
             self._opened += 1
@@ -139,8 +169,35 @@ class _ConnectionPool:
         # that happen to run next to each other.
         return psycopg.connect(self._dsn, autocommit=False, **self._kwargs)
 
+    def _discard_inherited(self) -> None:
+        """Disown every pooled socket when this is not the process that opened them.
+
+        Called with ``self._condition`` held. ``os.fork()`` duplicates descriptors rather
+        than connections, so parent and child end up writing to one TCP stream and the
+        PostgreSQL wire protocol - request/response, strictly ordered - loses track of
+        which reply belongs to whom.
+
+        The sockets are dropped, never closed. Closing one sends a termination message the
+        server acts on, killing a session the parent is still using; the child simply
+        stops using them and opens its own. The counters reset to zero because the
+        connections other *threads* had checked out in the parent do not exist here: fork
+        keeps only the calling thread.
+
+        The one case this cannot cover is a connection checked out *across* the fork - a
+        ``os.fork()`` from inside :meth:`PostgresBackend._borrow`. Fork between requests,
+        which is what every pre-forking server does, never does that.
+        """
+        pid = os.getpid()
+        if pid == self._pid:
+            return
+        self._pid = pid
+        _INHERITED_SOCKETS.extend(self._idle)
+        self._idle.clear()
+        self._opened = 0
+
     def getconn(self) -> psycopg.Connection:
         with self._condition:
+            self._discard_inherited()
             while True:
                 if self._closed:
                     raise StorageError("backend is closed")
@@ -174,6 +231,9 @@ class _ConnectionPool:
     def closeall(self) -> None:
         with self._condition:
             self._closed = True
+            # A worker that never served a request still shuts down, and closing a socket
+            # it only inherited would take the parent's session down with it.
+            self._discard_inherited()
             idle, self._idle = self._idle, []
             self._opened -= len(idle)
             self._condition.notify_all()
@@ -226,7 +286,8 @@ class PostgresBackend:
                 dsn, minconn=minconn, maxconn=maxconn, connect_timeout=connect_timeout
             )
         try:
-            self._create_schema()
+            with _translating("create_schema"):
+                self._create_schema()
         except BaseException:
             self._pool.closeall()
             raise
@@ -298,9 +359,20 @@ class PostgresBackend:
     # -- schema ------------------------------------------------------------------------
 
     def _create_schema(self) -> None:
+        """Create the two tables, the index and the append-only guard, once.
+
+        The whole thing runs under the *same* advisory lock the append path takes, because
+        ``IF NOT EXISTS`` is a check, not a lock: two processes both find the table absent,
+        both insert into ``pg_type``, and the loser gets ``UniqueViolation`` on
+        ``pg_type_typname_nsp_index``. The DDL path was the one place ``_lock_key`` was
+        not used, and two workers starting together failed 15 constructions out of 20.
+        """
         entries = sql.Identifier(self.entries_table)
         checkpoints = sql.Identifier(self.checkpoints_table)
         with self._borrow() as connection, connection.cursor() as cur:
+            # Transaction-scoped: COMMIT and ROLLBACK both release it, so a construction
+            # that raises cannot leave the lock held on a connection the pool reuses.
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (self._lock_key,))
             cur.execute(
                 sql.SQL(
                     """
@@ -363,7 +435,17 @@ class PostgresBackend:
         discards* the statement, so a delete an auditor believes was refused reports
         success. A ``BEFORE`` trigger that raises is the same prohibition that also tells
         the truth, so that is what ships.
+
+        Idempotent, and that is load-bearing. ``DROP TRIGGER`` takes ACCESS EXCLUSIVE on
+        the entries table, so re-running it on every construction made a *new* worker's
+        start-up wait on any in-flight append, and two workers starting together deadlock
+        against each other on ``pg_proc``. A guard that is already attached is left exactly
+        where it is - the trigger keeps its OID and no exclusive lock is ever requested.
+        The consequence to know about: changing the guard's body in a future release will
+        need an explicit migration, because an existing trigger is never replaced here.
         """
+        if self._append_only_trigger_exists(cur):
+            return
         cur.execute(
             sql.SQL(
                 """

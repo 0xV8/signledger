@@ -1339,7 +1339,11 @@ def build_parser() -> argparse.ArgumentParser:
         "export", parents=[store], help="write a self-contained, offline-verifiable bundle"
     )
     export.add_argument(
-        "--bundle", required=True, metavar="PATH", help="where to write the bundle"
+        "-o",
+        "--bundle",
+        required=True,
+        metavar="PATH",
+        help="where to write the bundle",
     )
     export.add_argument(
         "--key",

@@ -1224,3 +1224,498 @@ class TestSessionTimezoneValidation:
 
         with pytest.raises(StorageError):
             pg_backend.set_session_timezone("Asia/Kolkata")
+
+
+# --------------------------------------------------------------------------------------
+# concurrent schema creation
+# --------------------------------------------------------------------------------------
+
+
+def _guarded_conninfo(dsn: str, milliseconds: int) -> str:
+    """``dsn`` with a server-side ``lock_timeout``.
+
+    A test that proves a statement *waits* for a lock has to bound the wait, or a red
+    test hangs the suite instead of reporting. ``make_conninfo`` accepts either the URL
+    or the keyword form, so this works whichever shape the developer's DSN has.
+    """
+    return psycopg.conninfo.make_conninfo(dsn, options=f"-c lock_timeout={milliseconds}ms")
+
+
+def _trigger_identity(dsn: str, table: str, trigger: str):
+    """``(pg_trigger.oid, tgfoid)`` for the append-only guard on ``table``.
+
+    ``CREATE OR REPLACE FUNCTION`` keeps a function's OID, but ``DROP TRIGGER`` followed
+    by ``CREATE TRIGGER`` always mints a new trigger OID - so the OID is exactly the
+    observable that says whether the guard was recreated or left alone.
+    """
+    with _raw(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT t.oid, t.tgfoid FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+            "WHERE c.relname = %s AND t.tgname = %s AND NOT t.tgisinternal",
+            (table, trigger),
+        )
+        return cur.fetchone()
+
+
+class TestSchemaCreationIsConcurrencySafe:
+    """Two processes constructing a backend on one pair of tables.
+
+    Measured before the fix: with the tables absent, ``CREATE TABLE IF NOT EXISTS`` races
+    on ``pg_type_typname_nsp_index`` and raises ``UniqueViolation``; with them present, the
+    unconditional ``CREATE OR REPLACE FUNCTION`` / ``DROP TRIGGER`` / ``CREATE TRIGGER``
+    deadlocks. Both escaped as *raw psycopg exceptions*, which contract section 4 forbids.
+    """
+
+    def test_a_driver_error_while_creating_the_schema_is_a_storage_error(
+        self, pg_dsn: str, table_prefix: str
+    ) -> None:
+        """Contract section 4: every backend failure is a ``StorageError``.
+
+        A table already holding the entries name but not the ``timestamp_us`` column makes
+        ``CREATE INDEX IF NOT EXISTS`` fail deterministically - the same class of driver
+        error the concurrent constructions raise, without the race.
+        """
+        from signledger.core.exceptions import SignLedgerError, StorageError
+
+        entries = f"{table_prefix}_entries"
+        with _raw(pg_dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                psycopg.sql.SQL("CREATE TABLE {} (sequence BIGINT)").format(
+                    psycopg.sql.Identifier(entries)
+                )
+            )
+
+        from signledger.backends.postgresql import PostgresBackend
+
+        with pytest.raises(StorageError) as caught:
+            PostgresBackend(
+                pg_dsn,
+                entries_table=entries,
+                checkpoints_table=f"{table_prefix}_checkpoints",
+            )
+
+        assert isinstance(caught.value, SignLedgerError)
+        assert "timestamp_us" not in str(caught.value)
+        assert pg_dsn not in str(caught.value)
+
+    def test_schema_creation_serialises_on_the_table_advisory_lock(
+        self, pg_dsn: str, table_prefix: str
+    ) -> None:
+        """The DDL path must take the same lock the append path takes.
+
+        Held explicitly from a second session rather than raced against N workers: a
+        flaky concurrency test trains people to ignore red.
+        """
+        from signledger.backends.postgresql import PostgresBackend, _advisory_key
+        from signledger.core.exceptions import StorageError
+
+        entries = f"{table_prefix}_entries"
+        key = _advisory_key(entries)
+        holder = psycopg.connect(pg_dsn, autocommit=True)
+        try:
+            holder.execute("SELECT pg_advisory_lock(%s)", (key,))
+
+            with pytest.raises(StorageError):
+                PostgresBackend(
+                    _guarded_conninfo(pg_dsn, 1500),
+                    entries_table=entries,
+                    checkpoints_table=f"{table_prefix}_checkpoints",
+                )
+
+            holder.execute("SELECT pg_advisory_unlock(%s)", (key,))
+            backend = PostgresBackend(
+                _guarded_conninfo(pg_dsn, 1500),
+                entries_table=entries,
+                checkpoints_table=f"{table_prefix}_checkpoints",
+            )
+            try:
+                assert backend.count() == 0
+            finally:
+                backend.close()
+        finally:
+            holder.close()
+
+    def test_reconstructing_a_backend_leaves_the_existing_guard_untouched(
+        self, pg_dsn: str, table_prefix: str
+    ) -> None:
+        """A restarted worker must not drop and recreate a trigger that is already there.
+
+        Recreating it takes ACCESS EXCLUSIVE on the entries table, which is what turned a
+        second worker's start-up into a deadlock against the first one's.
+        """
+        from signledger.backends.postgresql import PostgresBackend
+
+        entries = f"{table_prefix}_entries"
+        first = PostgresBackend(
+            pg_dsn, entries_table=entries, checkpoints_table=f"{table_prefix}_checkpoints"
+        )
+        try:
+            before = _trigger_identity(pg_dsn, entries, first.append_only_trigger)
+            second = PostgresBackend(
+                pg_dsn, entries_table=entries, checkpoints_table=f"{table_prefix}_checkpoints"
+            )
+            try:
+                after = _trigger_identity(pg_dsn, entries, second.append_only_trigger)
+            finally:
+                second.close()
+        finally:
+            first.close()
+
+        assert before is not None
+        assert after == before
+
+    def test_a_backend_starts_while_another_session_is_reading_the_entries_table(
+        self, pg_dsn: str, table_prefix: str
+    ) -> None:
+        """Starting a worker must not need an exclusive lock on a live ledger.
+
+        ``DROP TRIGGER`` requires ACCESS EXCLUSIVE, so an open reader - an in-flight
+        append, a long report - was enough to stall every new process indefinitely.
+        """
+        from signledger.backends.postgresql import PostgresBackend
+
+        entries = f"{table_prefix}_entries"
+        first = PostgresBackend(
+            pg_dsn, entries_table=entries, checkpoints_table=f"{table_prefix}_checkpoints"
+        )
+        reader = psycopg.connect(pg_dsn)
+        try:
+            append(first)
+            # An ordinary reader: an open transaction holding ACCESS SHARE on the table.
+            reader.execute(
+                psycopg.sql.SQL("SELECT count(*) FROM {}").format(
+                    psycopg.sql.Identifier(entries)
+                )
+            )
+
+            second = PostgresBackend(
+                _guarded_conninfo(pg_dsn, 2000),
+                entries_table=entries,
+                checkpoints_table=f"{table_prefix}_checkpoints",
+            )
+            try:
+                assert second.count() == 1
+            finally:
+                second.close()
+        finally:
+            reader.rollback()
+            reader.close()
+            first.close()
+
+    def test_a_guard_that_has_been_dropped_is_recreated(
+        self, pg_dsn: str, table_prefix: str
+    ) -> None:
+        """Skipping recreation must not mean *never* creating it.
+
+        An operator who dropped the trigger gets it back on the next start, and
+        ``capabilities()`` reads it out of the catalog rather than asserting it.
+        """
+        from signledger.backends.postgresql import PostgresBackend
+
+        entries = f"{table_prefix}_entries"
+        first = PostgresBackend(
+            pg_dsn, entries_table=entries, checkpoints_table=f"{table_prefix}_checkpoints"
+        )
+        try:
+            with _raw(pg_dsn) as conn, conn.cursor() as cur:
+                cur.execute(
+                    psycopg.sql.SQL("DROP TRIGGER {} ON {}").format(
+                        psycopg.sql.Identifier(first.append_only_trigger),
+                        psycopg.sql.Identifier(entries),
+                    )
+                )
+            assert CAP_APPEND_ONLY_ENFORCED not in first.capabilities()
+
+            second = PostgresBackend(
+                pg_dsn, entries_table=entries, checkpoints_table=f"{table_prefix}_checkpoints"
+            )
+            try:
+                assert CAP_APPEND_ONLY_ENFORCED in second.capabilities()
+            finally:
+                second.close()
+        finally:
+            first.close()
+
+
+# --------------------------------------------------------------------------------------
+# fork safety
+# --------------------------------------------------------------------------------------
+
+
+def _in_forked_child(work) -> str:
+    """Run ``work()`` in a real forked child and return the string it reported.
+
+    ``os.fork`` and not ``multiprocessing``: the defect *is* the inheritance. ``spawn``
+    starts a clean interpreter and would prove nothing, while ``fork`` is exactly what
+    ``gunicorn --preload -w 4`` does to a pool built at import time.
+
+    The child reports over a pipe and leaves with ``os._exit``, so no ``atexit`` hook,
+    finaliser or pytest teardown in the child can touch a socket the parent still owns.
+    """
+    import os
+
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            message = work()
+        except BaseException as err:  # noqa: BLE001 - reported to the parent, then asserted
+            message = f"error={type(err).__name__}: {err}"
+        try:
+            os.write(write_fd, message.encode("utf-8", "replace"))
+        finally:
+            os._exit(0)
+    os.close(write_fd)
+    chunks = []
+    while True:
+        chunk = os.read(read_fd, 4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.close(read_fd)
+    _, status = os.waitpid(pid, 0)
+    assert status == 0, f"child exited with status {status}"
+    return b"".join(chunks).decode("utf-8")
+
+
+@pytest.fixture
+def orphaned_sockets():
+    """The module-level list of sockets a process disowned after finding itself forked.
+
+    In production that list is never emptied - the sockets belong to the parent and
+    letting libpq finalise one would send a real termination message down it. In-process
+    the connections really are this process's own, so the fixture closes the ones a test
+    added rather than leaking a socket per test at the server.
+    """
+    from signledger.backends import postgresql
+
+    kept = postgresql._INHERITED_SOCKETS
+    start = len(kept)
+    yield kept
+    while len(kept) > start:
+        kept.pop().close()
+
+
+class TestForkSafety:
+    """``gunicorn --preload -w 4`` builds the pool once and forks four workers onto it.
+
+    Measured before the fix: every worker held the *same* psycopg TCP sockets, so two
+    processes interleaved their wire protocol. 60-second hung requests, a raw ``KeyError``
+    out of ``entry_from_row`` on a row that belonged to another process's query, and a
+    ledger holding 266 entries against 139 acknowledged appends - silent corruption. The
+    same flag over SQLite was clean, so it is the pool, not ``--preload``.
+    """
+
+    def test_a_pool_that_wakes_up_in_a_new_process_forgets_its_inherited_sockets(
+        self, pg_backend, orphaned_sockets
+    ) -> None:
+        """The pid change is simulated rather than forked so the assertions can be made
+        in a process whose failures pytest can actually report."""
+        pool = pg_backend._pool
+        inherited = pool.getconn()
+        pool.putconn(inherited)
+        pool._pid += 1
+
+        fresh = pool.getconn()
+        try:
+            assert fresh is not inherited
+            assert pool.opened_count == 1
+        finally:
+            pool.putconn(fresh)
+
+        assert inherited in orphaned_sockets
+
+    def test_an_inherited_socket_is_dropped_and_never_closed(
+        self, pg_backend, orphaned_sockets
+    ) -> None:
+        """``close()`` on an inherited socket sends a real termination message to a server
+        session the parent is still using, which kills the parent too."""
+        pool = pg_backend._pool
+        inherited = pool.getconn()
+        pool.putconn(inherited)
+        pool._pid += 1
+
+        pool.putconn(pool.getconn())
+
+        assert not inherited.closed
+        with inherited.cursor() as cur:
+            cur.execute("SELECT 1")
+            assert cur.fetchone()[0] == 1
+
+    def test_closing_a_pool_in_a_new_process_does_not_close_inherited_sockets(
+        self, pg_backend, orphaned_sockets
+    ) -> None:
+        """A worker that never served a request still runs ``close()`` on the way out."""
+        pool = pg_backend._pool
+        inherited = pool.getconn()
+        pool.putconn(inherited)
+        pool._pid += 1
+
+        pool.closeall()
+
+        assert not inherited.closed
+        assert inherited in orphaned_sockets
+        assert pool.opened_count == 0
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_a_forked_child_does_not_reuse_the_parents_connection(self, pg_backend) -> None:
+        pool = pg_backend._pool
+        parent_connection = pool.getconn()
+        pool.putconn(parent_connection)
+
+        def work() -> str:
+            child_connection = pool.getconn()
+            with child_connection.cursor() as cur:
+                cur.execute("SELECT 1")
+                value = cur.fetchone()[0]
+            return f"distinct={child_connection is not parent_connection} select={value}"
+
+        assert _in_forked_child(work) == "distinct=True select=1"
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_a_forked_child_leaves_the_parents_ledger_working(self, pg_backend) -> None:
+        """The child closes the backend it inherited. The parent must not notice."""
+        append(pg_backend, {"event": "before-fork"})
+
+        def work() -> str:
+            pg_backend.close()
+            return "closed"
+
+        assert _in_forked_child(work) == "closed"
+        assert pg_backend.count() == 1
+        assert append(pg_backend, {"event": "after-fork"}).sequence == 1
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_a_forked_child_appends_to_the_same_chain_without_forking_it(
+        self, pg_backend
+    ) -> None:
+        """The end-to-end shape of the corruption: an append from a forked worker has to
+        land on the parent's chain, once, and be readable by both."""
+        first = append(pg_backend, {"event": "parent"})
+
+        def work() -> str:
+            entry = append(pg_backend, {"event": "child"})
+            return f"sequence={entry.sequence} previous={entry.previous_hash}"
+
+        assert _in_forked_child(work) == f"sequence=1 previous={first.hash}"
+        assert pg_backend.count() == 2
+        assert pg_backend.get_head().sequence == 1
+
+
+# --------------------------------------------------------------------------------------
+# start-up stress (slow, kept out of the default path)
+# --------------------------------------------------------------------------------------
+
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+_STARTUP_WORKER = """\
+import sys
+
+from signledger.backends.postgresql import PostgresBackend
+from signledger.core.exceptions import SignLedgerError
+
+try:
+    backend = PostgresBackend(sys.argv[1], entries_table=sys.argv[2], checkpoints_table=sys.argv[3])
+    backend.close()
+except SignLedgerError as err:
+    sys.stderr.write("signledger error: %s\\n" % type(err).__name__)
+    raise SystemExit(3)
+except BaseException as err:
+    sys.stderr.write("raw driver error: %s.%s\\n" % (type(err).__module__, type(err).__name__))
+    raise SystemExit(4)
+"""
+
+
+def _construct_concurrently(dsn: str, entries: str, checkpoints: str, count: int):
+    """Start ``count`` real processes that all construct a backend on one pair of tables."""
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (REPO_ROOT, env.get("PYTHONPATH"))))
+    running = [
+        subprocess.Popen(
+            [sys.executable, "-c", _STARTUP_WORKER, dsn, entries, checkpoints],
+            env=env,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(count)
+    ]
+    results = []
+    for process in running:
+        _, stderr = process.communicate(timeout=180)
+        results.append((process.returncode, stderr.strip()))
+    return results
+
+
+@pytest.mark.slow
+class TestStartupStress:
+    """The measured repros, as tests.
+
+    They are races, so they live behind ``-m slow``: a flaky test in the default path
+    teaches people to ignore red. The deterministic proofs are in
+    ``TestSchemaCreationIsConcurrencySafe`` and ``TestForkSafety``.
+    """
+
+    def test_eight_processes_build_a_missing_schema_at_once(
+        self, pg_dsn: str, table_prefix: str
+    ) -> None:
+        """15 of 20 constructions failed here with ``UniqueViolation`` on
+        ``pg_type_typname_nsp_index`` before the DDL took the advisory lock."""
+        results = _construct_concurrently(
+            pg_dsn, f"{table_prefix}_entries", f"{table_prefix}_checkpoints", 8
+        )
+
+        assert results == [(0, "")] * 8
+
+    def test_eight_processes_reopen_an_existing_schema_at_once(
+        self, pg_dsn: str, table_prefix: str
+    ) -> None:
+        """The steady state - a deployed ledger, workers re-forking. 18 of 24 failed with
+        ``DeadlockDetected`` before the guard became idempotent."""
+        from signledger.backends.postgresql import PostgresBackend
+
+        PostgresBackend(
+            pg_dsn,
+            entries_table=f"{table_prefix}_entries",
+            checkpoints_table=f"{table_prefix}_checkpoints",
+        ).close()
+
+        results = _construct_concurrently(
+            pg_dsn, f"{table_prefix}_entries", f"{table_prefix}_checkpoints", 8
+        )
+
+        assert results == [(0, "")] * 8
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_four_forked_workers_append_to_one_gapless_chain(self, pg_backend) -> None:
+        """``gunicorn --preload -w 4`` in miniature: one warm pool, four workers forked
+        onto it, all appending. Before the fix this hung past ten minutes and the ledger
+        held more rows than there were acknowledged appends."""
+        pg_backend.count()  # warm the pool the way an import-time application does
+
+        children = []
+        for _ in range(4):
+            pid = os.fork()
+            if pid == 0:
+                acknowledged = 0
+                try:
+                    for _ in range(10):
+                        append(pg_backend, {"event": "forked"})
+                        acknowledged += 1
+                except BaseException:  # noqa: BLE001 - reported through the exit status
+                    pass
+                os._exit(acknowledged)
+            children.append(pid)
+
+        acknowledged = 0
+        for pid in children:
+            _, status = os.waitpid(pid, 0)
+            acknowledged += os.waitstatus_to_exitcode(status)
+
+        assert acknowledged == 40
+        assert pg_backend.count() == 40
+        assert [entry.sequence for entry in pg_backend.iter_entries()] == list(range(40))

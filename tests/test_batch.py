@@ -441,20 +441,32 @@ def test_a_batch_is_faster_than_the_same_appends_in_a_loop() -> None:
     )
 
 
-def test_a_batch_refuses_to_continue_another_ledgers_chain() -> None:
+def test_a_batch_joins_the_chain_the_store_already_holds() -> None:
     """Two workers that both start against an empty store each mint their own identity
-    and neither can detect the clash at construction. The loser of the race to entry zero
-    must refuse: splicing its identity into someone else's chain leaves every hash in the
-    result perfectly correct, which is the worst kind of corruption there is."""
+    and neither can detect the clash at construction.
+
+    This test used to assert the loser REFUSED, matching ``Ledger.append`` at the time.
+    Both were wrong, and measurably so: the refusal was permanent - the id was frozen at
+    construction with no way back - so three of four gunicorn workers returned 500 on
+    every request for the life of the process. ``Ledger._adopt_or_refuse`` fixed that at
+    the single-append level; this is the same correction on the bulk path.
+
+    There is no splicing here. The loser invented a name, wrote nothing under it, and
+    gives it up for the one the store actually holds. Only one chain ever exists. The
+    genuine protections are asserted separately: a ledger that has already written refuses
+    a foreign tip, and a caller who named the id explicitly is never overridden.
+    """
     store = MemoryBackend()
     winner = Ledger(store)
     loser = Ledger(store)
     winner.append({"who": "winner"})
 
-    with pytest.raises(ConfigurationError):
-        BatchProcessor(loser).append_batch([{"who": "loser"}])
+    result = BatchProcessor(loser).append_batch([{"who": "loser"}])
 
-    assert store.count() == 1
+    assert result.ok is True
+    assert store.count() == 2
+    assert loser.ledger_id == winner.ledger_id
+    assert loser.check_integrity().ok is True
 
 
 def test_an_aborted_batch_leaves_an_existing_chain_verifying() -> None:
@@ -641,3 +653,115 @@ def test_a_result_holding_dead_letters_is_never_ok_however_it_was_built() -> Non
     result = BatchResult(entries=(), dead_letters=(DeadLetter(0, "X", "y"),), submitted=0)
 
     assert result.ok is False
+
+
+# ------------------------------------------------------------------------------------
+# Cold-start identity on the batch path.
+#
+# ``Ledger.append`` learned to adopt the store's identity when it minted its own and has
+# not yet written (see ``Ledger._adopt_or_refuse``). ``BatchProcessor`` did not, and it is
+# the README's own bulk example - so a multi-worker deployment using it stayed broken, and
+# a processor built before an adoption disagreed with the very ledger it wraps.
+# ------------------------------------------------------------------------------------
+
+
+class TestBatchAdoptsTheStoresIdentity:
+    """The batch path must answer identity exactly the way ``Ledger.append`` does."""
+
+    def test_a_worker_that_lost_the_race_for_entry_zero_can_still_batch(self) -> None:
+        """Two workers cold-start on one empty store; the loser must not be dead forever.
+
+        This is the defect that served 145 of 300 requests under gunicorn -w 4.
+        """
+        backend = MemoryBackend()
+        winner = Ledger(backend)
+        loser = Ledger(backend)
+
+        BatchProcessor(winner).append_batch([{"event": "winner"}])
+        result = BatchProcessor(loser).append_batch([{"event": "loser"}])
+
+        assert result.ok is True
+        assert loser.ledger_id == winner.ledger_id
+        assert loser.check_integrity().ok is True
+
+    def test_an_adopted_entry_carries_the_adopted_identity_not_the_minted_one(self) -> None:
+        """Re-linking against a moved tip must re-stamp the id, not just the hash.
+
+        ``_reseal`` rebuilt sequence, previous_hash, hash and signature. If it leaves the
+        minted ``ledger_id`` in place, the row written is stamped with an identity the
+        chain does not belong to and verification reports it forever.
+        """
+        backend = MemoryBackend()
+        winner = Ledger(backend)
+        loser = Ledger(backend)
+        minted = loser.ledger_id
+
+        BatchProcessor(winner).append_batch([{"event": "winner"}])
+        BatchProcessor(loser).append_batch([{"event": "loser"}])
+
+        stored = list(winner.iter_entries())
+        assert {entry.ledger_id for entry in stored} == {winner.ledger_id}
+        assert minted not in {entry.ledger_id for entry in stored}
+
+    def test_a_processor_built_before_adoption_agrees_with_the_ledger_after_it(self) -> None:
+        """One ledger must not answer two different identities through two of its methods.
+
+        ``BatchProcessor.__init__`` snapshotted ``ledger.ledger_id``. Once the ledger
+        adopted a different one via ``append``, the processor held a stale copy - so the
+        same object succeeded through ``.append()`` and refused through the processor.
+        """
+        backend = MemoryBackend()
+        winner = Ledger(backend)
+        loser = Ledger(backend)
+        processor_built_early = BatchProcessor(loser)
+
+        winner.append({"event": "winner"})
+        loser.append({"event": "adopts here"})
+
+        assert processor_built_early.ledger_id == loser.ledger_id
+        assert processor_built_early.append_batch([{"event": "still works"}]).ok is True
+
+    def test_a_batch_that_has_written_refuses_a_foreign_tip(self) -> None:
+        """Adoption is a cold-start allowance, not a standing licence.
+
+        A processor that keeps adopting would splice two independent logs together and
+        every hash in the result would verify. Once this ledger has committed anything,
+        a tip belonging to someone else is a fork and has to stay loud.
+        """
+        backend = MemoryBackend()
+        ledger = Ledger(backend)
+        BatchProcessor(ledger).append_batch([{"event": "ours"}])
+
+        stored = backend._entries[-1]
+        backend._entries[-1] = stored.model_copy(update={"ledger_id": "someone-else"})
+
+        with pytest.raises(ConfigurationError, match="different ledger"):
+            BatchProcessor(ledger).append_batch([{"event": "theirs"}])
+
+    def test_an_explicitly_named_ledger_still_refuses_through_the_batch_path(self) -> None:
+        """A caller who named the id meant it. Adopting would splice logs kept apart.
+
+        Both ledgers are constructed while the store is still empty, so construction
+        cannot catch the clash - there is no tip to compare against yet. The refusal has
+        to come from the batch path itself, inside the transaction that finally sees a
+        tip. This is the case ``_adopt_or_refuse`` must not wave through.
+        """
+        backend = MemoryBackend()
+        alpha = Ledger(backend, ledger_id="alpha")
+        beta = Ledger(backend, ledger_id="beta")
+        alpha.append({"event": "alpha"})
+
+        with pytest.raises(ConfigurationError, match="different ledger"):
+            BatchProcessor(beta).append_batch([{"event": "beta"}])
+
+    def test_the_batch_refusal_names_the_remedy(self) -> None:
+        """The 2.0.0 message told an operator what was wrong and not what to do."""
+        backend = MemoryBackend()
+        alpha = Ledger(backend, ledger_id="alpha")
+        beta = Ledger(backend, ledger_id="beta")
+        alpha.append({"event": "alpha"})
+
+        with pytest.raises(ConfigurationError) as caught:
+            BatchProcessor(beta).append_batch([{"event": "beta"}])
+
+        assert "ledger_id" in str(caught.value)

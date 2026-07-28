@@ -866,6 +866,127 @@ class TestRowMapping:
         assert checkpoint_from_row(checkpoint_to_row(cp)) == cp
 
 
+# --------------------------------------------------------------------------------------
+# decoding a stored row fails closed (contract sections 4 and 10)
+# --------------------------------------------------------------------------------------
+
+
+class TestRowMappingFailsClosed:
+    """A row missing a column is a ``StorageError``, never a bare ``KeyError``.
+
+    Observed for real: a PostgreSQL connection pool inherited across ``fork()`` handed a
+    gunicorn worker a cross-talked result row, ``entry_from_row`` indexed a column that
+    was not there, and the ``KeyError`` escaped ``append()`` untouched. Contract section 4
+    makes every storage failure a ``StorageError``; section 10 forbids the message from
+    carrying payload.
+    """
+
+    secret = "4111-1111-1111-1111"
+
+    def row(self, without=None):
+        from signledger.crypto.hashing import HashChain
+
+        draft = Entry(
+            ledger_id="led-1",
+            sequence=0,
+            entry_id="e-1",
+            timestamp=datetime(2024, 6, 1, 12, 0, 0, 123456, tzinfo=UTC),
+            data={"event": "charge", "card": self.secret},
+            previous_hash="0" * 64,
+        )
+        sealed = draft.model_copy(update={"hash": HashChain().calculate_hash(draft)})
+        row = entry_to_row(sealed)
+        if without is not None:
+            del row[without]
+        return row
+
+    def test_a_row_missing_a_column_raises_storage_error_not_key_error(self):
+        with pytest.raises(StorageError):
+            entry_from_row(self.row(without="format_version"))
+
+    def test_the_error_names_the_missing_column(self):
+        with pytest.raises(StorageError) as caught:
+            entry_from_row(self.row(without="format_version"))
+
+        assert "format_version" in str(caught.value)
+
+    def test_a_missing_column_read_late_is_named_just_as_precisely(self):
+        """``signature`` is the last column read, so the whole row decodes first."""
+        with pytest.raises(StorageError) as caught:
+            entry_from_row(self.row(without="signature"))
+
+        assert "signature" in str(caught.value)
+
+    def test_the_error_derives_from_the_package_base_error(self):
+        from signledger.core.exceptions import SignLedgerError
+
+        with pytest.raises(SignLedgerError):
+            entry_from_row(self.row(without="timestamp_us"))
+
+    def test_the_error_never_quotes_the_payload(self):
+        """Contract section 10. The row still holds ``data`` when the decode fails."""
+        with pytest.raises(StorageError) as caught:
+            entry_from_row(self.row(without="format_version"))
+
+        assert self.secret not in str(caught.value)
+
+    def test_a_complete_row_still_rebuilds(self):
+        assert entry_from_row(self.row()).entry_id == "e-1"
+
+
+class TestPayloadDeserializationFailsClosed:
+    """A stored payload that is not JSON text is corruption, not a ``TypeError``.
+
+    MongoDB will happily hold a subdocument in ``data``, and ``json.loads`` then raised a
+    bare ``TypeError`` while the :class:`~signledger.core.ledger.Ledger` was still being
+    built - so ``check_integrity()`` never got the chance to report the corruption at all.
+    """
+
+    def test_a_document_payload_raises_storage_error_not_type_error(self):
+        with pytest.raises(StorageError):
+            deserialize_payload({"event": "charge"})
+
+    def test_a_numeric_payload_raises_storage_error(self):
+        with pytest.raises(StorageError):
+            deserialize_payload(42)
+
+    def test_a_list_payload_raises_storage_error(self):
+        with pytest.raises(StorageError):
+            deserialize_payload(["a"])
+
+    def test_the_error_names_the_type_it_found(self):
+        with pytest.raises(StorageError) as caught:
+            deserialize_payload({"event": "charge"})
+
+        assert "dict" in str(caught.value)
+
+    def test_the_error_derives_from_the_package_base_error(self):
+        from signledger.core.exceptions import SignLedgerError
+
+        with pytest.raises(SignLedgerError):
+            deserialize_payload({"event": "charge"})
+
+    def test_the_error_never_quotes_the_payload_value(self):
+        """Contract section 10 - naming the type is fine, printing the value is not.
+
+        This library already shipped a payload leak once. A ``dict`` interpolated into an
+        f-string prints its keys *and* its values straight into the log line.
+        """
+        with pytest.raises(StorageError) as caught:
+            deserialize_payload({"card": "4111-1111-1111-1111"})
+
+        message = str(caught.value)
+        assert "4111-1111-1111-1111" not in message
+        assert "card" not in message
+
+    def test_bytes_are_still_decoded(self):
+        """``json.loads`` accepts them, so refusing them would be a new outage."""
+        assert deserialize_payload(b'{"a": 1}') == {"a": 1}
+
+    def test_a_bytearray_is_still_decoded(self):
+        assert deserialize_payload(bytearray(b'{"a": 1}')) == {"a": 1}
+
+
 class TestChainLinkChecking:
     def entry(self, tip=None, **kwargs):
         return build_next_entry(
@@ -1149,12 +1270,15 @@ class TestSQLiteSurvivesWalPragmaContention:
     Held-lock contention is the deterministic form of that race, so it is what these
     tests use - no sleeping on a hope, and no test that passes half the time.
 
-    Measured here, and worth recording because it corrects the original report: the WAL
-    pragma **is** covered by SQLite's busy handler on this build. Both
-    ``sqlite3.connect(timeout=...)`` and ``PRAGMA busy_timeout`` install one, and either
-    alone is sufficient - so mutating away just one of them leaves these tests green.
-    Removing *both* fails them. The surviving single mutants are real redundancy in the
-    backend, not missing assertions here.
+    Measured here, and worth recording because the answer depends on *which* lock the
+    other connection holds. Against ``BEGIN EXCLUSIVE`` the pragma cannot even take its
+    read lock, so SQLite consults the busy handler and the opener waits - which is what
+    these two tests exercise, and why either ``sqlite3.connect(timeout=...)`` or
+    ``PRAGMA busy_timeout`` alone keeps them green. Against a mere RESERVED lock
+    (``BEGIN IMMEDIATE`` plus a write, i.e. what a live worker actually holds) the
+    journal-mode change is refused with SQLITE_BUSY *immediately*, busy handler ignored.
+    That is the case the multi-process failure came from, and it is covered by
+    ``tests/test_sqlite_concurrency.py``, which pins the retry that fixes it.
     """
 
     @staticmethod
@@ -1197,28 +1321,126 @@ class TestSQLiteSurvivesWalPragmaContention:
             holder.join(timeout=10)
         assert released.is_set()
 
-    def test_a_lock_held_past_the_timeout_still_fails_as_storage_error(self, tmp_path):
+    def test_a_lock_held_throughout_still_fails_as_storage_error(self, tmp_path):
         """Guards the retry: waiting for ever is not an improvement on failing.
 
-        A retry loop with no bound turns one stuck worker into a hung fleet.
+        A retry loop with no bound turns one stuck worker into a hung fleet. The lock is
+        held for the whole of the attempt and released only after it, so this observes
+        the bound rather than racing a sleeping thread against it - the earlier version
+        of this test held the lock for a fixed 1.5s, which the bounded retry now outlasts
+        legitimately.
+
+        The budget is derived, not guessed: at most ``MAX_APPEND_ATTEMPTS`` tries, each
+        waiting out its own ``busy_timeout``, plus the exponential backoff between them.
+        ``tests/test_sqlite_concurrency.py`` asserts the attempt count itself.
         """
         import sqlite3
-        import threading
 
         from signledger.backends.sqlite import SQLiteBackend
 
+        timeout = 0.3
         path = str(tmp_path / "stuck.db")
-        sqlite3.connect(path).close()
+        holder = sqlite3.connect(path, isolation_level=None)
+        holder.execute("BEGIN EXCLUSIVE")
+        try:
+            started = time.monotonic()
+            with pytest.raises(StorageError):
+                SQLiteBackend(path, timeout=timeout)
+            elapsed = time.monotonic() - started
+        finally:
+            holder.execute("COMMIT")
+            holder.close()
 
-        released = threading.Event()
-        holder = self._hold_exclusive(path, 1.5, released)
-        time.sleep(0.15)
+        # It neither failed instantly nor hung.
+        assert timeout <= elapsed < MAX_APPEND_ATTEMPTS * timeout + 1.0
 
-        started = time.monotonic()
+
+class TestPayloadDecodeFailsClosed:
+    """Malformed payload TEXT is a ``StorageError``, never a raw ``JSONDecodeError``.
+
+    ``deserialize_payload`` gained a type guard, but the ``json.loads`` call one line below
+    it stayed bare - so a truncated or corrupted ``data`` column raised a ``ValueError``
+    subclass that is not a ``SignLedgerError`` and escaped every ``except`` in the library.
+    A corrupted audit log is precisely when ``check_integrity()`` needs to run, and this
+    raised during construction, before it could.
+    """
+
+    def test_malformed_json_text_is_a_storage_error(self) -> None:
         with pytest.raises(StorageError):
-            SQLiteBackend(path, timeout=0.3)
-        elapsed = time.monotonic() - started
-        holder.join(timeout=10)
+            deserialize_payload("not json at all")
 
-        # It gave up near its own timeout: it neither failed instantly nor hung.
-        assert 0.2 <= elapsed < 1.4
+    def test_truncated_json_is_a_storage_error(self) -> None:
+        """The realistic shape of the failure: a column cut off mid-write."""
+        with pytest.raises(StorageError):
+            deserialize_payload('{"actor": "alice", "acti')
+
+    def test_empty_bytes_read_as_an_absent_payload_like_an_empty_string(self) -> None:
+        """``raw == ""`` is False for ``b""``, so the empty guard missed the bytes case.
+
+        A driver that hands back ``bytes`` for a TEXT column then took the JSON path with
+        nothing to decode.
+        """
+        assert deserialize_payload(b"") == {}
+
+    def test_the_refusal_never_contains_the_payload(self) -> None:
+        """Contract section 10. A corrupted row still holds real audit data."""
+        secret = "4111-1111-1111-1111"
+
+        with pytest.raises(StorageError) as caught:
+            deserialize_payload('{"card": "' + secret + '"')
+
+        assert secret not in str(caught.value)
+
+    def test_a_decoded_payload_that_is_not_an_object_is_refused(self) -> None:
+        """``json.loads("3")`` is valid JSON and a valid int. ``data`` is a mapping."""
+        with pytest.raises(StorageError):
+            deserialize_payload("3")
+
+
+class TestCheckpointRowMappingFailsClosed:
+    """``checkpoint_from_row`` had the same defect ``entry_from_row`` was fixed for.
+
+    Same file, same read path, same bare ``KeyError`` - it was simply not in the brief.
+    """
+
+    def row(self, without=None):
+        row = {
+            "ledger_id": "led-1",
+            "sequence": 4,
+            "head_hash": "a" * 64,
+            "entry_count": 5,
+            "merkle_root": "b" * 64,
+            "timestamp_us": 1717243200000000,
+            "signature": None,
+            "key_id": None,
+            "format_version": 2,
+        }
+        if without is not None:
+            del row[without]
+        return row
+
+    def test_a_complete_row_still_rebuilds(self) -> None:
+        checkpoint = checkpoint_from_row(self.row())
+
+        assert checkpoint.ledger_id == "led-1"
+        assert checkpoint.entry_count == 5
+
+    @pytest.mark.parametrize(
+        "column",
+        [
+            "ledger_id",
+            "sequence",
+            "head_hash",
+            "entry_count",
+            "merkle_root",
+            "timestamp_us",
+            "signature",
+            "key_id",
+            "format_version",
+        ],
+    )
+    def test_a_missing_column_is_a_storage_error_naming_it(self, column: str) -> None:
+        with pytest.raises(StorageError) as caught:
+            checkpoint_from_row(self.row(without=column))
+
+        assert column in str(caught.value)

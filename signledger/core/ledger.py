@@ -12,6 +12,12 @@ Every rule enforced here is a v1 defect written down:
   permanently.
 * The cache re-checks an entry's digest before handing it back, and verification never
   reads the cache at all.
+* A worker that cold starts against an empty store, mints an identity and then loses the
+  race to entry zero adopts the identity the store ended up with, once. 2.0.0 froze the
+  minted id at construction and had no way back, so three of four ``gunicorn`` workers
+  raised ``ConfigurationError`` on every append for the life of the process.
+* A construction that fails closes the backend it adopted. ``close()`` owns it, so the
+  one path that raised must not also be the one path that leaked it.
 """
 
 import queue
@@ -41,6 +47,14 @@ _STOP = object()
 #: Default depth of the notification queue. Bounded so a slow subscriber sheds load
 #: instead of stalling every writer behind it.
 DEFAULT_NOTIFY_QUEUE_SIZE = 1000
+
+#: Appended to every refusal to write a second chain into one store. A message that names
+#: the fault but not the fix leaves an operator staring at a 500 with nowhere to go, which
+#: is what 2.0.0 shipped. It names no identifier and no payload (contract section 10).
+_IDENTITY_REMEDY = (
+    "give every process that writes this store the same explicit ledger_id=, or point "
+    "this ledger at a store of its own"
+)
 
 
 def _utcnow() -> datetime:
@@ -90,6 +104,51 @@ class Ledger:
         max_cache_bytes: Optional[int] = None,
         notify_queue_size: int = DEFAULT_NOTIFY_QUEUE_SIZE,
     ) -> None:
+        # Adopted first, and released again by every path out of here that raises.
+        # ``close()`` owns the backend whether the caller supplied it or not, so a
+        # constructor that fails must not be the one path that leaves it open: 1000
+        # refused constructions held 227 descriptors between them, and every one of
+        # them belonged to a ledger object that no longer existed.
+        self.backend = MemoryBackend() if backend is None else backend
+        try:
+            self._configure(
+                ledger_id=ledger_id,
+                hash_algorithm=hash_algorithm,
+                enable_signatures=enable_signatures,
+                signer=signer,
+                key_resolver=key_resolver,
+                auto_verify=auto_verify,
+                verify_interval=verify_interval,
+                on_integrity_failure=on_integrity_failure,
+                anchor_sink=anchor_sink,
+                max_cache_entries=max_cache_entries,
+                max_cache_bytes=max_cache_bytes,
+                notify_queue_size=notify_queue_size,
+            )
+        except BaseException:
+            # Nothing after the finalizer is registered can fail except starting the
+            # verifier thread, and a thread that failed to start is not running - so
+            # releasing the store is the whole of the cleanup.
+            self.backend.close()
+            raise
+
+    def _configure(
+        self,
+        *,
+        ledger_id: Optional[str],
+        hash_algorithm: str,
+        enable_signatures: bool,
+        signer: Any,
+        key_resolver: Any,
+        auto_verify: bool,
+        verify_interval: float,
+        on_integrity_failure: Any,
+        anchor_sink: Any,
+        max_cache_entries: int,
+        max_cache_bytes: Optional[int],
+        notify_queue_size: int,
+    ) -> None:
+        """The body of ``__init__``, split out so one ``except`` can guard all of it."""
         # Every check below runs before anything is opened or started, so a
         # misconfigured ledger never reaches the point of writing a single entry.
         if enable_signatures and signer is None:
@@ -121,7 +180,6 @@ class Ledger:
 
         # Raises ConfigurationError for an unknown algorithm.
         self._chain = HashChain(hash_algorithm)
-        self.backend = MemoryBackend() if backend is None else backend
         self.auto_verify = auto_verify
         self._signer = signer
         self._enable_signatures = enable_signatures
@@ -150,6 +208,13 @@ class Ledger:
         self._last_report: Optional[VerificationReport] = None
         self._last_verified_at: Optional[datetime] = None
 
+        #: True when this process invented the identity rather than being given one or
+        #: reading one out of the store. Only a minted identity may be given up again.
+        self._minted_identity = False
+        #: True once this ledger has itself written an entry. After that a tip belonging
+        #: to someone else is a forked chain, not a cold start.
+        self._has_appended = False
+
         self.ledger_id = self._resolve_identity(ledger_id)
         self._load_cache()
 
@@ -167,16 +232,58 @@ class Ledger:
 
         A store that already holds entries owns its identity: inventing a fresh one would
         make entry 0 fail its genesis check forever, on a ledger nobody had touched.
+
+        An **empty** store has no identity to adopt, so a caller who named none gets a
+        minted one - and that is recorded, because a minted identity is the only kind
+        this ledger may later give up (see :meth:`_adopt_or_refuse`).
         """
         oldest = self.backend.get_oldest()
         if oldest is None:
-            return str(uuid.uuid4()) if ledger_id is None else ledger_id
+            if ledger_id is None:
+                self._minted_identity = True
+                return str(uuid.uuid4())
+            return ledger_id
         if ledger_id is not None and ledger_id != oldest.ledger_id:
             raise ConfigurationError(
                 "the requested ledger_id is not the one this store was written with; "
-                "refusing to append a second chain into it"
+                f"refusing to append a second chain into it - {_IDENTITY_REMEDY}"
             )
         return str(oldest.ledger_id)
+
+    def _adopt_or_refuse(self, tip: Entry) -> None:
+        """Take over the identity the store already holds, or refuse to fork the chain.
+
+        Called from inside the backend transaction, with the tip that transaction read.
+
+        Against an empty store there is nothing to adopt, so every process mints its own
+        uuid4 and exactly one of them wins entry zero. 2.0.0 froze that minted id at
+        construction and gave ``_seal`` no way back, so each loser raised
+        ``ConfigurationError`` on *every* append for the rest of its life: measured,
+        Flask + ``gunicorn -w 4`` + SQLite served 129 of 300 requests and FastAPI +
+        ``uvicorn --workers 4`` + PostgreSQL served exactly 75 - one live worker out of
+        four, permanently. Nothing was wrong with the three that died; the store had
+        simply acquired a name while they were not looking.
+
+        So a ledger that minted its own identity and has not yet written anything under
+        it gives it up and adopts the tip's. ``tip`` came out of the store inside this
+        transaction, which makes it the store's own answer to who owns the chain - and
+        asking the backend again from in here would re-enter a connection that is
+        mid-transaction, or take a second one from a pool that may only have the one.
+
+        The refusal stays for the two cases where the disagreement is real:
+
+        * the identity was **chosen by the caller** - a genuine misconfiguration, and
+          adopting would silently splice two logs an operator deliberately kept apart;
+        * this ledger has **already written entries** of its own, so the chain forked
+          underneath it, which is an integrity event and must stay loud.
+        """
+        if self._minted_identity and not self._has_appended:
+            self.ledger_id = tip.ledger_id
+            return
+        raise ConfigurationError(
+            "the chain in this store belongs to a different ledger; refusing to "
+            f"continue it under this ledger's identity - {_IDENTITY_REMEDY}"
+        )
 
     # -- append ------------------------------------------------------------------------
 
@@ -206,6 +313,9 @@ class Ledger:
             return self._seal(tip, data, metadata, moment, entry_id)
 
         entry: Entry = self.backend.append_atomic(build)
+        # Set only once the store has actually taken the entry. From here on this ledger
+        # has a stake in the chain, and a tip belonging to anyone else is a fork.
+        self._has_appended = True
         self._remember(entry)
         # Outside every lock this method took, and handed to a different thread.
         self._publish_event(entry)
@@ -222,7 +332,8 @@ class Ledger:
         """Build, hash and sign the entry that follows ``tip``.
 
         Called *inside* the backend transaction and re-invoked on a retry, so it must stay
-        free of side effects.
+        free of side effects - with one exception, :meth:`_adopt_or_refuse`, which is
+        idempotent: the second call sees an identity that already matches the tip.
         """
         if tip is None:
             sequence = 0
@@ -238,15 +349,7 @@ class Ledger:
             )
         else:
             if tip.ledger_id != self.ledger_id:
-                # Two workers that both started against an empty store each minted their
-                # own identity, and neither could detect the clash at construction time.
-                # The one that lost the race to entry zero must refuse: continuing another
-                # ledger's chain under a second identity splices two logs into one, and
-                # every hash in the result is still perfectly correct.
-                raise ConfigurationError(
-                    "the chain in this store belongs to a different ledger; refusing to "
-                    "continue it under this ledger's identity"
-                )
+                self._adopt_or_refuse(tip)
             sequence = tip.sequence + 1
             previous_hash = tip.hash
 

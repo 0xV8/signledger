@@ -1,0 +1,64 @@
+# What the source distribution ships.
+#
+# For a security library the sdist is not a convenience copy of the wheel: it is the
+# artifact a distribution packager (Debian, Fedora, Nix, Conda, an internal mirror)
+# fetches in order to *re-verify from source* the claims this package makes. That means
+# it has to carry a test suite that runs.
+#
+# 2.0.0's sdist half-shipped one. `tests/*.py` were present; `tests/conftest.py`,
+# `tests/vectors/slcs1.json`, `docs/`, `examples/`, `CHANGELOG.md` and `SECURITY.md`
+# were not. Anyone who unpacked it and ran pytest got a collection error followed by
+# ~194 fixture errors - a suite that looks broken rather than one that is absent, which
+# is the worst of the three options (all, none, some).
+#
+# The rule here is therefore: ship everything needed to reproduce the verification, and
+# nothing that is a build or scratch artifact. tests/test_packaging.py enforces both
+# halves - TestSdistContents checks the manifest, TestSdistIsSelfVerifying unpacks the
+# built sdist and runs the suite out of it.
+
+# ---------------------------------------------------------------------------------
+# Documents. SECURITY.md and CHANGELOG.md are referenced from the package metadata and
+# from the threat-model tests; docs/ARCHITECTURE.md is the normative contract every
+# module is written against, and tests/test_docs_execute.py executes its code blocks.
+# ---------------------------------------------------------------------------------
+include LICENSE
+include README.md
+include CHANGELOG.md
+include SECURITY.md
+include MANIFEST.in
+graft docs
+
+# ---------------------------------------------------------------------------------
+# The test suite, whole. conftest.py holds every backend, ledger and signing-key
+# fixture in the project, and tests/vectors/slcs1.json is the frozen SLCS/1 byte
+# format - the canonical serialization cannot be re-verified without it.
+# ---------------------------------------------------------------------------------
+graft tests
+
+# ---------------------------------------------------------------------------------
+# The runnable examples. tests/test_examples.py executes these, so they are part of
+# the suite whether or not they read like documentation.
+# ---------------------------------------------------------------------------------
+graft examples
+
+# ---------------------------------------------------------------------------------
+# The typing marker, which is package data and also belongs in the sdist.
+# ---------------------------------------------------------------------------------
+include signledger/py.typed
+
+# ---------------------------------------------------------------------------------
+# `graft tests` sweeps up whatever a local run left behind, and __pycache__ is always
+# there. This is deliberately the ONLY exclusion. distutils prints a warning for every
+# pattern that matches nothing, and a release build that prints a screenful of warnings
+# is a release build nobody reads - which is the same failure mode that let a broken
+# manifest ship in the first place. The guard against everything else (a stray
+# ledger.db, a .DS_Store, a coverage file) is
+# tests/test_packaging.py::TestSdistContents::test_the_sdist_ships_no_build_or_scratch_artefact,
+# which fails loudly on the real artifact instead of hiding the mistake behind a
+# speculative pattern.
+#
+# (`python -m build` still prints this one warning once, during its "build wheel from
+# sdist" pass: the unpacked sdist has no __pycache__ left to exclude, because this line
+# worked. That is the exclusion succeeding, not failing.)
+# ---------------------------------------------------------------------------------
+global-exclude *.py[cod]

@@ -185,13 +185,39 @@ def serialize_payload(payload: Optional[Dict[str, Any]]) -> str:
     return json.dumps({} if payload is None else payload, ensure_ascii=False, sort_keys=True)
 
 
-def deserialize_payload(raw: Optional[str]) -> Dict[str, Any]:
-    """Decode a stored payload. A NULL column from a legacy row still reads as ``{}``."""
+def deserialize_payload(raw: Any) -> Dict[str, Any]:
+    """Decode a stored payload. A NULL column from a legacy row still reads as ``{}``.
+
+    ``raw`` is typed ``Any`` because a store hands back whatever is actually in the
+    column, not whatever the schema promised: MongoDB will happily keep a BSON
+    subdocument in ``data``, and ``json.loads`` answers that with a bare ``TypeError``
+    raised while the ledger is still being constructed - so ``check_integrity()`` never
+    gets the chance to report the corruption at all. Anything ``json.loads`` cannot read
+    is refused here as a :class:`StorageError` instead.
+
+    The refusal names the *type* and never the value. Interpolating the payload itself
+    would put audit data into every log line that catches the error, which is the leak
+    contract section 10 exists to prevent.
+    """
     import json
 
-    if raw is None or raw == "":
+    if raw is None or raw in ("", b""):
+        # ``raw == ""`` alone is False for ``b""``, so a driver handing back bytes for a
+        # TEXT column took the decode path with nothing to decode.
         return {}
-    loaded = json.loads(raw)
+    if not isinstance(raw, (str, bytes, bytearray)):
+        raise StorageError(f"stored payload is {type(raw).__name__}, expected a JSON string")
+    try:
+        loaded = json.loads(raw)
+    except ValueError as err:
+        # json.JSONDecodeError is a ValueError, not a SignLedgerError, so a truncated or
+        # corrupted column escaped every ``except SignLedgerError`` in the library - and it
+        # raised while the ledger was still being constructed, so check_integrity() never
+        # ran. A corrupted store is exactly when it needs to.
+        #
+        # str(err) from json carries a position and a reason but never the document, so it
+        # is safe to name; the document itself is real audit data (section 10).
+        raise StorageError(f"stored payload is not valid JSON: {err}") from None
     if not isinstance(loaded, dict):
         raise StorageError(f"stored payload decoded to {type(loaded).__name__}, expected an object")
     return loaded
@@ -236,21 +262,35 @@ def entry_to_row(entry: Entry) -> Dict[str, Any]:
 
 
 def entry_from_row(row: Dict[str, Any]) -> Entry:
-    """Rebuild an entry from a stored row, re-validating it on the way in."""
-    return Entry(
-        format_version=row["format_version"],
-        ledger_id=row["ledger_id"],
-        sequence=row["sequence"],
-        entry_id=row["entry_id"],
-        timestamp=micros_to_timestamp(row["timestamp_us"]),
-        data=deserialize_payload(row["data"]),
-        metadata=deserialize_payload(row["metadata"]),
-        previous_hash=row["previous_hash"],
-        key_id=row["key_id"],
-        signature_algorithm=row["signature_algorithm"],
-        hash=row["hash"],
-        signature=row["signature"],
-    )
+    """Rebuild an entry from a stored row, re-validating it on the way in.
+
+    A row that is short a column is a storage failure, so it leaves as a
+    :class:`StorageError` naming the column - never as the raw ``KeyError`` this used to
+    raise. That ``KeyError`` was not theoretical: a connection pool inherited across
+    ``fork()`` handed a gunicorn worker a cross-talked result row and the bare exception
+    escaped ``append()`` to the caller, past every ``except SignLedgerError`` that was
+    supposed to contain it (contract section 4).
+
+    Only the column *name* goes into the message. The row still holds ``data`` when the
+    decode fails, and section 10 forbids putting it in an error.
+    """
+    try:
+        return Entry(
+            format_version=row["format_version"],
+            ledger_id=row["ledger_id"],
+            sequence=row["sequence"],
+            entry_id=row["entry_id"],
+            timestamp=micros_to_timestamp(row["timestamp_us"]),
+            data=deserialize_payload(row["data"]),
+            metadata=deserialize_payload(row["metadata"]),
+            previous_hash=row["previous_hash"],
+            key_id=row["key_id"],
+            signature_algorithm=row["signature_algorithm"],
+            hash=row["hash"],
+            signature=row["signature"],
+        )
+    except KeyError as err:
+        raise StorageError(f"stored row is missing the {err.args[0]!r} column") from err
 
 
 def checkpoint_to_row(cp: Checkpoint) -> Dict[str, Any]:
@@ -270,18 +310,27 @@ def checkpoint_to_row(cp: Checkpoint) -> Dict[str, Any]:
 
 
 def checkpoint_from_row(row: Dict[str, Any]) -> Checkpoint:
-    """Rebuild a checkpoint from a stored row."""
-    return Checkpoint(
-        ledger_id=row["ledger_id"],
-        sequence=row["sequence"],
-        head_hash=row["head_hash"],
-        entry_count=row["entry_count"],
-        merkle_root=row["merkle_root"],
-        timestamp=micros_to_timestamp(row["timestamp_us"]),
-        signature=row["signature"],
-        key_id=row["key_id"],
-        format_version=row["format_version"],
-    )
+    """Rebuild a checkpoint from a stored row.
+
+    Fails closed on a short row exactly like :func:`entry_from_row`, and for the same
+    reason: this is the other half of the same read path, and a bare ``KeyError`` here is
+    the same contract section 4 violation - it just was not the one that happened to show
+    up in the fork-corrupted pool logs first.
+    """
+    try:
+        return Checkpoint(
+            ledger_id=row["ledger_id"],
+            sequence=row["sequence"],
+            head_hash=row["head_hash"],
+            entry_count=row["entry_count"],
+            merkle_root=row["merkle_root"],
+            timestamp=micros_to_timestamp(row["timestamp_us"]),
+            signature=row["signature"],
+            key_id=row["key_id"],
+            format_version=row["format_version"],
+        )
+    except KeyError as err:
+        raise StorageError(f"stored checkpoint row is missing column {err.args[0]!r}") from None
 
 
 def validate_window(
