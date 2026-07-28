@@ -1,0 +1,844 @@
+{
+  "spec": "SLCS/1",
+  "description": "Frozen conformance vectors for SignLedger Canonical Serialization version 1. An implementation in any language is conformant when it turns each decoded input into exactly the bytes given by canonical_hex.",
+  "rules": [
+    "UTF-8 output, separators ',' and ':', no insignificant whitespace.",
+    "Object keys sorted by UTF-16 code unit (RFC 8785 3.2.3), not by code point.",
+    "datetime encodes as integer microseconds since the Unix epoch in UTC; naive datetimes are rejected.",
+    "NaN, Infinity and -Infinity are rejected.",
+    "Only JSON-native types; object keys must be strings.",
+    "Integers outside +/-2**53 are rejected.",
+    "Numbers follow ECMAScript Number::toString, so 1 and 1.0 both encode as 1.",
+    "Maximum encoded size 1048576 bytes; maximum nesting depth 64 containers."
+  ],
+  "dialect": {
+    "$str": "a literal string; the escape hatch for text that would look like a tag",
+    "$int": "an integer parsed from a decimal string literal",
+    "$float": "an IEEE-754 binary64 parsed from a decimal string literal",
+    "$decimal": "an arbitrary-precision decimal (a non-JSON type; expected to be rejected)",
+    "$bytes": "the UTF-8 bytes of the given string (a non-JSON type)",
+    "$datetime": "an ISO-8601 timestamp; without an offset it denotes a naive datetime",
+    "$codepoint": "the single character with the given Unicode code point",
+    "$tuple": "an ordered immutable sequence distinct from an array (a non-JSON type)",
+    "$set": "an unordered collection (a non-JSON type)",
+    "$date": "a calendar date with no time (a non-JSON type)",
+    "$object": "an object built from explicit [key, value] pairs, so keys may be non-strings",
+    "$repeat": "{value, count}: the value repeated count times, to keep this file small",
+    "$nest": "{kind, key, depth}: containers nested depth levels deep",
+    "$nonfinite": "one of nan, infinity, -infinity: an IEEE-754 value JSON cannot express"
+  },
+  "vectors": [
+    {
+      "name": "unicode/emoji-value",
+      "input": {
+        "k": "\ud83d\ude00"
+      },
+      "canonical": "{\"k\":\"\ud83d\ude00\"}",
+      "canonical_hex": "7b226b223a22f09f9880227d",
+      "sha256": "f073f1f05c0a1e01bf604e8ec5f389a64fdeb334e00f9456008269e852b1ff4a"
+    },
+    {
+      "name": "unicode/non-ascii-literal",
+      "input": {
+        "caf\u00e9": "na\u00efve"
+      },
+      "canonical": "{\"caf\u00e9\":\"na\u00efve\"}",
+      "canonical_hex": "7b22636166c3a9223a226e61c3af7665227d",
+      "sha256": "8d9bcca95360c226e5d7f0039e45a492b075f4180982edfef731a03e92e4c626"
+    },
+    {
+      "name": "unicode/escapes",
+      "input": {
+        "backslash": "\\",
+        "backspace": {
+          "$codepoint": 8
+        },
+        "cr": {
+          "$codepoint": 13
+        },
+        "formfeed": {
+          "$codepoint": 12
+        },
+        "newline": {
+          "$codepoint": 10
+        },
+        "nul": {
+          "$codepoint": 0
+        },
+        "quote": "\"",
+        "tab": {
+          "$codepoint": 9
+        },
+        "unit-sep": {
+          "$codepoint": 31
+        }
+      },
+      "canonical": "{\"backslash\":\"\\\\\",\"backspace\":\"\\b\",\"cr\":\"\\r\",\"formfeed\":\"\\f\",\"newline\":\"\\n\",\"nul\":\"\\u0000\",\"quote\":\"\\\"\",\"tab\":\"\\t\",\"unit-sep\":\"\\u001f\"}",
+      "canonical_hex": "7b226261636b736c617368223a225c5c222c226261636b7370616365223a225c62222c226372223a225c72222c22666f726d66656564223a225c66222c226e65776c696e65223a225c6e222c226e756c223a225c7530303030222c2271756f7465223a225c22222c22746162223a225c74222c22756e69742d736570223a225c7530303166227d",
+      "sha256": "f0a6510c1a4e07022a51ca44e3f206774411a70362970f8d993a46c9f8ee0406"
+    },
+    {
+      "name": "unicode/del-is-not-escaped",
+      "input": {
+        "$codepoint": 127
+      },
+      "canonical": "\"\u007f\"",
+      "canonical_hex": "227f22",
+      "sha256": "6fe76740e12a93d5598fe685cb6ad3d3c94e44609065a56866b69647772026ec"
+    },
+    {
+      "name": "unicode/forward-slash-is-not-escaped",
+      "input": "a/b",
+      "canonical": "\"a/b\"",
+      "canonical_hex": "22612f6222",
+      "sha256": "f5effa31772a3689cb116700c569f4b72d765290968f099016a899ab6c1e4ee3"
+    },
+    {
+      "name": "unicode/astral-value",
+      "input": "\ud800\udc00\udbff\udfff",
+      "canonical": "\"\ud800\udc00\udbff\udfff\"",
+      "canonical_hex": "22f0908080f48fbfbf22",
+      "sha256": "f66ee6ebfc339a9a088ba6aad2b9f9220a172ea0d0e26c1997e0eca868d7d0f8"
+    },
+    {
+      "name": "unicode/empty-string",
+      "input": "",
+      "canonical": "\"\"",
+      "canonical_hex": "2222",
+      "sha256": "12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+    },
+    {
+      "name": "key-order/utf16-code-unit-beats-code-point",
+      "input": {
+        "\uffff": 1,
+        "\ud83d\ude00": 2
+      },
+      "canonical": "{\"\ud83d\ude00\":2,\"\uffff\":1}",
+      "canonical_hex": "7b22f09f9880223a322c22efbfbf223a317d",
+      "sha256": "48c5d098713870a7b88be7fc0ffc0a79e912d20f80ea8a4a5604426f49add103"
+    },
+    {
+      "name": "key-order/surrogate-sorts-before-private-use",
+      "input": {
+        "\ue000": 1,
+        "\ud800\udc00": 2
+      },
+      "canonical": "{\"\ud800\udc00\":2,\"\ue000\":1}",
+      "canonical_hex": "7b22f0908080223a322c22ee8080223a317d",
+      "sha256": "9d4cdc71dda603c42f9b21d88d0c2ffc31a76cd1bd461d7359406cf169845f1e"
+    },
+    {
+      "name": "key-order/ascii-uppercase-first",
+      "input": {
+        "b": 1,
+        "A": 2,
+        "a": 3
+      },
+      "canonical": "{\"A\":2,\"a\":3,\"b\":1}",
+      "canonical_hex": "7b2241223a322c2261223a332c2262223a317d",
+      "sha256": "4e37ea935b466ff504588cbec40a5f03155f4699727d58bc43dd4fef9d7c2324"
+    },
+    {
+      "name": "key-order/insertion-order-ignored",
+      "input": {
+        "z": 1,
+        "a": 2
+      },
+      "canonical": "{\"a\":2,\"z\":1}",
+      "canonical_hex": "7b2261223a322c227a223a317d",
+      "sha256": "c2985c5ba6f7d2a55e768f92490ca09388e95bc4cccb9fdf11b15f4d42f93e73"
+    },
+    {
+      "name": "key-order/empty-key-sorts-first",
+      "input": {
+        "a": 1,
+        "": 2
+      },
+      "canonical": "{\"\":2,\"a\":1}",
+      "canonical_hex": "7b22223a322c2261223a317d",
+      "sha256": "521339c3bd7ac04721bdad192e9ba038cb377bca61a0a24f08fe55c26ef61673"
+    },
+    {
+      "name": "key-order/prefix-before-extension",
+      "input": {
+        "ab": 1,
+        "a": 2
+      },
+      "canonical": "{\"a\":2,\"ab\":1}",
+      "canonical_hex": "7b2261223a322c226162223a317d",
+      "sha256": "ee8723a8d7d6ef8e9dd499dd6308103c80dd8b74f4e349747090dc787da6d0f8"
+    },
+    {
+      "name": "key-order/digits-before-letters",
+      "input": {
+        "a": 1,
+        "1": 2
+      },
+      "canonical": "{\"1\":2,\"a\":1}",
+      "canonical_hex": "7b2231223a322c2261223a317d",
+      "sha256": "0735152c18bf1d82dd0654c27a3baf0db3220cd8edf746c54592303c1c0163dd"
+    },
+    {
+      "name": "key-order/nested-objects-sort-too",
+      "input": {
+        "z": {
+          "b": 1,
+          "a": 2
+        }
+      },
+      "canonical": "{\"z\":{\"a\":2,\"b\":1}}",
+      "canonical_hex": "7b227a223a7b2261223a322c2262223a317d7d",
+      "sha256": "98e212db440c176d43ca60badab0227ae2e28c929e0fd4c8a4b3a996f23ca0d0"
+    },
+    {
+      "name": "nesting/dicts-at-the-limit",
+      "input": {
+        "$nest": {
+          "kind": "dict",
+          "key": "k",
+          "depth": 64
+        }
+      },
+      "canonical": "{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}",
+      "canonical_hex": "7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b226b223a7b7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d",
+      "sha256": "66989f16ae5f25eaa7a57cdba54420df7a9beed1ce39c7ca47302f63f122d223"
+    },
+    {
+      "name": "nesting/lists-at-the-limit",
+      "input": {
+        "$nest": {
+          "kind": "list",
+          "depth": 64
+        }
+      },
+      "canonical": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+      "canonical_hex": "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d",
+      "sha256": "b3ff3b51ce17ef2a2a68203329ff0e73738c07df874044149c283b28841a0035"
+    },
+    {
+      "name": "nesting/mixed-containers",
+      "input": {
+        "a": [
+          {
+            "b": [
+              1,
+              [
+                2,
+                {
+                  "c": {}
+                }
+              ]
+            ]
+          }
+        ]
+      },
+      "canonical": "{\"a\":[{\"b\":[1,[2,{\"c\":{}}]]}]}",
+      "canonical_hex": "7b2261223a5b7b2262223a5b312c5b322c7b2263223a7b7d7d5d5d7d5d7d",
+      "sha256": "1750710b70e1f39635ada5033477e9503381ec6e885adecf916bc3841fd2e2eb"
+    },
+    {
+      "name": "nesting/empty-containers",
+      "input": {
+        "a": {},
+        "b": []
+      },
+      "canonical": "{\"a\":{},\"b\":[]}",
+      "canonical_hex": "7b2261223a7b7d2c2262223a5b5d7d",
+      "sha256": "aeeba1e56a144077f89e26c930dad7cf933e9383cfb8e33ddff618233b29be76"
+    },
+    {
+      "name": "nesting/list-order-is-preserved",
+      "input": [
+        3,
+        1,
+        2
+      ],
+      "canonical": "[3,1,2]",
+      "canonical_hex": "5b332c312c325d",
+      "sha256": "51bda7ab4e44726cde71fcb6e4b515357059bb6b6dd5146d1fc50f73f11678c6"
+    },
+    {
+      "name": "numeric-edge/int-zero",
+      "input": 0,
+      "canonical": "0",
+      "canonical_hex": "30",
+      "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+    },
+    {
+      "name": "numeric-edge/int-negative",
+      "input": -42,
+      "canonical": "-42",
+      "canonical_hex": "2d3432",
+      "sha256": "fec80006df0542549b4cbaafb8987eee00bb49bca396eefe9ac8be5b5928e8f6"
+    },
+    {
+      "name": "numeric-edge/int-max-safe",
+      "input": {
+        "$int": "9007199254740992"
+      },
+      "canonical": "9007199254740992",
+      "canonical_hex": "39303037313939323534373430393932",
+      "sha256": "c681da39d7273a6a24c15c9cac3a75526ff2ecf8ba4ee60346a0c70c8163bdb2"
+    },
+    {
+      "name": "numeric-edge/int-min-safe",
+      "input": {
+        "$int": "-9007199254740992"
+      },
+      "canonical": "-9007199254740992",
+      "canonical_hex": "2d39303037313939323534373430393932",
+      "sha256": "83e109bfd7fb4984b47a46f363627c18dbbd7e57e36b05a04cd162d304df72e9"
+    },
+    {
+      "name": "numeric-edge/float-one-is-integral",
+      "input": {
+        "$float": "1.0"
+      },
+      "canonical": "1",
+      "canonical_hex": "31",
+      "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+    },
+    {
+      "name": "numeric-edge/float-negative-one",
+      "input": {
+        "$float": "-1.0"
+      },
+      "canonical": "-1",
+      "canonical_hex": "2d31",
+      "sha256": "1bad6b8cf97131fceab8543e81f7757195fbb1d36b376ee994ad1cf17699c464"
+    },
+    {
+      "name": "numeric-edge/float-zero",
+      "input": {
+        "$float": "0.0"
+      },
+      "canonical": "0",
+      "canonical_hex": "30",
+      "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+    },
+    {
+      "name": "numeric-edge/float-negative-zero-folds",
+      "input": {
+        "$float": "-0.0"
+      },
+      "canonical": "0",
+      "canonical_hex": "30",
+      "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+    },
+    {
+      "name": "numeric-edge/float-tenth",
+      "input": {
+        "$float": "0.1"
+      },
+      "canonical": "0.1",
+      "canonical_hex": "302e31",
+      "sha256": "14be4b45f18e0d8c67b4f719b5144eee88497e413709d11d85b096d8e2346310"
+    },
+    {
+      "name": "numeric-edge/float-fraction",
+      "input": {
+        "$float": "123.456"
+      },
+      "canonical": "123.456",
+      "canonical_hex": "3132332e343536",
+      "sha256": "52dad41684065ccf8dd86bc21e739e57c750e4e1305f759956b7373308023eae"
+    },
+    {
+      "name": "numeric-edge/float-1e20-expands",
+      "input": {
+        "$float": "1e20"
+      },
+      "canonical": "100000000000000000000",
+      "canonical_hex": "313030303030303030303030303030303030303030",
+      "sha256": "c344e9487bfbd5c4e03c9fb90d62a5dde5e00b54d55c46e9f4a803aea162b80c"
+    },
+    {
+      "name": "numeric-edge/float-1e21-uses-exponent",
+      "input": {
+        "$float": "1e21"
+      },
+      "canonical": "1e+21",
+      "canonical_hex": "31652b3231",
+      "sha256": "241c4643fa70b1dcde1205b71be4e3bebb17e9f880c8e1a33d0ead6c27271d3c"
+    },
+    {
+      "name": "numeric-edge/float-1.5e21",
+      "input": {
+        "$float": "1.5e21"
+      },
+      "canonical": "1.5e+21",
+      "canonical_hex": "312e35652b3231",
+      "sha256": "2ce57edafd4986d7ab7ed401a2f64d50eb4482ba01766409ffb78316323910b8"
+    },
+    {
+      "name": "numeric-edge/float-1e-6-expands",
+      "input": {
+        "$float": "1e-6"
+      },
+      "canonical": "0.000001",
+      "canonical_hex": "302e303030303031",
+      "sha256": "159fb29a827ad04b260aa6c8ab6d8637f8f2b38af5c4f3cb49d6a21205e040f8"
+    },
+    {
+      "name": "numeric-edge/float-1e-7-uses-exponent",
+      "input": {
+        "$float": "1e-7"
+      },
+      "canonical": "1e-7",
+      "canonical_hex": "31652d37",
+      "sha256": "5b33e02f2c5103a05d32f6ba9cb058294452bfbf393967f68bb30c1bdcbbab22"
+    },
+    {
+      "name": "numeric-edge/float-1.2e-7",
+      "input": {
+        "$float": "1.2e-7"
+      },
+      "canonical": "1.2e-7",
+      "canonical_hex": "312e32652d37",
+      "sha256": "7944316ca5bf5a5ef6d7df222716b04b42380361f87d79c913b9fbb41b5d62cb"
+    },
+    {
+      "name": "numeric-edge/float-min-subnormal",
+      "input": {
+        "$float": "5e-324"
+      },
+      "canonical": "5e-324",
+      "canonical_hex": "35652d333234",
+      "sha256": "c46e7ca1be4c8734f373a56530787288fa2058d73d07855e9247e949f811a42a"
+    },
+    {
+      "name": "numeric-edge/float-max",
+      "input": {
+        "$float": "1.7976931348623157e308"
+      },
+      "canonical": "1.7976931348623157e+308",
+      "canonical_hex": "312e37393736393331333438363233313537652b333038",
+      "sha256": "c2784e1abd6317452708f3fbf9641c16b959561bc621a1d408c23a20aa2cb585"
+    },
+    {
+      "name": "numeric-edge/int-and-integral-float-agree",
+      "input": {
+        "a": 1,
+        "b": {
+          "$float": "1.0"
+        }
+      },
+      "canonical": "{\"a\":1,\"b\":1}",
+      "canonical_hex": "7b2261223a312c2262223a317d",
+      "sha256": "4dad51ac41eb73862fce375fae85ba13711fd19f1b26d8e4b1f9fa405c3d5adf"
+    },
+    {
+      "name": "numeric-edge/bool-is-not-one",
+      "input": {
+        "a": true,
+        "b": 1
+      },
+      "canonical": "{\"a\":true,\"b\":1}",
+      "canonical_hex": "7b2261223a747275652c2262223a317d",
+      "sha256": "a3f44886ecd0b8667b0c6a4652d41e1f9e8205fb8d35d299fd20577f5268adb6"
+    },
+    {
+      "name": "datetime/epoch",
+      "input": {
+        "$datetime": "1970-01-01T00:00:00+00:00"
+      },
+      "canonical": "0",
+      "canonical_hex": "30",
+      "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+    },
+    {
+      "name": "datetime/one-and-a-half-seconds",
+      "input": {
+        "$datetime": "1970-01-01T00:00:01.500000+00:00"
+      },
+      "canonical": "1500000",
+      "canonical_hex": "31353030303030",
+      "sha256": "490d7c887c8033c20d2788eb073ad763d46ea740497158ab9b0fb2aa313b2f98"
+    },
+    {
+      "name": "datetime/before-the-epoch",
+      "input": {
+        "$datetime": "1969-12-31T23:59:59+00:00"
+      },
+      "canonical": "-1000000",
+      "canonical_hex": "2d31303030303030",
+      "sha256": "5613e3024e96f2eee62f63bd1d9196d624f4de63384d5dd35c515933e944d18a"
+    },
+    {
+      "name": "datetime/utc",
+      "input": {
+        "$datetime": "2024-03-01T12:00:00+00:00"
+      },
+      "canonical": "1709294400000000",
+      "canonical_hex": "31373039323934343030303030303030",
+      "sha256": "a7b6a816fcc9bcd9a017604e0a5ffe1e39d5dd07e0ce376e1a943daeff96a97e"
+    },
+    {
+      "name": "datetime/same-instant-plus-0530",
+      "input": {
+        "$datetime": "2024-03-01T17:30:00+05:30"
+      },
+      "canonical": "1709294400000000",
+      "canonical_hex": "31373039323934343030303030303030",
+      "sha256": "a7b6a816fcc9bcd9a017604e0a5ffe1e39d5dd07e0ce376e1a943daeff96a97e"
+    },
+    {
+      "name": "datetime/same-instant-minus-1000",
+      "input": {
+        "$datetime": "2024-03-01T02:00:00-10:00"
+      },
+      "canonical": "1709294400000000",
+      "canonical_hex": "31373039323934343030303030303030",
+      "sha256": "a7b6a816fcc9bcd9a017604e0a5ffe1e39d5dd07e0ce376e1a943daeff96a97e"
+    },
+    {
+      "name": "datetime/sub-second",
+      "input": {
+        "$datetime": "2024-03-01T12:00:00.123456+00:00"
+      },
+      "canonical": "1709294400123456",
+      "canonical_hex": "31373039323934343030313233343536",
+      "sha256": "ccd670c6afaad4932d7b44d3fd92651c6116184ba3fe9b61d9febb1550a3367d"
+    },
+    {
+      "name": "datetime/inside-an-object",
+      "input": {
+        "t": {
+          "$datetime": "2024-03-01T12:00:00+00:00"
+        }
+      },
+      "canonical": "{\"t\":1709294400000000}",
+      "canonical_hex": "7b2274223a313730393239343430303030303030307d",
+      "sha256": "d0d2c93118e5d3bf553b1d287617513e0d437ed4b62fb4bc9269ec7ac555a1cd"
+    },
+    {
+      "name": "literal/null",
+      "input": null,
+      "canonical": "null",
+      "canonical_hex": "6e756c6c",
+      "sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+    },
+    {
+      "name": "literal/true",
+      "input": true,
+      "canonical": "true",
+      "canonical_hex": "74727565",
+      "sha256": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b"
+    },
+    {
+      "name": "literal/false",
+      "input": false,
+      "canonical": "false",
+      "canonical_hex": "66616c7365",
+      "sha256": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa"
+    },
+    {
+      "name": "literal/empty-object",
+      "input": {},
+      "canonical": "{}",
+      "canonical_hex": "7b7d",
+      "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    {
+      "name": "literal/empty-array",
+      "input": [],
+      "canonical": "[]",
+      "canonical_hex": "5b5d",
+      "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "name": "literal/mixed-array",
+      "input": [
+        1,
+        "a",
+        null,
+        true,
+        false
+      ],
+      "canonical": "[1,\"a\",null,true,false]",
+      "canonical_hex": "5b312c2261222c6e756c6c2c747275652c66616c73655d",
+      "sha256": "d2498cace5d45e46866b3f6677814efdcf2b5ef9e1cefc91d607186bb9e3c49b"
+    }
+  ],
+  "rejects": [
+    {
+      "name": "reject/nan",
+      "input": {
+        "v": {
+          "$nonfinite": "nan"
+        }
+      },
+      "allow_datetime": true,
+      "error_contains": "v: non-finite float (NaN)"
+    },
+    {
+      "name": "reject/infinity",
+      "input": {
+        "v": {
+          "$nonfinite": "infinity"
+        }
+      },
+      "allow_datetime": true,
+      "error_contains": "v: non-finite float (Infinity)"
+    },
+    {
+      "name": "reject/negative-infinity",
+      "input": {
+        "v": {
+          "$nonfinite": "-infinity"
+        }
+      },
+      "allow_datetime": true,
+      "error_contains": "v: non-finite float (-Infinity)"
+    },
+    {
+      "name": "reject/int-above-2^53",
+      "input": {
+        "$int": "9007199254740993"
+      },
+      "allow_datetime": true,
+      "error_contains": "int exceeds +/-2**53"
+    },
+    {
+      "name": "reject/int-below-minus-2^53",
+      "input": {
+        "$int": "-9007199254740993"
+      },
+      "allow_datetime": true,
+      "error_contains": "int exceeds +/-2**53"
+    },
+    {
+      "name": "reject/naive-datetime",
+      "input": {
+        "t": {
+          "$datetime": "2024-03-01T12:00:00"
+        }
+      },
+      "allow_datetime": true,
+      "error_contains": "t: naive datetime is ambiguous"
+    },
+    {
+      "name": "reject/non-str-object-key",
+      "input": {
+        "$object": [
+          [
+            1,
+            "a"
+          ]
+        ]
+      },
+      "allow_datetime": true,
+      "error_contains": "object keys must be str, got int"
+    },
+    {
+      "name": "reject/tuple",
+      "input": {
+        "v": {
+          "$tuple": [
+            1,
+            2
+          ]
+        }
+      },
+      "allow_datetime": true,
+      "error_contains": "v: tuple is not JSON-native"
+    },
+    {
+      "name": "reject/set",
+      "input": {
+        "v": {
+          "$set": [
+            1,
+            2
+          ]
+        }
+      },
+      "allow_datetime": true,
+      "error_contains": "v: set is not JSON-native"
+    },
+    {
+      "name": "reject/bytes",
+      "input": {
+        "v": {
+          "$bytes": "x"
+        }
+      },
+      "allow_datetime": true,
+      "error_contains": "v: bytes is not JSON-native"
+    },
+    {
+      "name": "reject/decimal",
+      "input": {
+        "amount": {
+          "$decimal": "1.5"
+        }
+      },
+      "allow_datetime": true,
+      "error_contains": "amount: Decimal is not JSON-native; convert to str"
+    },
+    {
+      "name": "reject/date",
+      "input": {
+        "d": {
+          "$date": "2024-03-01"
+        }
+      },
+      "allow_datetime": true,
+      "error_contains": "d: date is not JSON-native"
+    },
+    {
+      "name": "reject/nesting-one-past-the-limit",
+      "input": {
+        "$nest": {
+          "kind": "list",
+          "depth": 65
+        }
+      },
+      "allow_datetime": true,
+      "error_contains": "nesting depth exceeds the maximum of 64"
+    },
+    {
+      "name": "reject/one-byte-past-the-size-limit",
+      "input": {
+        "$repeat": {
+          "value": "x",
+          "count": 1048575
+        }
+      },
+      "allow_datetime": true,
+      "error_contains": "canonical form is 1048577 bytes"
+    },
+    {
+      "name": "reject/unpaired-surrogate-value",
+      "input": {
+        "v": {
+          "$codepoint": 55296
+        }
+      },
+      "allow_datetime": true,
+      "error_contains": "v: str contains an unpaired surrogate"
+    },
+    {
+      "name": "reject/datetime-inside-a-payload",
+      "input": {
+        "when": {
+          "$datetime": "2024-03-01T12:00:00+00:00"
+        }
+      },
+      "allow_datetime": false,
+      "error_contains": "when: datetime is not allowed inside a payload"
+    }
+  ],
+  "entries": [
+    {
+      "name": "entry/fully-populated",
+      "entry": {
+        "format_version": 2,
+        "ledger_id": "11111111-1111-4111-8111-111111111111",
+        "sequence": 7,
+        "entry_id": "22222222-2222-4222-8222-222222222222",
+        "timestamp": {
+          "$datetime": "2024-03-01T12:00:00+00:00"
+        },
+        "data": {
+          "amount": "12.50",
+          "currency": "USD",
+          "event": "payment.captured"
+        },
+        "metadata": {
+          "actor": "billing-svc",
+          "request_id": "req-42"
+        },
+        "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "key_id": "kid-1",
+        "signature_algorithm": "ed25519",
+        "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "signature": "c2ln"
+      },
+      "preimage": "{\"data\":{\"amount\":\"12.50\",\"currency\":\"USD\",\"event\":\"payment.captured\"},\"entry_id\":\"22222222-2222-4222-8222-222222222222\",\"format_version\":2,\"key_id\":\"kid-1\",\"ledger_id\":\"11111111-1111-4111-8111-111111111111\",\"metadata\":{\"actor\":\"billing-svc\",\"request_id\":\"req-42\"},\"previous_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"sequence\":7,\"signature_algorithm\":\"ed25519\",\"timestamp\":1709294400000000}",
+      "preimage_hex": "7b2264617461223a7b22616d6f756e74223a2231322e3530222c2263757272656e6379223a22555344222c226576656e74223a227061796d656e742e6361707475726564227d2c22656e7472795f6964223a2232323232323232322d323232322d343232322d383232322d323232323232323232323232222c22666f726d61745f76657273696f6e223a322c226b65795f6964223a226b69642d31222c226c65646765725f6964223a2231313131313131312d313131312d343131312d383131312d313131313131313131313131222c226d65746164617461223a7b226163746f72223a2262696c6c696e672d737663222c22726571756573745f6964223a227265712d3432227d2c2270726576696f75735f68617368223a2230303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030222c2273657175656e6365223a372c227369676e61747572655f616c676f726974686d223a2265643235353139222c2274696d657374616d70223a313730393239343430303030303030307d",
+      "hashes": {
+        "sha256": "6745608d108a661ee1bac0fd51ff4382c06ed64adb5ac85e070f7b15497f78fb",
+        "sha512": "46fb76077f549e55f82d3918d9ed9149d5e59bcabb21a900179fcef9d5983efff82458d12152981711ce740e37cc5a3e767e50459390f7be2fe7924c07383826"
+      }
+    },
+    {
+      "name": "entry/unsigned-genesis",
+      "entry": {
+        "format_version": 2,
+        "ledger_id": "11111111-1111-4111-8111-111111111111",
+        "sequence": 0,
+        "entry_id": "33333333-3333-4333-8333-333333333333",
+        "timestamp": {
+          "$datetime": "2024-03-01T12:00:00+00:00"
+        },
+        "data": {
+          "event": "ledger.created"
+        },
+        "previous_hash": "abababababababababababababababababababababababababababababababab"
+      },
+      "preimage": "{\"data\":{\"event\":\"ledger.created\"},\"entry_id\":\"33333333-3333-4333-8333-333333333333\",\"format_version\":2,\"key_id\":null,\"ledger_id\":\"11111111-1111-4111-8111-111111111111\",\"metadata\":{},\"previous_hash\":\"abababababababababababababababababababababababababababababababab\",\"sequence\":0,\"signature_algorithm\":null,\"timestamp\":1709294400000000}",
+      "preimage_hex": "7b2264617461223a7b226576656e74223a226c65646765722e63726561746564227d2c22656e7472795f6964223a2233333333333333332d333333332d343333332d383333332d333333333333333333333333222c22666f726d61745f76657273696f6e223a322c226b65795f6964223a6e756c6c2c226c65646765725f6964223a2231313131313131312d313131312d343131312d383131312d313131313131313131313131222c226d65746164617461223a7b7d2c2270726576696f75735f68617368223a2261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162222c2273657175656e6365223a302c227369676e61747572655f616c676f726974686d223a6e756c6c2c2274696d657374616d70223a313730393239343430303030303030307d",
+      "hashes": {
+        "sha256": "76720b504fb70aee5c3e81e075a3dedf161c69aef8d8fa480a7c48bc3daf575e",
+        "sha512": "10770fff51a9bbb8f7104edc24b8a554d9517b8f6da7ac6b0a7c9141720693e7e1034a1c26f79cd8e3c3aee426af831d3bfeea887bc9a47d6b8982a6b0131999"
+      }
+    },
+    {
+      "name": "entry/unicode-payload",
+      "entry": {
+        "format_version": 2,
+        "ledger_id": "11111111-1111-4111-8111-111111111111",
+        "sequence": 1,
+        "entry_id": "44444444-4444-4444-8444-444444444444",
+        "timestamp": {
+          "$datetime": "2024-03-01T17:30:00+05:30"
+        },
+        "data": {
+          "note": "caf\u00e9 \u2615",
+          "emoji": "\ud83d\ude00"
+        },
+        "metadata": {},
+        "previous_hash": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      },
+      "preimage": "{\"data\":{\"emoji\":\"\ud83d\ude00\",\"note\":\"caf\u00e9 \u2615\"},\"entry_id\":\"44444444-4444-4444-8444-444444444444\",\"format_version\":2,\"key_id\":null,\"ledger_id\":\"11111111-1111-4111-8111-111111111111\",\"metadata\":{},\"previous_hash\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\",\"sequence\":1,\"signature_algorithm\":null,\"timestamp\":1709294400000000}",
+      "preimage_hex": "7b2264617461223a7b22656d6f6a69223a22f09f9880222c226e6f7465223a22636166c3a920e29895227d2c22656e7472795f6964223a2234343434343434342d343434342d343434342d383434342d343434343434343434343434222c22666f726d61745f76657273696f6e223a322c226b65795f6964223a6e756c6c2c226c65646765725f6964223a2231313131313131312d313131312d343131312d383131312d313131313131313131313131222c226d65746164617461223a7b7d2c2270726576696f75735f68617368223a2263646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364222c2273657175656e6365223a312c227369676e61747572655f616c676f726974686d223a6e756c6c2c2274696d657374616d70223a313730393239343430303030303030307d",
+      "hashes": {
+        "sha256": "52ed710abfa92ebb3febd56309deed37343a225c44f1ffcbd8c4678a7d2be25d",
+        "sha512": "39539ec1f29639edd7d326c5adc0c52aa2e9ff6acdca9f9fc5f511a1559c09d3848d8f2c4be3e3efa5c916bd0a9de024ab2fe4a16ef33a366e88c2d7881465a8"
+      }
+    }
+  ],
+  "genesis": [
+    {
+      "name": "genesis/v2-utc",
+      "ledger_id": "11111111-1111-4111-8111-111111111111",
+      "created_at": {
+        "$datetime": "2024-03-01T12:00:00+00:00"
+      },
+      "format_version": 2,
+      "preimage": "{\"created_at\":1709294400000000,\"format_version\":2,\"ledger_id\":\"11111111-1111-4111-8111-111111111111\",\"type\":\"signledger/genesis\"}",
+      "sha256": "252a08d34bdffa125b4a0d347b4871b031547c8449351e3b49619bb5c84c922c"
+    },
+    {
+      "name": "genesis/v2-offset-timezone",
+      "ledger_id": "11111111-1111-4111-8111-111111111111",
+      "created_at": {
+        "$datetime": "2024-03-01T17:30:00+05:30"
+      },
+      "format_version": 2,
+      "preimage": "{\"created_at\":1709294400000000,\"format_version\":2,\"ledger_id\":\"11111111-1111-4111-8111-111111111111\",\"type\":\"signledger/genesis\"}",
+      "sha256": "252a08d34bdffa125b4a0d347b4871b031547c8449351e3b49619bb5c84c922c"
+    },
+    {
+      "name": "genesis/other-ledger",
+      "ledger_id": "99999999-9999-4999-8999-999999999999",
+      "created_at": {
+        "$datetime": "2024-03-01T12:00:00+00:00"
+      },
+      "format_version": 2,
+      "preimage": "{\"created_at\":1709294400000000,\"format_version\":2,\"ledger_id\":\"99999999-9999-4999-8999-999999999999\",\"type\":\"signledger/genesis\"}",
+      "sha256": "9bfbf1fe495d6fa41b9f76359695ae740a6181e0bc912cf5e614774a25cdb400"
+    }
+  ]
+}

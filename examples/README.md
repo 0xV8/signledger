@@ -1,347 +1,149 @@
-# SignLedger Examples
+# SignLedger examples
 
-This directory contains comprehensive real-world examples demonstrating SignLedger usage across different industries and use cases.
+Three runnable examples. Each one is executed end to end by `tests/test_examples.py` on
+every test run, and CI fails if any of them stops working or stops printing what it
+promises.
 
-## Quick Start
+That test exists because v1.0.0 shipped three examples and all three crashed on first
+use. An example nobody runs is an example nobody knows is broken.
 
 ```bash
-# Install SignLedger from PyPI
-pip install signledger
-
-# Run any example
-python examples/flask_banking_app.py
+python examples/quickstart.py
+python examples/banking_sox.py
+python examples/healthcare_hipaa.py
 ```
 
-## Examples Overview
+No arguments, no setup, no database to provision. Each example builds everything it needs
+in a temporary directory and deletes it on exit, so you can run them repeatedly and they
+leave nothing behind.
 
-### 1. Flask Banking Application
+Only `quickstart.py` runs on a bare install. The other two need the signing extra:
 
-**File**: `flask_banking_app.py`
-
-A production-ready RESTful API for banking operations with complete audit trail.
-
-**Features**:
-- Account creation and management
-- Money transfers with validation
-- Transaction history
-- Audit trail with cryptographic signatures
-- Compliance reporting
-- Integrity verification API
-
-**Run**:
 ```bash
-python examples/flask_banking_app.py
+pip install 'signledger[signatures]'
 ```
-
-**Test**:
-```bash
-# In another terminal
-python examples/test_flask_app.py
-```
-
-**API Endpoints**:
-- `POST /api/accounts` - Create account
-- `GET /api/accounts/<id>` - Get account details
-- `POST /api/transactions/transfer` - Transfer money
-- `GET /api/transactions/<account_id>` - Get transactions
-- `GET /api/audit/verify` - Verify ledger integrity
-- `GET /api/audit/compliance-report` - Generate compliance report
 
 ---
 
-### 2. Healthcare HIPAA Compliance
+## The assurance ladder
 
-**File**: `real_world/healthcare_hipaa_compliance.py`
+SignLedger reports what a deployment's evidence is actually worth, computed at runtime by
+`Ledger.assurance_level()`. It is never asserted in prose and never hardcoded. The three
+examples deliberately land on three different rungs, and each says out loud what its rung
+does and does not buy:
 
-HIPAA-compliant audit logging for healthcare applications tracking Protected Health Information (PHI) access.
+| Example | Reaches | What that means |
+|---|---|---|
+| `quickstart.py` | `chain_only` | Accidental corruption and naive edits are detected. Someone with write access can still rewrite history and recompute every digest. |
+| `healthcare_hipaa.py` | `signed` | Entries cannot be forged or altered without the signing key. The newest entries can still be **deleted** without trace. |
+| `banking_sox.py` | `worm` | Signed, anchored outside the database, and the store itself refuses `UPDATE` and `DELETE`. |
 
-**Features**:
-- PHI access logging with signatures
-- User authentication tracking
-- Data modification audit trail
-- Patient data export logs
-- HIPAA compliance reporting
-- Complete patient access history
-
-**Run**:
-```bash
-python examples/real_world/healthcare_hipaa_compliance.py
-```
-
-**Use Cases**:
-- Electronic Health Records (EHR) systems
-- Medical practice management software
-- Hospital information systems
-- Healthcare data exchanges
-
-**Compliance Coverage**:
-- 45 CFR 164.308(a)(1)(ii)(D) - Access audit logs
-- 45 CFR 164.312(a)(2)(i) - User authentication
-- 45 CFR 164.508 - Authorization tracking
+A bare hash chain is not tamper-evidence. SHA-256 is public, so the chain alone only ever
+proves internal consistency. The two things that actually stop an insider are a secret
+they cannot forge (signatures) and a witness they do not control (an external anchor).
 
 ---
 
-### 3. E-Commerce Order Tracking
+## 1. `quickstart.py` — append, verify, get caught
 
-**File**: `real_world/ecommerce_order_tracking.py`
+The five-minute tour, on SQLite.
 
-Complete order lifecycle tracking for e-commerce platforms.
+It appends a handful of payment events, verifies the chain, and then attacks it twice:
 
-**Features**:
-- Order placement and status tracking
-- Payment processing logs
-- Inventory management audit
-- Shipment tracking
-- Returns and refunds logging
-- Customer activity tracking
-- Sales reporting
+1. A plain `UPDATE` against the entries table. SQLite **refuses it** — the schema carries
+   `BEFORE UPDATE` and `BEFORE DELETE` triggers, so the rows are append-only at the
+   database level.
+2. The attack that works: drop the trigger first, then rewrite a refund amount. The row
+   ends up looking completely ordinary to anyone reading the table.
 
-**Run**:
-```bash
-python examples/real_world/ecommerce_order_tracking.py
-```
+Verification then reports `bad_hash` against the exact sequence number, because the digest
+is recomputed from the row rather than trusted from it.
 
-**Use Cases**:
-- Online retail platforms
-- Marketplace applications
-- Dropshipping systems
-- Subscription services
-
-**Tracked Events**:
-- `ORDER_CREATED` - New order placement
-- `PAYMENT_PROCESSED` - Payment confirmation
-- `INVENTORY_UPDATE` - Stock changes
-- `ORDER_STATUS_CHANGE` - Order lifecycle
-- `SHIPMENT_CREATED` - Shipping initiated
-- `SHIPMENT_STATUS` - Tracking updates
-- `RETURN_REQUEST` - Return requests
-- `REFUND_PROCESSED` - Refund completion
-- `CUSTOMER_ACTIVITY` - User actions
+Read this one first. It is also the shortest path to understanding why the other two
+examples bother with keys and anchors.
 
 ---
 
-## Common Patterns
+## 2. `banking_sox.py` — signatures, checkpoints, external anchoring
 
-### Basic Usage
+A SOX-style financial audit trail. Deliberately a script and not a web service: v1's
+flagship example was a Flask app that returned HTTP 500 from every endpoint while bound to
+every network interface with the debug console enabled. A script runs in CI, so it stays
+working.
 
-```python
-from signledger import Ledger
-from signledger.backends import SQLiteBackend
+Demonstrates:
 
-# Create ledger
-ledger = Ledger(backend=SQLiteBackend("audit.db"))
+- **A signing key loaded from a file**, as an encrypted PKCS#8 PEM, the way it would arrive
+  from a secrets mount. Public keys are resolved from a directory by `FileKeyResolver`,
+  which indexes them by fingerprint — so renaming a key file cannot re-point a `key_id`.
+- **Ledger-first writes.** The balance moves only *after* the append succeeds. v1 moved the
+  money first, so a failed append left funds transferred with no record of it.
+- **Refusals are logged too.** An overdraw attempt is an auditable event; a control that
+  only records its successes cannot be shown to have rejected anything.
+- **Bulk posting** of end-of-day fees through `BatchProcessor`, including what an atomic
+  batch does when one item in the submission is unusable (nothing is committed).
+- **Checkpointing and anchoring** to a file kept outside the database directory. This is
+  the control that makes a truncated tail visible. In production the anchor belongs on a
+  different host, under a different account, or with a notarization service — the point is
+  segregation of duties, not the file format.
 
-# Add entry
-entry = ledger.append({
-    "action": "user_login",
-    "user_id": "user123",
-    "ip": "192.168.1.1"
-})
+It reaches `worm` and then explains precisely how much that is worth: the append-only
+trigger stops the application and a careless operator, but someone with file-level write
+access can drop it in one statement. What survives that attacker is the signature they
+cannot forge and the anchor they do not control.
 
-# Verify integrity
-is_valid = ledger.verify_integrity()
+---
 
-# Query entries
-entries = ledger.query(
-    lambda e: e.data.get("user_id") == "user123"
-)
+## 3. `healthcare_hipaa.py` — PHI access logging, redacted
 
-# Close ledger
-ledger.close()
-```
+HIPAA-style audit logging for access to Protected Health Information, under
+45 CFR 164.312(b).
 
-### With Cryptographic Signatures
+The interesting work happens **before `append()` is ever called**. SignLedger redacts
+nothing on your behalf — it preserves exactly what you hand it, forever, in a store built
+to make deletion detectable. That is the whole reason the filtering has to happen at the
+call site.
 
-```python
-from signledger.crypto.signatures import RSASigner
+The example prints both halves side by side:
 
-# Initialize signer
-signer = RSASigner(key_size=2048)
+- **Captured:** who accessed the record, their role, the action, the purpose of use, the
+  field *names* touched, and the outcome.
+- **Not captured:** the medical record number, name, date of birth, SSN, diagnosis,
+  medications and clinical notes.
 
-# Create wrapper for string-to-bytes conversion
-def sign_wrapper(data_str):
-    if isinstance(data_str, str):
-        data_str = data_str.encode('utf-8')
-    return signer.sign(data_str)
+Entries carry a pseudonymous subject id — an HMAC of the medical record number under a key
+that lives with the covered entity and never enters the log. Every access to one patient
+stays correlatable, which is what makes an access history useful, while the log on its own
+cannot name anybody.
 
-# Append signed entry
-entry = ledger.append(
-    {"transaction": "critical_operation"},
-    sign=True,
-    signer=sign_wrapper
-)
+It then scans every stored payload for the known PHI values and proves none of them
+leaked, rather than asserting it in a comment.
 
-# Verify signature
-is_valid = signer.verify(
-    entry.hash.encode('utf-8'),
-    entry.signature
-)
-```
+---
 
-### Context Manager
+## Using the bulk path
 
-```python
-with Ledger(backend=SQLiteBackend("audit.db")) as ledger:
-    ledger.append({"event": "process_started"})
-    # Process data
-    ledger.append({"event": "process_completed"})
-# Ledger automatically closed
-```
-
-## Integration Examples
-
-### Django Middleware
+`BatchProcessor` (shown in `banking_sox.py`) validates, hashes and signs an entire batch
+before writing anything, so a bad item aborts the whole submission with nothing committed:
 
 ```python
 from signledger import Ledger
-from signledger.backends import PostgreSQLBackend
+from signledger.core.batch import BatchItem, BatchProcessor
 
-class AuditMiddleware:
-    def __init__(self, get_response):
-        self.get_response = get_response
-        self.ledger = Ledger(
-            backend=PostgreSQLBackend(
-                host="localhost",
-                database="audit_db"
-            )
-        )
+with Ledger() as ledger:
+    result = BatchProcessor(ledger).append_batch([
+        {"event": "fee.posted", "account": "ACC-1001", "amount": "2.50"},
+        BatchItem(data={"event": "interest.accrued"}, metadata={"run": "eod"}),
+    ])
 
-    def __call__(self, request):
-        # Log request
-        self.ledger.append({
-            "type": "http_request",
-            "method": request.method,
-            "path": request.path,
-            "user": str(request.user)
-        })
-
-        response = self.get_response(request)
-        return response
+if not result.ok:
+    for letter in result.dead_letters:
+        print(f"item {letter.index} refused: {letter.error} - {letter.message}")
 ```
 
-### Flask Decorator
+A bare `dict` is always the entry's `data`. Use `BatchItem` to attach metadata, pin a
+timestamp or supply your own `entry_id`.
 
-```python
-from functools import wraps
-from flask import request
-
-def audit_log(event_type):
-    def decorator(f):
-        @wraps(f)
-        def wrapper(*args, **kwargs):
-            # Log before execution
-            ledger.append({
-                "event": event_type,
-                "endpoint": request.endpoint,
-                "user": get_current_user()
-            })
-            return f(*args, **kwargs)
-        return wrapper
-    return decorator
-
-@app.route('/api/critical-operation')
-@audit_log("critical_operation")
-def critical_operation():
-    # Your code here
-    pass
-```
-
-### FastAPI Dependency
-
-```python
-from fastapi import Depends
-from signledger import Ledger
-
-async def get_ledger():
-    ledger = Ledger(backend=SQLiteBackend("audit.db"))
-    try:
-        yield ledger
-    finally:
-        ledger.close()
-
-@app.post("/api/action")
-async def perform_action(
-    ledger: Ledger = Depends(get_ledger)
-):
-    entry = await ledger.append_async({
-        "action": "api_call",
-        "timestamp": datetime.utcnow().isoformat()
-    })
-    return {"entry_id": entry.id}
-```
-
-## Performance Tips
-
-1. **Use Batch Operations** for high-throughput scenarios:
-   ```python
-   from signledger.core.batch import BatchProcessor
-
-   batch = BatchProcessor(ledger, batch_size=1000)
-   for i in range(10000):
-       batch.add_entry({"transaction": i})
-   batch.flush()
-   ```
-
-2. **Enable Compression** for large-scale deployments:
-   ```python
-   from signledger.compression import Compressor
-
-   ledger = Ledger(
-       backend=SQLiteBackend("audit.db"),
-       compression=Compressor(algorithm="zstd")
-   )
-   ```
-
-3. **Use Connection Pooling** for concurrent access:
-   ```python
-   from signledger.pool import ConnectionPool
-
-   pool = ConnectionPool(
-       backend_class=PostgreSQLBackend,
-       max_connections=10,
-       host="localhost",
-       database="audit_db"
-   )
-   ```
-
-## Testing
-
-All examples include comprehensive testing:
-
-```bash
-# Run all tests
-python -m pytest examples/
-
-# Run specific test
-python examples/test_flask_app.py
-```
-
-## Database Files
-
-Examples create SQLite database files in the current directory:
-- `banking_audit.db` - Flask banking app
-- `hipaa_demo.db` - Healthcare compliance
-- `ecommerce_demo.db` - E-commerce tracking
-
-These can be deleted after testing.
-
-## Production Deployment
-
-For production use:
-
-1. **Use PostgreSQL or MongoDB** instead of SQLite
-2. **Enable cryptographic signatures** for critical events
-3. **Set up automated integrity verification**
-4. **Configure proper backup strategies**
-5. **Implement access controls** for audit logs
-6. **Set up monitoring and alerting**
-
-## Support
-
-- GitHub: https://github.com/vipin08/signledger
-- PyPI: https://pypi.org/project/signledger/
-- Issues: https://github.com/vipin08/signledger/issues
-
-## License
-
-MIT License - See LICENSE file for details
+There is no parallel mode, and there will not be one. A hash chain is serial at the tip —
+entry *n* cannot exist until entry *n-1* has a digest — so extra threads can only contend
+for it. v1 shipped the flag anyway and it measured 0.67x a plain `append` loop.

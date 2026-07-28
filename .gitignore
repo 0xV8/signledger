@@ -129,7 +129,15 @@ dmypy.json
 .DS_Store
 Thumbs.db
 
+# Ruff
+.ruff_cache/
+
 # Project specific
 *.db
 audit.db
 test_*.db
+
+# SQLite WAL-mode sidecar files. `*.db` alone does not match these, which is how
+# ledger.db-shm and ledger.db-wal ended up untracked-but-visible in the tree.
+*.db-shm
+*.db-wal

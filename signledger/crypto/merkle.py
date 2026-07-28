@@ -1,387 +1,484 @@
-"""Merkle tree implementation for SignLedger."""
+"""RFC 6962 Merkle tree (architecture contract, section 7)."""
 
 import hashlib
-import json
-import math
-from typing import List, Tuple, Optional, Dict, Any, Union
+import hmac
 from dataclasses import dataclass
-import logging
+from typing import Iterable, Optional, Sequence, Tuple
 
-logger = logging.getLogger(__name__)
+from signledger.core.exceptions import ConfigurationError, ValidationError
+from signledger.crypto.hashing import DEFAULT_ALGORITHM, SUPPORTED_ALGORITHMS
+
+__all__ = [
+    "LEAF_PREFIX",
+    "NODE_PREFIX",
+    "ROOT_PREFIX",
+    "ConsistencyProof",
+    "InclusionProof",
+    "MerkleTree",
+    "ProofStep",
+    "expected_path_length",
+    "leaf_hash",
+    "node_hash",
+    "verify_consistency",
+    "verify_inclusion",
+]
+
+#: Domain tag for a leaf. RFC 6962 section 2.1.
+LEAF_PREFIX = b"\x00"
+
+#: Domain tag for an interior node. RFC 6962 section 2.1.
+NODE_PREFIX = b"\x01"
+
+#: Domain tag for the count-bound root. Contract section 7: "leaf count is bound into the
+#: root". This is a SignLedger addition on top of RFC 6962, whose MTH commits to the leaf
+#: count only implicitly through the tree shape - and not at all for a one-leaf tree,
+#: where the MTH *is* a leaf digest.
+ROOT_PREFIX = b"\x02"
+
+#: Width of the big-endian leaf count in the root preimage.
+_COUNT_BYTES = 8
 
 
-@dataclass
-class MerkleNode:
-    """Represents a node in the Merkle tree."""
-    hash: str
-    left: Optional['MerkleNode'] = None
-    right: Optional['MerkleNode'] = None
-    is_leaf: bool = False
-    data: Optional[Any] = None
-    index: Optional[int] = None
+def _digest(algorithm: str, payload: bytes) -> bytes:
+    return hashlib.new(algorithm, payload).digest()
 
 
-@dataclass
-class MerkleProof:
-    """Proof of inclusion for a leaf in the Merkle tree."""
-    leaf_hash: str
-    leaf_index: int
-    root_hash: str
-    proof_path: List[Tuple[str, str]]  # List of (hash, direction) tuples
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert proof to dictionary."""
-        return {
-            'leaf_hash': self.leaf_hash,
-            'leaf_index': self.leaf_index,
-            'root_hash': self.root_hash,
-            'proof_path': self.proof_path
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'MerkleProof':
-        """Create proof from dictionary."""
-        return cls(
-            leaf_hash=data['leaf_hash'],
-            leaf_index=data['leaf_index'],
-            root_hash=data['root_hash'],
-            proof_path=[(h, d) for h, d in data['proof_path']]
+def _leaf_digest(algorithm: str, data_item: bytes) -> bytes:
+    return _digest(algorithm, LEAF_PREFIX + data_item)
+
+
+def _node_digest(algorithm: str, left: bytes, right: bytes) -> bytes:
+    return _digest(algorithm, NODE_PREFIX + left + right)
+
+
+def _digest_size(algorithm: str) -> int:
+    return hashlib.new(algorithm).digest_size
+
+
+def _unhex(value: str, width: int) -> Optional[bytes]:
+    """Decode an attacker-supplied hex digest, or ``None`` if it is not one."""
+    try:
+        raw = bytes.fromhex(value)
+    except (TypeError, ValueError):
+        return None
+    return raw if len(raw) == width else None
+
+
+def _check_data_item(data_item: bytes) -> bytes:
+    """Leaves are raw bytes only.
+
+    Accepting ``str`` would put an implicit encoding choice inside the digest, and
+    accepting ``bytearray`` would let a caller mutate a leaf after the tree was built.
+    """
+    if not isinstance(data_item, bytes):
+        raise ValidationError(
+            f"a Merkle leaf must be bytes, got {type(data_item).__name__}"
         )
+    return data_item
+
+
+def _check_leaf_index(tree_size: int, leaf_index: int) -> None:
+    if tree_size < 1:
+        raise ValidationError(f"a tree of {tree_size} leaves has no leaf to prove")
+    if not 0 <= leaf_index < tree_size:
+        raise ValidationError(
+            f"leaf_index {leaf_index} is outside a tree of {tree_size} leaves"
+        )
+
+
+def _same_digest(left: str, right: str) -> bool:
+    """Constant-time hex comparison (contract section 5 rule 7).
+
+    Compares UTF-8 bytes rather than ``str``: ``compare_digest`` raises on a non-ASCII
+    ``str``, and a tampered value must make a verifier answer False, never crash it.
+    """
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+
+
+def _check_algorithm(algorithm: str) -> str:
+    if algorithm not in SUPPORTED_ALGORITHMS:
+        raise ConfigurationError(
+            f"unsupported hash algorithm {algorithm!r}; "
+            f"choose one of {sorted(SUPPORTED_ALGORITHMS)}"
+        )
+    return algorithm
+
+
+def _largest_power_of_two_below(n: int) -> int:
+    """Return the largest power of two **strictly** less than ``n`` (``n >= 2``)."""
+    return 1 << ((n - 1).bit_length() - 1)
+
+
+def _bind_count(algorithm: str, leaf_count: int, tree_hash: bytes) -> bytes:
+    """Return ``H(0x02 || uint64_be(leaf_count) || mth)``.
+
+    Without this an inclusion proof says only "this item is *a* leaf of *a* tree with
+    this shape"; with it the root a verifier is handed also pins how many leaves that
+    tree has, so a proof cut from one tree size cannot be replayed against another.
+    """
+    return _digest(
+        algorithm, ROOT_PREFIX + leaf_count.to_bytes(_COUNT_BYTES, "big") + tree_hash
+    )
+
+
+def _mth(algorithm: str, leaf_digests: Sequence[bytes]) -> bytes:
+    """RFC 6962 section 2.1 Merkle Tree Hash over already-hashed leaves."""
+    n = len(leaf_digests)
+    if n == 0:
+        return _digest(algorithm, b"")
+    if n == 1:
+        return leaf_digests[0]
+    k = _largest_power_of_two_below(n)
+    return _node_digest(
+        algorithm, _mth(algorithm, leaf_digests[:k]), _mth(algorithm, leaf_digests[k:])
+    )
+
+
+def leaf_hash(data_item: bytes, algorithm: str = DEFAULT_ALGORITHM) -> str:
+    """Return the hex leaf digest ``H(0x00 || data_item)``."""
+    return _leaf_digest(_check_algorithm(algorithm), _check_data_item(data_item)).hex()
+
+
+def node_hash(left: str, right: str, algorithm: str = DEFAULT_ALGORITHM) -> str:
+    """Return the hex interior digest ``H(0x01 || left || right)``.
+
+    ``left`` and ``right`` are hex, but they are hashed as **raw digest bytes**: hashing
+    the hex text instead would diverge from every other RFC 6962 implementation.
+    """
+    return _node_digest(
+        _check_algorithm(algorithm), bytes.fromhex(left), bytes.fromhex(right)
+    ).hex()
+
+
+@dataclass(frozen=True)
+class ProofStep:
+    """One level of an audit path: the sibling subtree digest and which side it is on."""
+
+    sibling_hash: str
+    sibling_is_left: bool
+
+
+@dataclass(frozen=True)
+class InclusionProof:
+    """An RFC 6962 audit path.
+
+    Deliberately carries **no root and no leaf digest**. Both are the verifier's job:
+    the root comes from the caller as trusted input, and the leaf digest is re-derived
+    from the data item. v1 stored both on the proof and checked the proof against
+    itself, which authenticated every forgery.
+    """
+
+    leaf_index: int
+    tree_size: int
+    path: Tuple[ProofStep, ...]
+    algorithm: str
+
+
+@dataclass(frozen=True)
+class ConsistencyProof:
+    """An RFC 6962 consistency proof: the old tree is a prefix of the new one.
+
+    Carries no roots, for the same reason :class:`InclusionProof` carries none - both
+    roots are the caller's trusted input. ``path`` is the RFC 6962 SUBPROOF array with
+    the old tree hash materialised when ``old_size`` is a power of two, so the proof can
+    be checked against the two count-bound roots and nothing else.
+    """
+
+    old_size: int
+    new_size: int
+    path: Tuple[str, ...]
+    algorithm: str
+
+
+def _audit_path(
+    algorithm: str, leaf_digests: Sequence[bytes], index: int
+) -> Tuple[ProofStep, ...]:
+    """RFC 6962 section 2.1.1 PATH(index, leaf_digests), ordered leaf-upwards."""
+    n = len(leaf_digests)
+    if n == 1:
+        return ()
+    k = _largest_power_of_two_below(n)
+    if index < k:
+        sibling = _mth(algorithm, leaf_digests[k:])
+        return _audit_path(algorithm, leaf_digests[:k], index) + (
+            ProofStep(sibling.hex(), sibling_is_left=False),
+        )
+    sibling = _mth(algorithm, leaf_digests[:k])
+    return _audit_path(algorithm, leaf_digests[k:], index - k) + (
+        ProofStep(sibling.hex(), sibling_is_left=True),
+    )
+
+
+def _audit_directions(tree_size: int, leaf_index: int) -> Tuple[bool, ...]:
+    """The side each audit-path sibling must sit on, derived from the tree shape alone.
+
+    This is what binds ``leaf_index`` to the proof. Verification recomputes the sequence
+    from ``(tree_size, leaf_index)`` and refuses a path that does not match it, so the
+    index cannot be edited to relocate an item within the tree.
+    """
+    if tree_size == 1:
+        return ()
+    k = _largest_power_of_two_below(tree_size)
+    if leaf_index < k:
+        return _audit_directions(k, leaf_index) + (False,)
+    return _audit_directions(tree_size - k, leaf_index - k) + (True,)
+
+
+def expected_path_length(tree_size: int, leaf_index: int) -> int:
+    """Return how many audit-path steps a proof for ``leaf_index`` must carry.
+
+    For a full tree this is ``ceil(log2(tree_size))`` for every leaf. For a ragged tree
+    a promoted leaf sits above the deepest level and needs fewer steps, so the contract's
+    ``ceil(log2(n))`` is the *longest* path rather than every path.
+    """
+    _check_leaf_index(tree_size, leaf_index)
+    return len(_audit_directions(tree_size, leaf_index))
+
+
+def _subproof(
+    algorithm: str, leaf_digests: Sequence[bytes], m: int, complete: bool
+) -> Tuple[bytes, ...]:
+    """RFC 6962 section 2.1.2 SUBPROOF(m, leaf_digests, complete)."""
+    n = len(leaf_digests)
+    if m == n:
+        # ``complete`` means the old tree is exactly this subtree, so the verifier
+        # already holds its hash and the RFC omits it.
+        return () if complete else (_mth(algorithm, leaf_digests),)
+    k = _largest_power_of_two_below(n)
+    if m <= k:
+        return _subproof(algorithm, leaf_digests[:k], m, complete) + (
+            _mth(algorithm, leaf_digests[k:]),
+        )
+    return _subproof(algorithm, leaf_digests[k:], m - k, False) + (
+        _mth(algorithm, leaf_digests[:k]),
+    )
+
+
+def _is_power_of_two(n: int) -> bool:
+    return n & (n - 1) == 0
 
 
 class MerkleTree:
-    """Merkle tree for efficient verification of data integrity."""
-    
-    def __init__(self, hash_func: str = 'sha256'):
-        self.hash_func = hash_func
-        self.root: Optional[MerkleNode] = None
-        self.leaves: List[MerkleNode] = []
-        self._leaf_map: Dict[str, int] = {}  # Hash to index mapping
-    
-    def build(self, data_items: List[Union[str, Dict[str, Any]]]) -> str:
-        """Build Merkle tree from data items."""
-        if not data_items:
-            raise ValueError("Cannot build Merkle tree from empty data")
-        
-        # Create leaf nodes
-        self.leaves = []
-        self._leaf_map = {}
-        
-        for i, item in enumerate(data_items):
-            # Convert to string if needed
-            if isinstance(item, dict):
-                item_str = json.dumps(item, sort_keys=True)
-            else:
-                item_str = str(item)
-            
-            leaf_hash = self._hash(item_str)
-            leaf_node = MerkleNode(
-                hash=leaf_hash,
-                is_leaf=True,
-                data=item,
-                index=i
-            )
-            self.leaves.append(leaf_node)
-            self._leaf_map[leaf_hash] = i
-        
-        # Build tree
-        self.root = self._build_tree(self.leaves)
-        return self.root.hash
-    
-    def _build_tree(self, nodes: List[MerkleNode]) -> MerkleNode:
-        """Recursively build the Merkle tree."""
-        if len(nodes) == 1:
-            return nodes[0]
-        
-        # Create parent level
-        parent_nodes = []
-        
-        for i in range(0, len(nodes), 2):
-            left = nodes[i]
-            # Handle odd number of nodes
-            right = nodes[i + 1] if i + 1 < len(nodes) else left
-            
-            # Create parent node
-            parent_hash = self._hash(left.hash + right.hash)
-            parent = MerkleNode(
-                hash=parent_hash,
-                left=left,
-                right=right
-            )
-            parent_nodes.append(parent)
-        
-        # Recursively build upper levels
-        return self._build_tree(parent_nodes)
-    
-    def get_root(self) -> Optional[str]:
-        """Get the root hash of the tree."""
-        return self.root.hash if self.root else None
-    
-    def generate_proof(self, data_item: Union[str, Dict[str, Any], int]) -> Optional[MerkleProof]:
-        """Generate proof of inclusion for a data item."""
-        if not self.root:
-            return None
-        
-        # Find leaf index
-        if isinstance(data_item, int):
-            # Direct index provided
-            if 0 <= data_item < len(self.leaves):
-                leaf_index = data_item
-                leaf_hash = self.leaves[leaf_index].hash
-            else:
-                return None
-        else:
-            # Hash the data item
-            if isinstance(data_item, dict):
-                item_str = json.dumps(data_item, sort_keys=True)
-            else:
-                item_str = str(data_item)
-            
-            leaf_hash = self._hash(item_str)
-            
-            if leaf_hash not in self._leaf_map:
-                return None
-            
-            leaf_index = self._leaf_map[leaf_hash]
-        
-        # Generate proof path
-        proof_path = self._generate_proof_path(leaf_index)
-        
-        return MerkleProof(
-            leaf_hash=leaf_hash,
-            leaf_index=leaf_index,
-            root_hash=self.root.hash,
-            proof_path=proof_path
+    """An immutable RFC 6962 Merkle tree over a fixed list of data items."""
+
+    def __init__(
+        self, leaves: Iterable[bytes], algorithm: str = DEFAULT_ALGORITHM
+    ) -> None:
+        self._algorithm = _check_algorithm(algorithm)
+        self._leaf_digests: Tuple[bytes, ...] = tuple(
+            _leaf_digest(self._algorithm, _check_data_item(item)) for item in leaves
         )
-    
-    def _generate_proof_path(self, leaf_index: int) -> List[Tuple[str, str]]:
-        """Generate the proof path from leaf to root."""
-        proof_path = []
-        
-        # Calculate path through tree levels
-        current_index = leaf_index
-        level_size = len(self.leaves)
-        
-        # Start from leaves and work up
-        nodes = self.leaves.copy()
-        
-        while level_size > 1:
-            # Find sibling
-            if current_index % 2 == 0:
-                # Current is left, sibling is right
-                sibling_index = current_index + 1
-                direction = 'right'
-            else:
-                # Current is right, sibling is left
-                sibling_index = current_index - 1
-                direction = 'left'
-            
-            # Handle edge case for odd number of nodes
-            if sibling_index >= level_size:
-                sibling_index = current_index
-            
-            # Add sibling to proof path
-            sibling_hash = nodes[sibling_index].hash
-            proof_path.append((sibling_hash, direction))
-            
-            # Move to parent level
-            current_index //= 2
-            
-            # Build parent level
-            parent_nodes = []
-            for i in range(0, level_size, 2):
-                left = nodes[i]
-                right = nodes[i + 1] if i + 1 < level_size else left
-                parent_hash = self._hash(left.hash + right.hash)
-                parent_nodes.append(MerkleNode(hash=parent_hash))
-            
-            nodes = parent_nodes
-            level_size = len(parent_nodes)
-        
-        return proof_path
-    
-    def verify_proof(self, proof: MerkleProof) -> bool:
-        """Verify a Merkle proof."""
-        # Start with leaf hash
-        current_hash = proof.leaf_hash
-        
-        # Follow proof path
-        for sibling_hash, direction in proof.proof_path:
-            if direction == 'left':
-                # Sibling is on the left
-                current_hash = self._hash(sibling_hash + current_hash)
-            else:
-                # Sibling is on the right
-                current_hash = self._hash(current_hash + sibling_hash)
-        
-        # Check if we reached the expected root
-        return current_hash == proof.root_hash
-    
-    def _hash(self, data: Union[str, bytes]) -> str:
-        """Hash data using the configured hash function."""
-        if isinstance(data, str):
-            data = data.encode('utf-8')
-        
-        hasher = hashlib.new(self.hash_func)
-        hasher.update(data)
-        return hasher.hexdigest()
-    
-    def get_leaves(self) -> List[str]:
-        """Get all leaf hashes."""
-        return [leaf.hash for leaf in self.leaves]
-    
-    def visualize(self) -> str:
-        """Create a text visualization of the tree."""
-        if not self.root:
-            return "Empty tree"
-        
-        lines = []
-        self._visualize_node(self.root, "", True, lines)
-        return "\n".join(lines)
-    
-    def _visualize_node(self, node: MerkleNode, prefix: str, is_tail: bool, lines: List[str]):
-        """Recursively visualize tree nodes."""
-        # Add current node
-        connector = "└── " if is_tail else "├── "
-        lines.append(prefix + connector + node.hash[:8] + ("... (leaf)" if node.is_leaf else "..."))
-        
-        # Add children
-        if node.left and not node.is_leaf:
-            extension = "    " if is_tail else "│   "
-            if node.right and node.right != node.left:
-                self._visualize_node(node.left, prefix + extension, False, lines)
-                self._visualize_node(node.right, prefix + extension, True, lines)
-            else:
-                self._visualize_node(node.left, prefix + extension, True, lines)
+        # The tree is immutable, so the hash is computed once here rather than on every
+        # property access.
+        self._tree_hash = _mth(self._algorithm, self._leaf_digests)
+
+    @property
+    def algorithm(self) -> str:
+        """The digest algorithm every node in this tree is built with."""
+        return self._algorithm
+
+    @property
+    def leaf_count(self) -> int:
+        """The number of data items in the tree."""
+        return len(self._leaf_digests)
+
+    @property
+    def merkle_tree_hash(self) -> str:
+        """The bare RFC 6962 MTH, for interoperability with other implementations.
+
+        Use :attr:`root` for anything security-bearing: this value does not commit to
+        the leaf count.
+        """
+        return self._tree_hash.hex()
+
+    @property
+    def root(self) -> str:
+        """The SignLedger root: the RFC 6962 MTH with the leaf count bound in."""
+        return _bind_count(self._algorithm, self.leaf_count, self._tree_hash).hex()
+
+    def generate_inclusion_proof(self, leaf_index: int) -> InclusionProof:
+        """Return the audit path proving the item at ``leaf_index`` is in this tree."""
+        _check_leaf_index(self.leaf_count, leaf_index)
+        return InclusionProof(
+            leaf_index=leaf_index,
+            tree_size=self.leaf_count,
+            path=_audit_path(self._algorithm, self._leaf_digests, leaf_index),
+            algorithm=self._algorithm,
+        )
+
+    def generate_consistency_proof(self, old_size: int) -> ConsistencyProof:
+        """Return the proof that the first ``old_size`` leaves are a prefix of this tree.
+
+        ``old_size == 0`` is refused rather than answered with an empty proof: nothing
+        can be demonstrated about an empty tree, and an empty list is exactly what v1
+        returned for every call.
+        """
+        if old_size < 1:
+            raise ValidationError(
+                f"old_size must be at least 1 to prove anything, got {old_size}"
+            )
+        if old_size > self.leaf_count:
+            raise ValidationError(
+                f"old_size {old_size} exceeds the tree's {self.leaf_count} leaves"
+            )
+        path: Tuple[bytes, ...] = ()
+        if old_size < self.leaf_count:
+            path = _subproof(self._algorithm, self._leaf_digests, old_size, True)
+            if _is_power_of_two(old_size):
+                # RFC 9162 section 2.1.4.2 step 2, done here rather than in the verifier:
+                # a count-bound root cannot be unwrapped back into this tree hash.
+                path = (_mth(self._algorithm, self._leaf_digests[:old_size]), *path)
+        return ConsistencyProof(
+            old_size=old_size,
+            new_size=self.leaf_count,
+            path=tuple(node.hex() for node in path),
+            algorithm=self._algorithm,
+        )
 
 
-class IncrementalMerkleTree:
-    """Merkle tree that supports incremental updates."""
-    
-    def __init__(self, hash_func: str = 'sha256'):
-        self.hash_func = hash_func
-        self.levels: List[List[str]] = [[]]  # Level 0 is leaves
-        self._hasher = lambda x: hashlib.new(hash_func, x.encode() if isinstance(x, str) else x).hexdigest()
-    
-    def append(self, data: Union[str, Dict[str, Any]]) -> str:
-        """Append a new leaf and update the tree."""
-        # Convert to string if needed
-        if isinstance(data, dict):
-            data_str = json.dumps(data, sort_keys=True)
-        else:
-            data_str = str(data)
-        
-        # Hash the data
-        leaf_hash = self._hasher(data_str)
-        
-        # Add to leaves
-        self.levels[0].append(leaf_hash)
-        
-        # Update tree
-        self._update_tree(len(self.levels[0]) - 1)
-        
-        return leaf_hash
-    
-    def _update_tree(self, new_leaf_index: int):
-        """Update tree after adding a new leaf."""
-        current_index = new_leaf_index
-        
-        for level in range(len(self.levels) - 1):
-            # Check if we need a new level
-            if level + 1 >= len(self.levels):
-                self.levels.append([])
-            
-            # Check if this is a right child
-            if current_index % 2 == 1:
-                # Combine with left sibling
-                left_hash = self.levels[level][current_index - 1]
-                right_hash = self.levels[level][current_index]
-                parent_hash = self._hasher(left_hash + right_hash)
-                
-                # Add or update parent
-                parent_index = current_index // 2
-                if parent_index >= len(self.levels[level + 1]):
-                    self.levels[level + 1].append(parent_hash)
-                else:
-                    self.levels[level + 1][parent_index] = parent_hash
-                
-                current_index = parent_index
-            else:
-                # This is a left child, wait for right sibling
-                break
-    
-    def get_root(self) -> Optional[str]:
-        """Get current root hash."""
-        if not self.levels[0]:
+def verify_inclusion(
+    proof: InclusionProof, data_item: bytes, expected_root: str
+) -> bool:
+    """Return whether ``data_item`` is the leaf ``proof`` claims, under ``expected_root``.
+
+    ``expected_root`` is a **required caller argument** and is the only trusted input.
+    Nothing is read off ``proof`` that the proof could use to authenticate itself: the
+    leaf digest is recomputed from ``data_item``, and the root is recomputed from that
+    leaf and compared against what the caller already believed.
+
+    Malformed *proofs* answer False rather than raising: a proof is attacker-controlled
+    input, and a verifier that crashes on a hostile path is a denial of service. A
+    malformed ``expected_root`` or ``data_item`` does raise, because those are the
+    caller's own arguments and silently answering "not included" would hide the bug.
+    """
+    if not isinstance(proof, InclusionProof):
+        raise ValidationError(
+            f"proof must be an InclusionProof, got {type(proof).__name__}"
+        )
+    if not isinstance(data_item, bytes):
+        raise ValidationError(
+            f"data_item must be bytes, got {type(data_item).__name__}"
+        )
+    if not isinstance(expected_root, str):
+        raise ValidationError(
+            f"expected_root must be a hex str, got {type(expected_root).__name__}"
+        )
+    if not expected_root:
+        raise ValidationError("expected_root must not be empty")
+
+    algorithm = proof.algorithm
+    if algorithm not in SUPPORTED_ALGORITHMS:
+        return False
+    if proof.tree_size < 1:
+        return False
+    if not 0 <= proof.leaf_index < proof.tree_size:
+        return False
+
+    # The shape a proof for this (tree_size, leaf_index) is *required* to have. Checking
+    # it is what stops leaf_index being edited to relocate an item, and what rejects
+    # truncated and extended paths instead of letting them chain to some other root.
+    # Comparing the whole direction tuple pins the path *length* and every direction at
+    # once: one step per level that has a sibling - ceil(log2(tree_size)) of them for a
+    # full tree - each on the side the tree shape requires. A truncated, extended,
+    # re-sided or relocated path is rejected here, before a single digest is computed.
+    directions = _audit_directions(proof.tree_size, proof.leaf_index)
+    if not all(isinstance(step, ProofStep) for step in proof.path):
+        return False
+    if tuple(step.sibling_is_left for step in proof.path) != directions:
+        return False
+
+    width = _digest_size(algorithm)
+    node = _leaf_digest(algorithm, data_item)
+    for step, sibling_is_left in zip(proof.path, directions):
+        sibling = _unhex(step.sibling_hash, width)
+        if sibling is None:
+            return False
+        node = (
+            _node_digest(algorithm, sibling, node)
+            if sibling_is_left
+            else _node_digest(algorithm, node, sibling)
+        )
+    computed = _bind_count(algorithm, proof.tree_size, node).hex()
+    return _same_digest(computed, expected_root)
+
+
+def _replay_consistency(
+    algorithm: str, path: Sequence[bytes], old_size: int, new_size: int
+) -> Optional[Tuple[bytes, bytes]]:
+    """RFC 9162 section 2.1.4.2 steps 3-7: rebuild both tree hashes from the proof.
+
+    Returns ``(old_tree_hash, new_tree_hash)``, or ``None`` if the proof is structurally
+    unusable. Deriving both ends from the proof - rather than walking one and trusting
+    the other - is what makes this a verifier and not a formality.
+    """
+    if not path:
+        return None
+    fn, sn = old_size - 1, new_size - 1
+    while fn & 1:
+        fn >>= 1
+        sn >>= 1
+    old_hash = new_hash = path[0]
+    for node in path[1:]:
+        if sn == 0:
             return None
-        
-        # Calculate root by combining unpaired nodes
-        level_hashes = self.levels[0].copy()
-        
-        while len(level_hashes) > 1:
-            next_level = []
-            
-            for i in range(0, len(level_hashes), 2):
-                left = level_hashes[i]
-                right = level_hashes[i + 1] if i + 1 < len(level_hashes) else left
-                parent = self._hasher(left + right)
-                next_level.append(parent)
-            
-            level_hashes = next_level
-        
-        return level_hashes[0]
-    
-    def generate_consistency_proof(self, old_size: int, new_size: int) -> List[str]:
-        """Generate proof that old tree is consistent with new tree."""
-        if old_size > new_size or old_size < 0 or new_size > len(self.levels[0]):
-            raise ValueError("Invalid tree sizes")
-        
-        if old_size == new_size or old_size == 0:
-            return []
-        
-        # This is a simplified version
-        # A full implementation would generate minimal proof
-        proof = []
-        
-        # Add hashes needed to verify consistency
-        # This would include siblings needed to reconstruct both old and new roots
-        
-        return proof
+        if fn & 1 or fn == sn:
+            old_hash = _node_digest(algorithm, node, old_hash)
+            new_hash = _node_digest(algorithm, node, new_hash)
+            while fn != 0 and not fn & 1:
+                fn >>= 1
+                sn >>= 1
+        else:
+            new_hash = _node_digest(algorithm, new_hash, node)
+        fn >>= 1
+        sn >>= 1
+    if sn != 0:
+        return None
+    return old_hash, new_hash
 
 
-class MerkleVerifier:
-    """Utilities for Merkle tree verification."""
-    
-    @staticmethod
-    def verify_batch_proofs(proofs: List[MerkleProof], expected_root: str) -> Tuple[List[bool], bool]:
-        """Verify multiple proofs against the same root."""
-        results = []
-        tree = MerkleTree()
-        
-        for proof in proofs:
-            # All proofs should have the same root
-            if proof.root_hash != expected_root:
-                results.append(False)
-            else:
-                results.append(tree.verify_proof(proof))
-        
-        all_valid = all(results)
-        return results, all_valid
-    
-    @staticmethod
-    def combine_trees(tree1_root: str, tree2_root: str, hash_func: str = 'sha256') -> str:
-        """Combine two Merkle tree roots."""
-        hasher = hashlib.new(hash_func)
-        hasher.update(tree1_root.encode('utf-8'))
-        hasher.update(tree2_root.encode('utf-8'))
-        return hasher.hexdigest()
-    
-    @staticmethod
-    def verify_subset(subset_root: str, subset_proofs: List[MerkleProof], full_tree_root: str) -> bool:
-        """Verify that a subset is part of a larger tree."""
-        # This would require additional proof data
-        # Simplified version
-        for proof in subset_proofs:
-            if proof.root_hash != full_tree_root:
-                return False
-        return True
+def verify_consistency(
+    proof: ConsistencyProof, old_root: str, new_root: str
+) -> bool:
+    """Return whether ``proof`` shows the ``old_root`` tree is a prefix of ``new_root``.
+
+    Both roots are **required caller arguments**; neither is read off the proof. An
+    empty path never proves anything about a tree that grew.
+    """
+    if not isinstance(proof, ConsistencyProof):
+        raise ValidationError(
+            f"proof must be a ConsistencyProof, got {type(proof).__name__}"
+        )
+    for name, value in (("old_root", old_root), ("new_root", new_root)):
+        if not isinstance(value, str):
+            raise ValidationError(
+                f"{name} must be a hex str, got {type(value).__name__}"
+            )
+        if not value:
+            raise ValidationError(f"{name} must not be empty")
+
+    algorithm = proof.algorithm
+    if algorithm not in SUPPORTED_ALGORITHMS:
+        return False
+    old_size, new_size = proof.old_size, proof.new_size
+    if old_size < 1 or new_size < old_size:
+        return False
+
+    if old_size == new_size:
+        # Nothing grew, so the proof must be empty and the two roots must be the one root.
+        return not proof.path and _same_digest(old_root, new_root)
+
+    width = _digest_size(algorithm)
+    path = []
+    for element in proof.path:
+        node = _unhex(element, width)
+        if node is None:
+            return False
+        path.append(node)
+
+    replayed = _replay_consistency(algorithm, path, old_size, new_size)
+    if replayed is None:
+        return False
+    old_hash, new_hash = replayed
+    return _same_digest(
+        _bind_count(algorithm, old_size, old_hash).hex(), old_root
+    ) and _same_digest(_bind_count(algorithm, new_size, new_hash).hex(), new_root)

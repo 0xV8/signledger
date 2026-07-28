@@ -1,412 +1,410 @@
-"""Batch operations for SignLedger."""
+"""Bulk appends - ``BatchProcessor``.
+
+A hash chain is **serial at the tip**: entry *n* cannot exist until entry *n-1* has a
+digest. So the only bulk path worth having is one that does less work per entry, not one
+that spreads the same work over more threads.
+
+v1 had it backwards. Its ``BatchProcessor`` measured 0.89x a plain ``append`` loop, and
+its ``parallel_processing=True`` mode measured 0.67x because the threads only ever
+contended for a single lock. ``TransactionalBatch.commit()`` raised ``AttributeError`` on
+the first line of its body and ``_rollback()`` logged a warning and returned, so nothing
+was atomic anywhere. Neither comes back: there is no thread pool here, no flag to enable
+one, and no second class holding a rollback that does not roll back.
+
+Where the speedup comes from
+----------------------------
+Each item is validated, deep-copied, hashed and signed **once**, before the first write,
+and directly at its projected chain position. The write phase then only re-links and
+inserts. A ``Ledger.append`` loop instead rebuilds every entry inside the write
+transaction and pushes each one through the read cache, which canonicalizes both payloads
+again just to measure them - so the loop pays SLCS/1 encoding roughly seven times per
+entry where a batch pays it five (three on a backend that stores JSON rather than
+detaching in memory).
+
+What "atomic" means here, precisely
+-----------------------------------
+Every failure the *caller* can cause - a payload SLCS/1 refuses, a naive timestamp, an
+``entry_id`` repeated inside the batch, a signer that throws - happens in the prepare
+phase with nothing written. When ``atomic`` is on (the default), one such failure
+abandons the whole batch: not a single entry reaches the store.
+
+It is **not** a distributed transaction, and this module does not pretend otherwise.
+:class:`~signledger.backends.base.StorageBackend` exposes ``append_atomic`` - one entry,
+one transaction - and no bulk primitive, so a storage failure part-way through the write
+phase cannot be undone by a protocol that has no DELETE. That case raises
+:class:`PartialBatchError`, which names exactly how many entries landed. Reporting it is
+the whole difference from v1, which logged a warning and returned as though nothing had
+happened.
+"""
 
 import time
-import threading
-from typing import List, Dict, Any, Optional, Callable, Tuple
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
-import logging
-import queue
-from contextlib import contextmanager
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-from .ledger import Entry
-from .exceptions import ValidationError, StorageError
+from pydantic import ValidationError as PydanticValidationError
 
-logger = logging.getLogger(__name__)
+from signledger.core.entry import CURRENT_FORMAT_VERSION, Entry
+from signledger.core.exceptions import (
+    ConfigurationError,
+    SignLedgerError,
+    StorageError,
+    ValidationError,
+)
+from signledger.crypto.hashing import genesis_hash
+
+__all__ = [
+    "DEFAULT_MAX_BATCH_SIZE",
+    "BatchItem",
+    "BatchProcessor",
+    "BatchResult",
+    "DeadLetter",
+    "PartialBatchError",
+]
+
+#: Upper bound on one batch. The whole chain is built in memory before anything is
+#: written, so an unbounded batch is an unbounded allocation: a caller streaming a
+#: million rows through one call would exhaust the process instead of being told to page.
+DEFAULT_MAX_BATCH_SIZE = 10_000
+
+#: Stand-in ``previous_hash`` while entry zero's genesis anchor is derived. Never
+#: stored, and never hashed: it is replaced before the digest is computed. It only has to
+#: be non-empty, because ``Entry`` refuses an empty one.
+_UNLINKED = "0"
 
 
-@dataclass
-class BatchOperation:
-    """Represents a single operation in a batch."""
-    operation_id: str
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class PartialBatchError(StorageError):
+    """The store failed part-way through a batch, after some entries were committed.
+
+    This is the one failure a batch cannot take back. An append-only store has no DELETE
+    to undo the rows that already landed, so the honest answer is to name the extent of
+    the damage: :attr:`committed` holds exactly the entries that reached the chain.
+    v1's equivalent logged a warning and returned normally, leaving a half-written ledger
+    nobody was told about.
+    """
+
+    def __init__(self, message: str, committed: Sequence[Entry]) -> None:
+        super().__init__(message)
+        self.committed: Tuple[Entry, ...] = tuple(committed)
+
+
+@dataclass(frozen=True)
+class BatchItem:
+    """One entry-to-be.
+
+    A bare ``dict`` passed to :meth:`BatchProcessor.append_batch` is always the entry's
+    ``data``; this is the only way to attach metadata, pin a timestamp or supply an
+    ``entry_id``. Keeping the two forms unambiguous matters more than the convenience of
+    guessing: ``{"data": ...}`` is a payload with a key called ``data``, nothing else.
+    """
+
     data: Dict[str, Any]
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: Optional[Dict[str, Any]] = None
     timestamp: Optional[datetime] = None
-    
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = datetime.now(timezone.utc)
+    entry_id: Optional[str] = None
 
 
-@dataclass
+@dataclass(frozen=True)
+class DeadLetter:
+    """One item that never became an entry, and why.
+
+    ``index`` is the item's position in the batch as submitted, so a caller can line the
+    failures back up against its own input.
+    """
+
+    index: int
+    error: str
+    message: str
+
+
+@dataclass(frozen=True)
 class BatchResult:
-    """Result of a batch operation."""
-    successful_entries: List[Entry]
-    failed_operations: List[Tuple[BatchOperation, Exception]]
-    total_operations: int
-    execution_time_ms: float
-    
+    """The outcome of one batch: what was committed, and what was refused."""
+
+    entries: Tuple[Entry, ...] = ()
+    dead_letters: Tuple[DeadLetter, ...] = ()
+    submitted: int = 0
+    duration_seconds: float = 0.0
+
     @property
-    def success_count(self) -> int:
-        return len(self.successful_entries)
-    
+    def committed(self) -> int:
+        """How many entries reached the store."""
+        return len(self.entries)
+
     @property
-    def failure_count(self) -> int:
-        return len(self.failed_operations)
-    
+    def failed(self) -> int:
+        """How many items were refused."""
+        return len(self.dead_letters)
+
     @property
-    def success_rate(self) -> float:
-        if self.total_operations == 0:
-            return 0.0
-        return self.success_count / self.total_operations
+    def ok(self) -> bool:
+        """True only when every submitted item became an entry."""
+        return not self.dead_letters and len(self.entries) == self.submitted
 
 
 class BatchProcessor:
-    """Handles batch operations for the ledger."""
-    
+    """Appends many entries to one :class:`~signledger.core.ledger.Ledger`.
+
+    There is no ``parallel_processing`` option and there will not be one: the tip is a
+    serial dependency, so extra threads can only contend for it.
+
+    With ``atomic=True`` (the default) one unusable item abandons the whole submission and
+    nothing is written. With ``atomic=False`` the usable items are committed and the rest
+    come back in :attr:`BatchResult.dead_letters`.
+    """
+
     def __init__(
         self,
-        ledger,
-        max_batch_size: int = 1000,
-        auto_commit_threshold: int = 100,
-        auto_commit_interval: float = 5.0,
-        parallel_processing: bool = False,
-        num_workers: int = 4
-    ):
-        self.ledger = ledger
+        ledger: Any,
+        *,
+        atomic: bool = True,
+        max_batch_size: int = DEFAULT_MAX_BATCH_SIZE,
+    ) -> None:
+        if max_batch_size < 1:
+            raise ConfigurationError(f"max_batch_size must be at least 1, got {max_batch_size}")
+        self._ledger = ledger
+        self.atomic = atomic
         self.max_batch_size = max_batch_size
-        self.auto_commit_threshold = auto_commit_threshold
-        self.auto_commit_interval = auto_commit_interval
-        self.parallel_processing = parallel_processing
-        self.num_workers = num_workers
-        
-        self._batch_queue: queue.Queue = queue.Queue(maxsize=max_batch_size)
-        self._lock = threading.RLock()
-        self._auto_commit_thread = None
-        self._stop_auto_commit = threading.Event()
-        self._processing = False
-        
-        # Statistics
-        self._total_processed = 0
-        self._total_failed = 0
-        
-        # Start auto-commit thread if enabled
-        if auto_commit_interval > 0:
-            self._start_auto_commit()
-    
-    def add_operation(self, operation: BatchOperation) -> None:
-        """Add an operation to the batch queue."""
-        with self._lock:
-            if self._batch_queue.qsize() >= self.max_batch_size:
-                raise ValidationError("Batch queue is full")
-            
-            self._batch_queue.put(operation)
-            
-            # Check if we should auto-commit
-            if self._batch_queue.qsize() >= self.auto_commit_threshold:
-                self._process_batch()
-    
-    def add_data(self, data: Dict[str, Any], **metadata) -> None:
-        """Convenience method to add data to batch."""
-        operation = BatchOperation(
-            operation_id=f"batch_{int(time.time() * 1000000)}",
-            data=data,
-            metadata=metadata
-        )
-        self.add_operation(operation)
-    
-    def process(self) -> BatchResult:
-        """Process all pending operations in the batch."""
-        with self._lock:
-            return self._process_batch()
-    
-    def _process_batch(self) -> BatchResult:
-        """Internal method to process the batch."""
-        if self._processing:
-            raise ValidationError("Batch processing already in progress")
-        
-        self._processing = True
-        start_time = time.time()
-        
-        # Collect all operations
-        operations = []
-        while not self._batch_queue.empty():
-            try:
-                operations.append(self._batch_queue.get_nowait())
-            except queue.Empty:
-                break
-        
-        if not operations:
-            self._processing = False
-            return BatchResult(
-                successful_entries=[],
-                failed_operations=[],
-                total_operations=0,
-                execution_time_ms=0
+        # Coupling to the ledger's internals, in one place and on purpose. A batched
+        # entry has to be indistinguishable from one ``Ledger.append`` produced - same
+        # digest algorithm, same signing identity inside the preimage - so it uses the
+        # ledger's own chain and signer rather than a second configuration that could
+        # drift out of step with it.
+        self.backend = ledger.backend
+        self.ledger_id = ledger.ledger_id
+        self._chain = ledger._chain
+        self._signer = ledger._signer if ledger._enable_signatures else None
+
+    def append_batch(
+        self, items: Iterable[Union[BatchItem, Dict[str, Any]]]
+    ) -> BatchResult:
+        """Validate the whole submission, then write the part of it that survived.
+
+        A bare ``dict`` is the entry's ``data``; use :class:`BatchItem` to attach
+        metadata, pin a timestamp or supply an ``entry_id``.
+
+        Raises :class:`~signledger.core.exceptions.ValidationError` for an empty or
+        oversized submission and :class:`PartialBatchError` if the store fails after some
+        entries have already been committed.
+        """
+        started = time.perf_counter()
+        submitted = list(items)
+        if not submitted:
+            # A bulk call that was handed nothing did nothing, and a result whose ``ok``
+            # is True would be a success tick over an empty range - the same defect
+            # contract section 5 rule 1 forbids in the verifier.
+            raise ValidationError("append_batch requires at least one item")
+        if len(submitted) > self.max_batch_size:
+            raise ValidationError(
+                f"batch holds {len(submitted)} items; the maximum is {self.max_batch_size}"
             )
-        
-        try:
-            if self.parallel_processing:
-                return self._process_parallel(operations, start_time)
-            else:
-                return self._process_sequential(operations, start_time)
-        finally:
-            self._processing = False
-    
-    def _process_sequential(self, operations: List[BatchOperation], start_time: float) -> BatchResult:
-        """Process operations sequentially."""
-        successful_entries = []
-        failed_operations = []
-        
-        for operation in operations:
-            try:
-                # Prepare entry data
-                entry_data = {
-                    'batch_id': operation.operation_id,
-                    'timestamp': operation.timestamp.isoformat(),
-                    **operation.data
-                }
-                
-                # Add metadata if present
-                if operation.metadata:
-                    entry_data['batch_metadata'] = operation.metadata
-                
-                # Append to ledger
-                entry = self.ledger.append(entry_data)
-                successful_entries.append(entry)
-                self._total_processed += 1
-                
-            except Exception as e:
-                failed_operations.append((operation, e))
-                self._total_failed += 1
-                logger.error(f"Failed to process batch operation {operation.operation_id}: {e}")
-        
-        execution_time = (time.time() - start_time) * 1000
-        
-        return BatchResult(
-            successful_entries=successful_entries,
-            failed_operations=failed_operations,
-            total_operations=len(operations),
-            execution_time_ms=execution_time
-        )
-    
-    def _process_parallel(self, operations: List[BatchOperation], start_time: float) -> BatchResult:
-        """Process operations in parallel using thread pool."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        successful_entries = []
-        failed_operations = []
-        
-        def process_single(operation: BatchOperation) -> Tuple[Optional[Entry], Optional[Exception]]:
-            try:
-                entry_data = {
-                    'batch_id': operation.operation_id,
-                    'timestamp': operation.timestamp.isoformat(),
-                    **operation.data
-                }
-                
-                if operation.metadata:
-                    entry_data['batch_metadata'] = operation.metadata
-                
-                entry = self.ledger.append(entry_data)
-                return entry, None
-            except Exception as e:
-                return None, e
-        
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            # Submit all operations
-            future_to_operation = {
-                executor.submit(process_single, op): op
-                for op in operations
-            }
-            
-            # Collect results
-            for future in as_completed(future_to_operation):
-                operation = future_to_operation[future]
-                try:
-                    entry, error = future.result()
-                    if error:
-                        failed_operations.append((operation, error))
-                        self._total_failed += 1
-                    else:
-                        successful_entries.append(entry)
-                        self._total_processed += 1
-                except Exception as e:
-                    failed_operations.append((operation, e))
-                    self._total_failed += 1
-        
-        execution_time = (time.time() - start_time) * 1000
-        
-        return BatchResult(
-            successful_entries=successful_entries,
-            failed_operations=failed_operations,
-            total_operations=len(operations),
-            execution_time_ms=execution_time
-        )
-    
-    def _start_auto_commit(self):
-        """Start auto-commit thread."""
-        def auto_commit_loop():
-            while not self._stop_auto_commit.wait(self.auto_commit_interval):
-                with self._lock:
-                    if not self._batch_queue.empty():
-                        try:
-                            self._process_batch()
-                        except Exception as e:
-                            logger.error(f"Auto-commit failed: {e}")
-        
-        self._auto_commit_thread = threading.Thread(
-            target=auto_commit_loop,
-            daemon=True,
-            name="BatchProcessor-AutoCommit"
-        )
-        self._auto_commit_thread.start()
-    
-    def stop(self):
-        """Stop the batch processor."""
-        # Process any remaining operations
-        with self._lock:
-            if not self._batch_queue.empty():
-                self._process_batch()
-        
-        # Stop auto-commit thread
-        if self._auto_commit_thread:
-            self._stop_auto_commit.set()
-            self._auto_commit_thread.join(timeout=5)
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get batch processor statistics."""
-        with self._lock:
-            return {
-                'total_processed': self._total_processed,
-                'total_failed': self._total_failed,
-                'success_rate': self._total_processed / (self._total_processed + self._total_failed) if (self._total_processed + self._total_failed) > 0 else 0,
-                'queue_size': self._batch_queue.qsize(),
-                'is_processing': self._processing,
-            }
-    
-    @contextmanager
-    def batch_context(self, auto_process: bool = True):
-        """Context manager for batch operations."""
-        # Temporarily disable auto-commit
-        old_threshold = self.auto_commit_threshold
-        self.auto_commit_threshold = float('inf')
-        
-        try:
-            yield self
-        finally:
-            # Restore auto-commit threshold
-            self.auto_commit_threshold = old_threshold
-            
-            # Process batch if requested
-            if auto_process:
-                self.process()
-
-
-class TransactionalBatch:
-    """Transactional batch operations with rollback support."""
-    
-    def __init__(self, ledger):
-        self.ledger = ledger
-        self._operations: List[BatchOperation] = []
-        self._checkpoint = None
-        self._committed = False
-    
-    def add(self, data: Dict[str, Any], **metadata) -> None:
-        """Add operation to transaction."""
-        if self._committed:
-            raise ValidationError("Transaction already committed")
-        
-        operation = BatchOperation(
-            operation_id=f"tx_{len(self._operations)}_{int(time.time() * 1000000)}",
-            data=data,
-            metadata=metadata
-        )
-        self._operations.append(operation)
-    
-    def commit(self) -> BatchResult:
-        """Commit all operations in the transaction."""
-        if self._committed:
-            raise ValidationError("Transaction already committed")
-        
-        if not self._operations:
-            raise ValidationError("No operations to commit")
-        
-        # Save checkpoint
-        latest = self.ledger.get_latest()
-        self._checkpoint = latest.sequence if latest else -1
-        
-        start_time = time.time()
-        successful_entries = []
-        failed_operations = []
-        
-        try:
-            # Process all operations
-            for operation in self._operations:
-                try:
-                    entry_data = {
-                        'transaction_id': f"tx_{self._checkpoint}_{operation.operation_id}",
-                        'timestamp': operation.timestamp.isoformat(),
-                        **operation.data
-                    }
-                    
-                    if operation.metadata:
-                        entry_data['transaction_metadata'] = operation.metadata
-                    
-                    entry = self.ledger.append(entry_data)
-                    successful_entries.append(entry)
-                    
-                except Exception as e:
-                    # On any failure, rollback
-                    self._rollback()
-                    raise StorageError(f"Transaction failed: {e}")
-            
-            self._committed = True
-            execution_time = (time.time() - start_time) * 1000
-            
+        prepared, dead_letters = self._prepare(submitted)
+        if dead_letters and self.atomic:
             return BatchResult(
-                successful_entries=successful_entries,
-                failed_operations=failed_operations,
-                total_operations=len(self._operations),
-                execution_time_ms=execution_time
+                dead_letters=tuple(dead_letters),
+                submitted=len(submitted),
+                duration_seconds=time.perf_counter() - started,
             )
-            
-        except Exception:
-            # Ensure rollback on any error
-            self._rollback()
-            raise
-    
-    def _rollback(self):
-        """Rollback transaction (if backend supports it)."""
-        # This is a simplified rollback that works with backends
-        # that support deletion or have transaction support
-        logger.warning("Transaction rollback requested - manual intervention may be required")
-        # In a real implementation, this would depend on backend capabilities
-    
-    def abort(self):
-        """Abort the transaction."""
-        self._operations.clear()
-        self._committed = True
+        committed = self._commit(prepared)
+        return BatchResult(
+            entries=tuple(committed),
+            dead_letters=tuple(dead_letters),
+            submitted=len(submitted),
+            duration_seconds=time.perf_counter() - started,
+        )
 
+    # -- phase 1: prepare ---------------------------------------------------------------
 
-class BatchValidator:
-    """Validates batch operations before processing."""
-    
-    def __init__(self, validators: Optional[List[Callable]] = None):
-        self.validators = validators or []
-    
-    def add_validator(self, validator: Callable[[BatchOperation], bool]) -> None:
-        """Add a validation function."""
-        self.validators.append(validator)
-    
-    def validate_batch(self, operations: List[BatchOperation]) -> Tuple[List[BatchOperation], List[Tuple[BatchOperation, str]]]:
-        """Validate all operations in a batch."""
-        valid_operations = []
-        invalid_operations = []
-        
-        for operation in operations:
-            errors = []
-            
-            for validator in self.validators:
-                try:
-                    if not validator(operation):
-                        errors.append(f"Validation failed: {validator.__name__}")
-                except Exception as e:
-                    errors.append(f"Validator error: {e}")
-            
-            if errors:
-                invalid_operations.append((operation, "; ".join(errors)))
+    def _prepare(
+        self, submitted: List[Union[BatchItem, Dict[str, Any]]]
+    ) -> Tuple[List["_Prepared"], List[DeadLetter]]:
+        """Validate, hash and sign the whole chain. Writes nothing.
+
+        This is where the atomicity guarantee is bought: everything that can go wrong on
+        the caller's side - a payload SLCS/1 refuses, a naive timestamp, a repeated
+        ``entry_id``, a signer that throws - goes wrong here, before a single row exists.
+
+        Each entry is built directly at its projected chain position, so a payload is
+        canonicalized and deep-copied exactly once. That projection is a *guess* about
+        where the tip will still be; :meth:`_commit` checks it against the tip the backend
+        reads inside the transaction and re-seals only if another writer moved it.
+        """
+        moment = _utcnow()
+        tip = self.backend.get_head()
+        previous = None if tip is None else tip.hash
+        sequence = 0 if tip is None else tip.sequence + 1
+
+        prepared: List[_Prepared] = []
+        dead_letters: List[DeadLetter] = []
+        seen_ids: Dict[str, int] = {}
+        for index, raw in enumerate(submitted):
+            item = raw if isinstance(raw, BatchItem) else BatchItem(data=raw)
+            try:
+                entry = self._seal(item, moment, sequence, previous)
+                _reject_repeat(entry.entry_id, index, seen_ids)
+            except (SignLedgerError, PydanticValidationError) as err:
+                dead_letters.append(
+                    DeadLetter(index=index, error=type(err).__name__, message=str(err))
+                )
+                continue
+            prepared.append(_Prepared(index=index, entry=entry, predecessor=previous))
+            previous = entry.hash
+            sequence += 1
+        return prepared, dead_letters
+
+    def _seal(
+        self, item: BatchItem, moment: datetime, sequence: int, previous: Optional[str]
+    ) -> Entry:
+        """Build, validate, hash and sign one entry at a known chain position.
+
+        ``previous is None`` means the store is empty, so entry 0's ``previous_hash`` comes
+        from its **own** timestamp - the same rule ``Ledger.append`` uses. A reopened
+        ledger recomputes that anchor from the oldest entry it can see, and any other
+        choice makes a pristine chain report GENESIS_MISMATCH on restart.
+        """
+        signer = self._signer
+        draft = Entry(
+            ledger_id=self.ledger_id,
+            sequence=sequence,
+            entry_id=str(uuid.uuid4()) if item.entry_id is None else item.entry_id,
+            timestamp=moment if item.timestamp is None else item.timestamp,
+            data=item.data,
+            metadata={} if item.metadata is None else item.metadata,
+            # Linked below once ``Entry`` has validated the timestamp the genesis anchor
+            # is derived from. Deriving it first would report a naive timestamp as a
+            # CanonicalizationError from deep inside the encoder on an empty store and as
+            # a ValidationError on a populated one - the same mistake, two different
+            # answers, depending on something the caller cannot see.
+            previous_hash=_UNLINKED if previous is None else previous,
+            # Contract section 6: the signing identity is inside the preimage, so it is
+            # fixed here, before the digest that covers it exists.
+            key_id=None if signer is None else signer.key_id,
+            signature_algorithm=None if signer is None else signer.algorithm,
+        )
+        if previous is None:
+            draft = draft.model_copy(
+                update={"previous_hash": self._genesis(draft.timestamp)}
+            )
+        return self._finish(draft)
+
+    def _reseal(self, entry: Entry, sequence: int, previous: Optional[str]) -> Entry:
+        """Re-link an already validated entry onto a tip that moved, and re-sign it."""
+        draft = entry.model_copy(
+            update={
+                "sequence": sequence,
+                "previous_hash": (
+                    self._genesis(entry.timestamp) if previous is None else previous
+                ),
+                "hash": "",
+                "signature": None,
+            }
+        )
+        return self._finish(draft)
+
+    def _finish(self, draft: Entry) -> Entry:
+        """Attach the digest, then the signature over it."""
+        sealed = draft.model_copy(update={"hash": self._chain.calculate_hash(draft)})
+        if self._signer is None:
+            return sealed
+        # Deferred for the same reason as in ``Ledger._seal``: importing
+        # ``signledger.crypto.signatures`` at module scope pulls ``cryptography`` - an
+        # optional extra - into every `import signledger`.
+        from signledger.crypto.signatures import signing_payload
+
+        signature = self._signer.sign(signing_payload(sealed.ledger_id, sealed.hash))
+        return sealed.model_copy(update={"signature": signature})
+
+    def _genesis(self, timestamp: datetime) -> str:
+        return genesis_hash(
+            self.ledger_id, timestamp, CURRENT_FORMAT_VERSION, algorithm=self._chain.algorithm
+        )
+
+    # -- phase 2: commit ----------------------------------------------------------------
+
+    def _commit(self, prepared: List["_Prepared"]) -> List[Entry]:
+        """Write the prepared chain, one backend transaction per entry.
+
+        The build callback always re-links against the tip the backend read *inside* the
+        transaction. Reading the head here and trusting it would be a read-modify-write,
+        which is precisely how two v1 workers forked a chain permanently.
+        """
+        committed: List[Entry] = []
+        for step in prepared:
+            try:
+                entry = self.backend.append_atomic(self._linker(step))
+            except Exception as err:
+                if not committed:
+                    # Nothing landed, so nothing is partial. Wrapping it would send an
+                    # operator looking for a half-written chain that does not exist.
+                    raise
+                raise PartialBatchError(
+                    f"batch failed after committing {len(committed)} of {len(prepared)} "
+                    f"entries: {type(err).__name__}",
+                    committed,
+                ) from err
+            committed.append(entry)
+            # Same bounded, off-thread queue ``Ledger.append`` uses. A subscriber must not
+            # go blind because the caller switched to the bulk path, and it must not be
+            # able to slow a batch down either.
+            self._ledger._publish_event(entry)
+        return committed
+
+    def _linker(self, step: "_Prepared") -> Any:
+        """The build callback for one prepared entry, run inside the transaction."""
+
+        def build(tip: Optional[Entry]) -> Entry:
+            if tip is None:
+                actual, sequence = None, 0
             else:
-                valid_operations.append(operation)
-        
-        return valid_operations, invalid_operations
+                if tip.ledger_id != self.ledger_id:
+                    # Two writers that each started against an empty store minted their
+                    # own identity and neither could detect the clash. Continuing another
+                    # ledger's chain under this one's identity splices two logs together,
+                    # and every hash in the result verifies perfectly.
+                    raise ConfigurationError(
+                        "the chain in this store belongs to a different ledger; refusing "
+                        "to continue it under this ledger's identity"
+                    )
+                actual, sequence = tip.hash, tip.sequence + 1
+            if actual == step.predecessor:
+                return step.entry
+            # Another writer moved the tip between preparation and this transaction, so
+            # the projection is stale. Re-link against what the transaction actually read
+            # - never against what we assumed before it started.
+            return self._reseal(step.entry, sequence, actual)
+
+        return build
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    """A validated, hashed and signed entry waiting to be confirmed into the chain.
+
+    ``predecessor`` is the tip digest the projection assumed - ``None`` for a store the
+    preparation phase found empty. The write phase compares it against the tip the
+    transaction really read.
+    """
+
+    index: int
+    entry: Entry
+    predecessor: Optional[str]
+
+
+def _reject_repeat(entry_id: str, index: int, seen: Dict[str, int]) -> None:
+    """Refuse an ``entry_id`` this batch has already used.
+
+    ``UNIQUE(entry_id)`` would catch it at insert time, but only after the earlier
+    entries had been committed - and the backend's retry would rebuild the same duplicate
+    five times before giving up. Catching it here keeps the failure inside the prepare
+    phase, where a batch can still be abandoned whole.
+    """
+    if entry_id in seen:
+        raise ValidationError(
+            f"entry_id of item {index} is already used by item {seen[entry_id]} in this batch"
+        )
+    seen[entry_id] = index

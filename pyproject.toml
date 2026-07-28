@@ -1,0 +1,170 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "signledger"
+dynamic = ["version"]
+description = "Tamper-evident append-only audit logging with verified signatures and external anchoring"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Vipin Kumar" }]
+keywords = ["audit", "logging", "immutable", "ledger", "tamper-evident", "cryptography", "compliance"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Logging",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Database",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pydantic>=2.0.0",
+    "typing-extensions>=4.0.0",
+]
+
+[project.optional-dependencies]
+signatures = ["cryptography>=41.0.0"]
+postgresql = ["psycopg[binary]>=3.1"]
+mongodb = ["pymongo>=4.0.0"]
+flask = ["flask>=2.0.0"]
+fastapi = ["fastapi>=0.100.0"]
+django = ["django>=4.2"]
+all = [
+    "cryptography>=41.0.0",
+    "django>=4.2",
+    "fastapi>=0.100.0",
+    "flask>=2.0.0",
+    "psycopg[binary]>=3.1",
+    "pymongo>=4.0.0",
+]
+test = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-timeout>=2.1.0",
+    "hypothesis>=6.80.0",
+    "httpx>=0.24.0",
+]
+dev = [
+    "mutmut>=2.4.0",
+    "mypy>=1.5.0",
+    "ruff>=0.1.0",
+    "bandit>=1.7.5",
+    "build>=1.0.0",
+    "twine>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/0xV8/signledger"
+Source = "https://github.com/0xV8/signledger"
+"Bug Reports" = "https://github.com/0xV8/signledger/issues"
+Changelog = "https://github.com/0xV8/signledger/blob/main/CHANGELOG.md"
+
+[project.scripts]
+signledger = "signledger.cli:main"
+
+# Explicit package list. NEVER find_packages(): that is how v1.0.0 shipped four empty
+# directories that shadowed their own sibling modules and broke the console script.
+[tool.setuptools]
+packages = [
+    "signledger",
+    "signledger.core",
+    "signledger.crypto",
+    "signledger.backends",
+    "signledger.anchor",
+    "signledger.contrib",
+    "signledger.contrib.django",
+    "signledger.contrib.django.migrations",
+]
+zip-safe = false
+
+[tool.setuptools.dynamic]
+version = { attr = "signledger.__version__" }
+
+[tool.setuptools.package-data]
+signledger = ["py.typed"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config -ra"
+timeout = 300
+markers = [
+    "postgres: requires a live PostgreSQL server",
+    "mongo: requires a live MongoDB server",
+    "slow: long-running (concurrency/stress)",
+]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["signledger"]
+parallel = true
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "@overload",
+    "class .*\\(Protocol\\):",
+    "\\.\\.\\.",
+]
+
+[tool.mypy]
+# The package still *supports* 3.9 (see requires-python and the UP006 note above), but
+# mypy >= 1.15 refuses to type-check against it: "Python 3.9 is not supported (must be
+# 3.10 or higher)". 3.10 is the lowest version the checker will accept, so it is the
+# floor we can actually verify. Runtime compatibility with 3.9 is covered by the ruff
+# target-version and by not using any 3.10+ syntax.
+python_version = "3.10"
+strict = true
+warn_unreachable = true
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "S", "C4", "RET", "SIM"]
+ignore = [
+    "S101",
+    # UP006/UP035 demand PEP 585 (`dict[str, Any]`, `collections.abc.Iterator`).
+    # Architecture contract section 10 mandates `typing.Dict` and explicitly forbids
+    # PEP 585 for this package. Both rules fired ~410 times across every module, and
+    # six separate implementation waves reported the conflict rather than silently
+    # picking a side. Resolved here, in the one place a project-wide style decision
+    # belongs: the contract wins, so the two rules are off.
+    #
+    # (PEP 585 is in fact valid on the 3.9 floor, so this is a consistency decision
+    # rather than a compatibility one. If section 10 is ever relaxed, delete these two
+    # entries and run `ruff check --fix --unsafe-fixes`.)
+    "UP006",
+    "UP035",
+    # SIM117 wants nested `with` blocks merged. Merging the three-context cases here
+    # exceeds line-length, and the parenthesized form that would wrap them is documented
+    # as 3.10+ (3.9's PEG parser accepted it only as an undocumented side effect). The
+    # package floor is 3.9, so the nested form is the only guaranteed-valid spelling.
+    "SIM117",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "N806"]
+
+[tool.mutmut]
+paths_to_mutate = "signledger/"
+tests_dir = "tests/"

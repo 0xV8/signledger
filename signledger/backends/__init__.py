@@ -1,34 +1,38 @@
-"""Storage backend implementations for SignLedger."""
+"""Storage backends (architecture contract, section 4).
 
-from .base import StorageBackend, InMemoryBackend
+``StorageBackend`` is the protocol; ``BackendConformanceSuite`` is the executable proof
+that an implementation of it is interchangeable with the shipped ones.
 
-# Lazy imports to avoid circular dependencies
-def __getattr__(name):
-    if name == 'MemoryBackend':
-        from .memory import MemoryBackend
-        return MemoryBackend
-    elif name == 'SQLiteBackend':
-        from .sqlite import SQLiteBackend
-        return SQLiteBackend
-    elif name == 'PostgreSQLBackend':
-        try:
-            from .postgresql import PostgreSQLBackend
-            return PostgreSQLBackend
-        except ImportError:
-            return None
-    elif name == 'MongoDBBackend':
-        try:
-            from .mongodb import MongoDBBackend
-            return MongoDBBackend
-        except ImportError:
-            return None
-    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+Only the dependency-free backends are imported eagerly. ``postgresql`` and ``mongodb``
+need optional drivers, so they stay importable by path
+(``signledger.backends.postgresql``) without making ``import signledger.backends`` fail
+on a machine that has neither. Each backend has exactly one module name - no aliases.
+"""
+
+from signledger.backends.base import (
+    CAP_APPEND_ONLY_ENFORCED,
+    CAP_ATOMIC_APPEND,
+    CAP_DURABLE_FSYNC,
+    CAP_UNIQUE_CHAIN_LINK,
+    CAP_WORM,
+    CAPABILITY_TOKENS,
+    BackendConformanceSuite,
+    ConformanceTestMixin,
+    StorageBackend,
+)
+from signledger.backends.memory import MemoryBackend
+from signledger.backends.sqlite import SQLiteBackend
 
 __all__ = [
-    'StorageBackend',
-    'InMemoryBackend',
-    'MemoryBackend',
-    'SQLiteBackend',
-    'PostgreSQLBackend',
-    'MongoDBBackend',
+    "CAPABILITY_TOKENS",
+    "CAP_APPEND_ONLY_ENFORCED",
+    "CAP_ATOMIC_APPEND",
+    "CAP_DURABLE_FSYNC",
+    "CAP_UNIQUE_CHAIN_LINK",
+    "CAP_WORM",
+    "BackendConformanceSuite",
+    "ConformanceTestMixin",
+    "MemoryBackend",
+    "SQLiteBackend",
+    "StorageBackend",
 ]

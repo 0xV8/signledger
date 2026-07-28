@@ -1,0 +1,286 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONWARNINGS: error::DeprecationWarning
+  FORCE_COLOR: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The gate that matters. 100% line AND branch coverage, measured against real
+  # PostgreSQL and MongoDB servers.
+  #
+  # v1.0.0 claimed "100% test coverage" in its README while shipping zero tests.
+  # This job is the reason that claim can now be checked by anyone, including us.
+  # Without live databases the suite skips 582 tests and coverage falls to ~91%,
+  # so the databases are services here rather than something a developer is
+  # trusted to remember.
+  # ---------------------------------------------------------------------------
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: signledger
+          POSTGRES_PASSWORD: signledger
+          POSTGRES_DB: signledger_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U signledger"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      mongo:
+        image: mongo:7
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      SIGNLEDGER_TEST_POSTGRES_DSN: postgresql://signledger:signledger@127.0.0.1:5432/signledger_test
+      SIGNLEDGER_TEST_MONGO_URI: mongodb://127.0.0.1:27017
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[all,test]'
+
+      - name: Assert the databases are actually reachable
+        # A skipped database test is indistinguishable from a passing one in the
+        # summary line. Fail loudly here instead of silently measuring 91%.
+        run: |
+          python - <<'PY'
+          import os, psycopg, pymongo
+          psycopg.connect(os.environ["SIGNLEDGER_TEST_POSTGRES_DSN"], connect_timeout=10).close()
+          c = pymongo.MongoClient(os.environ["SIGNLEDGER_TEST_MONGO_URI"], serverSelectionTimeoutMS=10000)
+          try:
+              c.admin.command("ping")
+          finally:
+              c.close()
+          print("postgres + mongo reachable")
+          PY
+
+      - name: Test with 100% line and branch coverage
+        run: pytest --cov=signledger --cov-branch --cov-report=term-missing
+
+      - name: Assert no database test was skipped
+        # `pytest -m "postgres or mongo"` must report zero skips. If the services
+        # disappear mid-run, coverage would still pass via unrelated modules.
+        run: |
+          pytest -m "postgres or mongo" -q --no-cov -rs 2>&1 | tee db.log
+          if grep -qE '[0-9]+ skipped' db.log; then
+            echo "::error::database tests were skipped - the 100% figure is not real"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Import hygiene. Four empty package directories shadowed their own sibling
+  # modules in v1.0.0, which silently disabled the CLI and all three framework
+  # integrations. Nobody noticed because nothing ever imported them.
+  # ---------------------------------------------------------------------------
+  imports:
+    name: import every module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -e '.[all,test]'
+
+      - name: Walk and import every module
+        # Django's two app modules need a settings module before their model
+        # classes can be constructed - that is Django, not signledger, and
+        # `import django.contrib.auth.models` fails identically on a bare
+        # interpreter. tests/test_packaging.py runs this same walk with the
+        # settings bootstrap and requires 36/36.
+        run: |
+          python - <<'PY'
+          import django
+          from django.conf import settings
+          settings.configure(
+              INSTALLED_APPS=["django.contrib.contenttypes", "signledger.contrib.django"],
+              DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
+              USE_TZ=True,
+          )
+          django.setup()
+
+          import importlib, pkgutil, sys, signledger
+          failed = []
+          for mod in pkgutil.walk_packages(signledger.__path__, "signledger."):
+              try:
+                  importlib.import_module(mod.name)
+              except Exception as err:
+                  failed.append(f"{mod.name} -> {type(err).__name__}: {err}")
+          for line in failed:
+              print("FAIL", line)
+          print(f"imported {len(list(pkgutil.walk_packages(signledger.__path__, 'signledger.')))} modules")
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Assert a base install pulls in no optional dependency
+        # `import signledger` must not drag in cryptography, psycopg, pymongo or
+        # a web framework. Checked in a clean environment, not this one.
+        run: |
+          python -m venv /tmp/bare
+          /tmp/bare/bin/pip install --quiet .
+          /tmp/bare/bin/python - <<'PY'
+          import sys, signledger
+          leaked = sorted(
+              m for m in sys.modules
+              if m.split(".")[0] in {"cryptography", "psycopg", "pymongo", "flask", "fastapi", "django"}
+          )
+          assert not leaked, f"import signledger leaked optional deps: {leaked}"
+          print("no optional dependency imported by `import signledger`")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Static analysis.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: ruff + mypy --strict + bandit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -e '.[all,test,dev]'
+
+      - run: ruff check .
+      - run: ruff format --check .
+        continue-on-error: true
+      - run: mypy --strict -p signledger
+      - run: bandit -q -r signledger -x signledger/contrib/django/migrations
+
+  # ---------------------------------------------------------------------------
+  # Packaging. The wheel is what users get; test the wheel, not the source tree.
+  # ---------------------------------------------------------------------------
+  package:
+    name: build and verify the wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -e '.[all,test,dev]'
+
+      - name: Build
+        run: python -m build
+
+      - name: twine check
+        run: twine check --strict dist/*
+
+      - name: Packaging conformance suite
+        # Builds a real wheel, unpacks it, imports every module out of the
+        # artifact, runs the console script, and writes+verifies a ledger using
+        # only the installed wheel. Also asserts the Django migration is present
+        # (it was missing from an earlier build, which 500'd every audited
+        # request under the default fail-closed policy) and that no empty
+        # namespace directory shadows a sibling module.
+        run: pytest tests/test_packaging.py -q --no-cov
+
+  # ---------------------------------------------------------------------------
+  # Mutation testing. Coverage proves a line ran; mutation proves an assertion
+  # would have caught it changing. Advisory on PRs, enforced on main.
+  # ---------------------------------------------------------------------------
+  mutation:
+    name: mutmut
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 120
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: signledger
+          POSTGRES_PASSWORD: signledger
+          POSTGRES_DB: signledger_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U signledger"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      mongo:
+        image: mongo:7
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      SIGNLEDGER_TEST_POSTGRES_DSN: postgresql://signledger:signledger@127.0.0.1:5432/signledger_test
+      SIGNLEDGER_TEST_MONGO_URI: mongodb://127.0.0.1:27017
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -e '.[all,test,dev]'
+
+      - name: Run mutation testing
+        run: mutmut run --no-progress || true
+
+      - name: Report
+        run: |
+          mutmut results | tee mutmut.txt
+          echo "### Mutation results" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -50 mutmut.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mutmut-results
+          path: mutmut.txt

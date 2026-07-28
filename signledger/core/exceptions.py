@@ -1,77 +1,57 @@
-"""Exception classes for SignLedger."""
+"""SignLedger exception hierarchy (architecture contract, section 10).
 
-from typing import Optional, Any, List
+Every error raised by SignLedger derives from :class:`SignLedgerError`, so a caller
+can wrap the whole library in a single ``except``.
+
+No exception message may contain entry payloads, connection strings or credentials.
+Messages carry *structural* information only - a JSON path, a field name, a sequence
+number, a type name - never a value taken from user data.
+"""
+
+__all__ = [
+    "AnchorError",
+    "CanonicalizationError",
+    "ConfigurationError",
+    "IntegrityError",
+    "SignLedgerError",
+    "SignatureError",
+    "StorageError",
+    "ValidationError",
+]
 
 
 class SignLedgerError(Exception):
-    """Base exception for all SignLedger errors."""
-    
-    def __init__(self, message: str, details: Optional[dict[str, Any]] = None):
-        super().__init__(message)
-        self.message = message
-        self.details = details or {}
+    """Base class for every error raised by SignLedger."""
 
 
 class IntegrityError(SignLedgerError):
-    """Raised when ledger integrity is compromised."""
-    
-    def __init__(
-        self,
-        message: str,
-        entry_id: Optional[str] = None,
-        expected_hash: Optional[str] = None,
-        actual_hash: Optional[str] = None,
-    ):
-        details = {
-            "entry_id": entry_id,
-            "expected_hash": expected_hash,
-            "actual_hash": actual_hash,
-        }
-        super().__init__(message, details)
-        self.entry_id = entry_id
-        self.expected_hash = expected_hash
-        self.actual_hash = actual_hash
+    """The hash chain, a signature or an anchored checkpoint did not verify."""
 
 
 class ValidationError(SignLedgerError):
-    """Raised when entry validation fails."""
-    
-    def __init__(self, message: str, field: Optional[str] = None, value: Any = None):
-        details = {"field": field, "value": value}
-        super().__init__(message, details)
-        self.field = field
-        self.value = value
+    """An argument or entry field failed validation before it reached the store."""
 
 
 class StorageError(SignLedgerError):
-    """Raised when storage operations fail."""
-    
-    def __init__(self, message: str, operation: str, backend: Optional[str] = None):
-        details = {"operation": operation, "backend": backend}
-        super().__init__(message, details)
-        self.operation = operation
-        self.backend = backend
+    """A storage backend failed. Appends fail closed rather than writing unlinked rows."""
 
 
 class SignatureError(SignLedgerError):
-    """Raised when signature verification fails."""
-    
-    def __init__(
-        self,
-        message: str,
-        entry_id: Optional[str] = None,
-        signature: Optional[str] = None,
-    ):
-        details = {"entry_id": entry_id, "signature": signature}
-        super().__init__(message, details)
-        self.entry_id = entry_id
-        self.signature = signature
+    """A signing or signature-verification operation failed."""
 
 
-class ConsensusError(SignLedgerError):
-    """Raised when consensus cannot be reached."""
-    
-    def __init__(self, message: str, nodes: Optional[List[str]] = None):
-        details = {"nodes": nodes}
-        super().__init__(message, details)
-        self.nodes = nodes or []
+class CanonicalizationError(SignLedgerError):
+    """A value could not be encoded under SLCS/1.
+
+    Raised for non-JSON-native types, non-``str`` object keys, ``NaN``/``Infinity``,
+    integers outside +/-2**53, and violations of the size or nesting limits. The message
+    carries the JSON path of the offending value, never the value itself.
+    """
+
+
+class ConfigurationError(SignLedgerError):
+    """A ledger or backend was constructed with an unusable configuration."""
+
+
+class AnchorError(SignLedgerError):
+    """Publishing a checkpoint to, or fetching one from, an external anchor sink failed."""

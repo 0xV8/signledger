@@ -1,1 +1,0 @@
-"""Compression utilities for SignLedger."""

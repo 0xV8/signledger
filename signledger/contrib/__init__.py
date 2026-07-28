@@ -1,0 +1,147 @@
+"""Framework integrations for Flask, FastAPI and Django.
+
+This module holds the half that is identical in all three: what an audit record looks
+like, and what happens when writing one fails.
+
+**Nothing here imports a web framework.** ``signledger.contrib.flask``,
+``.fastapi`` and ``.django`` are reached by path, so ``import signledger.contrib`` keeps
+working on a machine that has none of them installed.
+
+The v1 versions of these integrations were 1,685 lines of code that could never run: each
+one was shadowed by an empty package of the same name, so the module a user imported was
+not the module anyone had tested. What did reach production wrote ``Authorization``
+headers and whole request bodies into an immutable store. Both failures share one cause -
+nothing was executed by a test - which is why every line below is reached by one.
+"""
+
+from typing import Any, Dict, Mapping, Optional
+
+from signledger.contrib.redaction import RedactionPolicy
+from signledger.core.exceptions import ConfigurationError, SignLedgerError
+
+__all__ = [
+    "AUDIT_FAILURE_POLICIES",
+    "FAIL_CLOSED",
+    "FAIL_OPEN",
+    "AuditRecorder",
+    "AuditWriteError",
+    "RedactionPolicy",
+    "build_audit_record",
+]
+
+#: The audit write must succeed or the request must not. The default.
+FAIL_CLOSED = "fail_closed"
+
+#: The request proceeds even when the audit write fails. Availability over auditability -
+#: a real trade-off some deployments need, but never the one you get by accident.
+FAIL_OPEN = "fail_open"
+
+AUDIT_FAILURE_POLICIES = frozenset({FAIL_CLOSED, FAIL_OPEN})
+
+
+class AuditWriteError(SignLedgerError):
+    """An audit record could not be written and the policy is ``fail_closed``.
+
+    Derives from :class:`~signledger.core.exceptions.SignLedgerError`, so an application
+    that already wraps SignLedger in one ``except`` catches this too.
+    """
+
+
+class AuditRecorder:
+    """The one place any integration turns a request into a ledger entry.
+
+    Written once and shared by all three frameworks so the fail-open/fail-closed decision
+    - the only part of an audit middleware that can quietly destroy the audit trail -
+    exists in exactly one testable place.
+    """
+
+    def __init__(
+        self,
+        ledger: Any,
+        *,
+        redaction: Optional[RedactionPolicy] = None,
+        audit_failure_policy: str = FAIL_CLOSED,
+    ) -> None:
+        if audit_failure_policy not in AUDIT_FAILURE_POLICIES:
+            raise ConfigurationError(
+                f"audit_failure_policy must be one of {sorted(AUDIT_FAILURE_POLICIES)}, "
+                f"got {audit_failure_policy!r}"
+            )
+        self.ledger = ledger
+        # A recorder with no policy still redacts. Redaction is not a feature that can be
+        # left switched off by forgetting to pass an argument.
+        self.redaction = RedactionPolicy() if redaction is None else redaction
+        self.audit_failure_policy = audit_failure_policy
+        self.audit_failures = 0
+        self.last_audit_error: Optional[str] = None
+
+    @property
+    def fail_closed(self) -> bool:
+        """Whether a failed audit write must fail the request."""
+        return self.audit_failure_policy == FAIL_CLOSED
+
+    def record(
+        self, data: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None
+    ) -> Optional[Any]:
+        """Append one audit record, honouring the configured failure policy.
+
+        Returns the stored entry, or ``None`` when the write failed under ``fail_open``.
+        """
+        try:
+            return self.ledger.append(data, metadata)
+        except Exception as err:  # noqa: BLE001 - re-raised or counted, never swallowed
+            # Deliberately broad, and deliberately not silent. ``fail_open`` promises the
+            # request survives an audit failure; a version that only caught
+            # SignLedgerError would break that promise on the first driver bug. Under
+            # ``fail_closed`` the error is re-raised, and under ``fail_open`` it is
+            # counted and named on the recorder - never swallowed, which is exactly what
+            # v1 did.
+            self.audit_failures += 1
+            self.last_audit_error = type(err).__name__
+            if self.fail_closed:
+                # No payload in the message: contract section 10. The chained cause
+                # carries the detail for whoever is holding the traceback.
+                raise AuditWriteError(
+                    "the audit record could not be written; refusing the request"
+                ) from err
+            return None
+
+
+def build_audit_record(
+    *,
+    integration: str,
+    method: str,
+    path: str,
+    status: Optional[int],
+    client_ip: Optional[str],
+    headers: Mapping[str, str],
+    query: Optional[Any] = None,
+    body: Any = None,
+    body_reason: str = "disabled",
+    user: Optional[str] = None,
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Assemble the audit payload every integration writes.
+
+    One shape for all three frameworks, so a query an auditor writes against a Flask
+    service still works against the Django one. Values arriving here are expected to have
+    been through :class:`~signledger.contrib.redaction.RedactionPolicy` already.
+    """
+    record: Dict[str, Any] = {
+        "integration": integration,
+        "method": method,
+        "path": path,
+        "status": status,
+        "client_ip": client_ip,
+        "headers": dict(headers),
+        "query": query,
+        # Either the captured body or a marker naming the rule that refused it. An
+        # absent field would be indistinguishable from a middleware nobody installed.
+        "body": body if body_reason == "captured" else f"[OMITTED:{body_reason}]",
+        "user": user,
+    }
+    if error is not None:
+        # Present only when there was one. A field that is always there and always null
+        # teaches people to stop reading it.
+        record["error"] = error
+    return record

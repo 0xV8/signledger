@@ -1,662 +1,349 @@
 # SignLedger
 
-**SignLedger** is a production-ready Python library for immutable audit logging with cryptographic verification. Built for compliance, security, and trust, SignLedger provides blockchain-inspired tamper-proof logging for critical applications.
+A tamper-evident, append-only audit log for Python.
 
-## Features
+SignLedger answers one question: **has this log been altered since it was written?**
 
-- **Immutable Audit Logs**: Write-once, tamper-proof entries with hash chain verification
-- **Cryptographic Signatures**: RSA, ECDSA, and Ed25519 digital signatures for non-repudiation
-- **Hash Chain Integrity**: SHA-256/SHA-512/SHA-3 cryptographic linking of entries
-- **Multiple Storage Backends**: In-memory, SQLite, PostgreSQL, MongoDB support
-- **High Performance**: 2,000+ transactions per second with batch operations
-- **Compression**: 50-70% storage reduction with zlib, gzip, lz4, or zstd
-- **Framework Integration**: Built-in support for Django, Flask, and FastAPI
-- **Thread-Safe**: Production-ready concurrent access with RLock protection
-- **Type-Safe**: Full type hints and Pydantic v2 validation
-
-## Installation
+It does not claim to answer that unconditionally, because no library can. How much the
+answer is worth depends on how you deploy it — so SignLedger *computes* that and tells
+you, instead of asserting it in prose.
 
 ```bash
 pip install signledger
 ```
 
-### Optional Dependencies
+> **If you are on 1.0.0, upgrade.** 1.0.0 is withdrawn: it did not provide the
+> tamper-evidence it documented. On SQLite and PostgreSQL — the documented default —
+> it built no hash chain at all, and its signatures were never verified.
+> [SECURITY.md](SECURITY.md) explains what to assume about a log written by it, and
+> `signledger migrate` carries an existing ledger forward without breaking its history.
+
+## Quick start
+
+```python
+from signledger import Ledger
+
+with Ledger() as ledger:
+    ledger.append({"actor": "alice", "action": "deleted-record", "record_id": 42})
+    ledger.append({"actor": "bob", "action": "changed-role", "target": "carol"})
+
+    report = ledger.check_integrity()
+
+print(report.ok)                # True
+print(report.entries_verified)  # 2
+print(report.assurance.value)   # chain_only
+```
+
+`Ledger()` with no arguments keeps entries in memory, which is useful for a test and
+useless for an audit trail. Point it at a store to keep anything:
+
+```python
+import os, tempfile
+from signledger import Ledger
+from signledger.backends import SQLiteBackend
+
+path = os.path.join(tempfile.mkdtemp(), "audit.db")
+
+with Ledger(SQLiteBackend(path)) as ledger:
+    entry = ledger.append({"actor": "alice", "action": "login"})
+
+print(entry.sequence)  # 0
+```
+
+## Read this before relying on it
+
+A hash chain on its own is **not** tamper evidence. SHA-256 is a public function, so
+anyone who can write to your database can edit a row and recompute every hash after it.
+The chain verifies perfectly afterwards.
+
+Only two things actually stop that — a secret the attacker cannot forge, or a record kept
+somewhere they cannot reach. SignLedger reports which of them you have:
+
+| Level | What you have | What it detects |
+|---|---|---|
+| `none` | chain broken, or nothing verified | — |
+| `chain_only` | hash chain only | accidental corruption, and naive edits |
+| `signed` | every entry signed with a key the attacker does not hold | a database insider rewriting rows |
+| `anchored` | signed, **plus** a head published outside the database | deletion of the tail, which nothing else can see |
+| `worm` | anchored, **plus** a store that refuses `UPDATE`/`DELETE` | rewriting at all |
+
+```python
+from signledger import AssuranceLevel, Ledger
+
+with Ledger() as ledger:
+    ledger.append({"event": "something happened"})
+    level = ledger.assurance_level()
+
+assert level is AssuranceLevel.CHAIN_ONLY
+```
+
+If `assurance_level()` returns `chain_only`, someone with write access to your database
+can rewrite your audit log undetectably. That is not a bug — it is what a bare chain is.
+The rest of this README is about getting above it.
+
+### Signing
+
+A signature is a secret the attacker cannot forge. The key's identity is part of the
+hashed preimage, so it cannot be swapped without breaking the chain.
+
+```python
+from signledger import AssuranceLevel, Ledger
+from signledger.crypto.signatures import Ed25519Signer
+
+signer = Ed25519Signer.generate()
+
+with Ledger(enable_signatures=True, signer=signer) as ledger:
+    ledger.append({"actor": "alice", "action": "wired-funds", "amount": "10000.00"})
+    level = ledger.assurance_level()
+
+assert level is AssuranceLevel.SIGNED
+```
+
+Signing needs the optional extra:
 
 ```bash
-# PostgreSQL backend
-pip install signledger[postgresql]
-
-# MongoDB backend
-pip install signledger[mongodb]
-
-# All backends
-pip install signledger[all]
-
-# Framework integrations
-pip install signledger[django]
-pip install signledger[flask]
-pip install signledger[fastapi]
+pip install 'signledger[signatures]'
 ```
 
-## Quick Start
+`Ledger(enable_signatures=True)` without a signer fails at construction, not on the first
+append.
+
+### Anchoring
+
+Signatures do not detect **deletion**. Remove the last 200 entries and what remains is a
+shorter log that is internally flawless — every hash and every signature still checks out.
+Nothing inside the database can tell you those entries ever existed.
+
+An anchor is a record of the chain head kept where the attacker does not control it.
 
 ```python
+import os, tempfile
 from signledger import Ledger
-from signledger.backends import InMemoryBackend
-
-# Create a ledger
-ledger = Ledger(backend=InMemoryBackend())
-
-# Append entries
-entry = ledger.append({
-    "action": "user_login",
-    "user_id": "user123",
-    "ip_address": "192.168.1.1"
-})
-
-# Query entries
-entries = list(ledger.get_entries(limit=10))
-
-# Verify integrity
-is_valid = ledger.verify_integrity()  # Returns True
-
-# Get statistics
-stats = ledger.get_stats()
-print(f"Total entries: {stats.total_entries}")
-```
-
-## Use Cases
-
-### 1. Financial Transaction Logging
-
-Immutable audit trails for banking and financial services compliance (SOX, PCI-DSS).
-
-```python
-from signledger import Ledger
-from signledger.backends import SQLiteBackend
-from signledger.crypto.signatures import RSASigner
-from datetime import datetime
-
-# Initialize ledger with signature support
-signer = RSASigner()
-ledger = Ledger(
-    backend=SQLiteBackend("financial_audit.db"),
-    enable_signatures=True
-)
-
-# Log financial transaction
-entry = ledger.append(
-    data={
-        "transaction_id": "TXN123456",
-        "account_from": "ACC001",
-        "account_to": "ACC002",
-        "amount": 15000.00,
-        "currency": "USD",
-        "timestamp": datetime.utcnow().isoformat(),
-        "operator_id": "OPR789"
-    },
-    metadata={
-        "compliance": "SOX",
-        "category": "wire_transfer"
-    },
-    sign=True,
-    signer=signer.sign
-)
-
-# Verify signature later
-is_valid = signer.verify(entry.hash, entry.signature)
-```
-
-### 2. Healthcare Access Logs (HIPAA Compliance)
-
-Track all access to protected health information (PHI) with non-repudiation.
-
-```python
-from signledger import Ledger
-from signledger.backends import PostgreSQLBackend
-
-# HIPAA-compliant audit logging
-ledger = Ledger(
-    backend=PostgreSQLBackend(
-        host="localhost",
-        database="healthcare_audit",
-        user="audit_user",
-        password="secure_password"
-    )
-)
-
-# Log PHI access
-ledger.append({
-    "event_type": "PHI_ACCESS",
-    "patient_id": "P123456",
-    "accessed_by": "DR_SMITH",
-    "access_type": "READ",
-    "data_accessed": ["medical_history", "prescriptions"],
-    "purpose": "treatment",
-    "facility": "General Hospital"
-})
-```
-
-### 3. Supply Chain Provenance
-
-Track product journey from manufacture to delivery.
-
-```python
-from signledger import Ledger
-
-ledger = Ledger()
-
-# Manufacture
-ledger.append({
-    "event": "manufactured",
-    "product_id": "PROD-2024-001",
-    "batch": "BATCH-A123",
-    "location": "Factory Shanghai",
-    "quality_check": "PASSED"
-})
-
-# Shipping
-ledger.append({
-    "event": "shipped",
-    "product_id": "PROD-2024-001",
-    "carrier": "DHL",
-    "tracking": "DHL123456789",
-    "destination": "Warehouse NYC"
-})
-
-# Delivery
-ledger.append({
-    "event": "delivered",
-    "product_id": "PROD-2024-001",
-    "recipient": "John Doe",
-    "signature": "base64_signature_data"
-})
-
-# Query product history
-product_history = ledger.query(
-    lambda e: e.data.get("product_id") == "PROD-2024-001"
-)
-```
-
-### 4. Software Deployment Audit
-
-Track all production deployments with approval workflows.
-
-```python
-from signledger import Ledger
-
-ledger = Ledger()
-
-# Log deployment
-ledger.append({
-    "deployment_id": "DEPLOY-2024-042",
-    "application": "api-service",
-    "version": "v2.3.1",
-    "environment": "production",
-    "deployed_by": "deploy_bot",
-    "approved_by": ["alice@company.com", "bob@company.com"],
-    "commit_sha": "a1b2c3d4",
-    "rollback_plan": "automatic",
-    "health_check": "PASSED"
-})
-```
-
-### 5. Database Change Tracking
-
-Immutable record of all database schema and data changes.
-
-```python
-from signledger import Ledger
-
-ledger = Ledger()
-
-# Track schema change
-ledger.append({
-    "change_type": "schema_migration",
-    "database": "production_db",
-    "migration_id": "20240101_add_user_roles",
-    "sql": "ALTER TABLE users ADD COLUMN role VARCHAR(50)",
-    "executed_by": "admin",
-    "rollback_sql": "ALTER TABLE users DROP COLUMN role"
-})
-```
-
-## Framework Integration
-
-### Django Integration
-
-```python
-# settings.py
-INSTALLED_APPS = [
-    ...
-    'signledger.integrations.django',
-]
-
-SIGNLEDGER = {
-    'BACKEND': 'signledger.backends.PostgreSQLBackend',
-    'OPTIONS': {
-        'host': 'localhost',
-        'database': 'audit_log',
-        'user': 'postgres',
-        'password': 'password'
-    },
-    'ENABLE_SIGNATURES': True,
-    'AUTO_VERIFY': True
-}
-
-# views.py
-from signledger.integrations.django import get_ledger
-
-def transfer_money(request):
-    ledger = get_ledger()
-
-    # Perform transaction
-    transaction = process_transfer(request.data)
-
-    # Log to immutable ledger
-    ledger.append({
-        "action": "money_transfer",
-        "user": request.user.id,
-        "amount": transaction.amount,
-        "status": "completed"
-    })
-
-    return JsonResponse({"status": "success"})
-```
-
-### Flask Integration
-
-```python
-from flask import Flask
-from signledger import Ledger
+from signledger.anchor import FileAnchorSink
 from signledger.backends import SQLiteBackend
 
-app = Flask(__name__)
+directory = tempfile.mkdtemp()
+store = os.path.join(directory, "audit.db")
+anchors = os.path.join(directory, "anchors.jsonl")
 
-# Initialize ledger
-ledger = Ledger(backend=SQLiteBackend("audit.db"))
+with Ledger(SQLiteBackend(store), anchor_sink=FileAnchorSink(anchors)) as ledger:
+    for index in range(5):
+        ledger.append({"event": "payment", "index": index})
+    checkpoint = ledger.checkpoint()
 
-@app.before_request
-def log_request():
-    """Log all API requests"""
-    from flask import request
-
-    if request.endpoint:
-        ledger.append({
-            "event": "api_request",
-            "method": request.method,
-            "endpoint": request.endpoint,
-            "ip": request.remote_addr,
-            "user_agent": request.user_agent.string
-        })
-
-@app.route('/api/transfer', methods=['POST'])
-def transfer():
-    data = request.json
-
-    # Process transfer
-    result = process_payment(data)
-
-    # Log transaction
-    ledger.append({
-        "action": "payment",
-        "from": data['from_account'],
-        "to": data['to_account'],
-        "amount": data['amount'],
-        "status": result['status']
-    })
-
-    return jsonify(result)
-
-@app.route('/api/audit/verify', methods=['GET'])
-def verify_integrity():
-    """Verify ledger integrity"""
-    is_valid = ledger.verify_integrity()
-    stats = ledger.get_stats()
-
-    return jsonify({
-        "integrity": is_valid,
-        "total_entries": stats.total_entries,
-        "last_entry": stats.last_entry_time.isoformat() if stats.last_entry_time else None
-    })
-
-if __name__ == '__main__':
-    app.run()
+print(checkpoint.entry_count)  # 5
 ```
 
-### FastAPI Integration
+Take a checkpoint periodically and keep it somewhere else — another host, an append-only
+bucket, a transparency log. `check_integrity()` compares the head against the newest
+anchored checkpoint, and a truncated tail then shows up as `HEAD_MISMATCH` and
+`COUNT_MISMATCH`.
+
+## Verification
+
+`check_integrity()` never raises because the log is damaged; it returns a report. It
+collects **every** failure rather than stopping at the first, because someone looking at a
+corrupted audit log needs the whole picture.
 
 ```python
-from fastapi import FastAPI, HTTPException
 from signledger import Ledger
-from signledger.backends import PostgreSQLBackend
-from pydantic import BaseModel
-from datetime import datetime
+from signledger.backends import MemoryBackend
 
-app = FastAPI()
+backend = MemoryBackend()
+with Ledger(backend) as ledger:
+    ledger.append({"event": "one"})
+    ledger.append({"event": "two"})
 
-# Initialize ledger
-ledger = Ledger(
-    backend=PostgreSQLBackend(
-        host="localhost",
-        database="audit_db",
-        user="postgres",
-        password="password"
-    )
-)
+    # Rewrite a stored row behind the ledger's back, the way an insider would.
+    stored = backend._entries[0]
+    backend._entries[0] = stored.model_copy(update={"data": {"event": "tampered"}})
 
-class Transaction(BaseModel):
-    from_account: str
-    to_account: str
-    amount: float
-    description: str
+    report = ledger.check_integrity()
 
-@app.post("/api/transaction")
-async def create_transaction(txn: Transaction):
-    """Process and audit a transaction"""
+print(report.ok)  # False
+print(sorted({failure.kind.value for failure in report.failures}))
+```
 
-    # Log transaction
-    entry = await ledger.append_async({
-        "type": "transaction",
-        "from": txn.from_account,
-        "to": txn.to_account,
-        "amount": txn.amount,
-        "description": txn.description,
-        "timestamp": datetime.utcnow().isoformat()
-    })
+Failures name what broke and where: `broken_link`, `bad_hash`, `bad_signature`,
+`missing_signature`, `sequence_gap`, `genesis_mismatch`, `head_mismatch`,
+`count_mismatch`, `unknown_key`, `format_unsupported`.
 
-    return {
-        "transaction_id": entry.id,
-        "hash": entry.hash,
-        "timestamp": entry.timestamp
-    }
+An empty range is reported as **not ok**. A verifier that returns success having checked
+nothing is worse than no verifier.
 
-@app.get("/api/audit/entries")
-async def get_audit_entries(limit: int = 100):
-    """Retrieve recent audit entries"""
-    entries = list(ledger.get_entries(limit=limit))
+## Storage backends
 
-    return {
-        "entries": [
-            {
-                "id": e.id,
-                "timestamp": e.timestamp.isoformat(),
-                "data": e.data,
-                "hash": e.hash
-            }
-            for e in entries
-        ]
-    }
+```python
+from signledger.backends import MemoryBackend, SQLiteBackend
 
-@app.get("/api/audit/verify")
-async def verify_audit_integrity():
-    """Verify ledger integrity"""
+memory = MemoryBackend()            # tests only; nothing survives the process
+sqlite = SQLiteBackend(":memory:")  # or a path, for WAL + synchronous=FULL on disk
+memory.close()
+sqlite.close()
+```
+
+PostgreSQL and MongoDB need their own extras, and are imported by path so a base install
+never needs their drivers:
+
+```bash
+pip install 'signledger[postgresql]'   # signledger.backends.postgresql.PostgresBackend
+pip install 'signledger[mongodb]'      # signledger.backends.mongodb.MongoBackend
+```
+
+Every backend runs the same conformance suite, so they behave identically. Ask one what it
+actually guarantees rather than assuming:
+
+```python
+from signledger.backends import SQLiteBackend
+
+backend = SQLiteBackend(":memory:")
+print(sorted(backend.capabilities()))
+backend.close()
+```
+
+An append is one database transaction — the tip read and the insert together — plus
+`UNIQUE` constraints on `sequence` and `previous_hash`, and a bounded retry on conflict.
+Two workers cannot fork the chain.
+
+## Batching
+
+```python
+from signledger import Ledger
+from signledger.core.batch import BatchItem, BatchProcessor
+
+with Ledger() as ledger:
+    result = BatchProcessor(ledger).append_batch([
+        {"event": "one"},
+        {"event": "two"},
+        BatchItem(data={"event": "three"}, metadata={"source": "importer"}),
+    ])
+
+print(result.ok, result.committed)  # True 3
+```
+
+Everything a caller can get wrong — an unencodable payload, a naive timestamp, a repeated
+`entry_id` — is checked before the first write, so with `atomic=True` (the default) one
+bad item means nothing at all is written.
+
+Honest number: batching is roughly **1.1–1.2x** faster than a loop of `append()`, not an
+order of magnitude. Most of the cost is canonical encoding, which both paths pay.
+
+## What goes in an entry
+
+Payloads must be JSON-native: `dict`, `list`, `str`, `int`, `bool`, `None`, `float`.
+`Decimal`, `datetime`, `bytes`, `set` and `tuple` are **rejected**, with the JSON path in
+the message:
+
+```python
+from decimal import Decimal
+from signledger import Ledger
+from signledger.core.exceptions import CanonicalizationError
+
+with Ledger() as ledger:
     try:
-        is_valid = await ledger.verify_integrity_async()
-        stats = ledger.get_stats()
-
-        return {
-            "valid": is_valid,
-            "total_entries": stats.total_entries,
-            "first_entry": stats.first_entry_time.isoformat() if stats.first_entry_time else None,
-            "last_entry": stats.last_entry_time.isoformat() if stats.last_entry_time else None
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        ledger.append({"amount": Decimal("1.50")})
+    except CanonicalizationError as err:
+        print(err)  # data.amount: Decimal is not JSON-native; convert to str
 ```
 
-### Celery Integration
+That strictness is deliberate: silently coercing values is how two different payloads end
+up with one hash. Convert to `str` and keep the exactness.
+
+Error messages never contain your payload, your connection string or your credentials.
+They carry field names, JSON paths, sequence numbers and type names only — an audit
+library's exceptions end up in logs its payloads were deliberately kept out of.
+
+Every error derives from `SignLedgerError`:
 
 ```python
-from celery import Celery
-from signledger import Ledger
-from signledger.backends import RedisBackend
+from signledger import Ledger, SignLedgerError
 
-app = Celery('tasks', broker='redis://localhost:6379')
-ledger = Ledger(backend=RedisBackend(host='localhost', port=6379))
-
-@app.task
-def process_order(order_id):
-    """Process order and log to audit trail"""
-
-    # Process order
-    result = handle_order(order_id)
-
-    # Log to ledger
-    ledger.append({
-        "task": "process_order",
-        "order_id": order_id,
-        "status": result['status'],
-        "processed_at": datetime.utcnow().isoformat()
-    })
-
-    return result
+with Ledger() as ledger:
+    try:
+        ledger.append({})               # data must not be empty
+    except SignLedgerError as err:
+        print(type(err).__name__)       # ValidationError
 ```
 
-### Simple Python Program
+## Command line
+
+```bash
+signledger verify -b sqlite:audit.db
+signledger stats -b sqlite:audit.db
+signledger inspect -b sqlite:audit.db --forks
+signledger checkpoint -b sqlite:audit.db --anchor anchors.jsonl
+signledger export -b sqlite:audit.db -o bundle.json
+signledger verify-bundle bundle.json
+```
+
+`verify` exits non-zero when the log does not verify **and** when the store is empty, so it
+works as a health check. Commands that make an integrity claim refuse to run on a ledger
+that does not verify: publishing a checkpoint over a rewritten chain would launder the
+damage into the one record an auditor is meant to trust.
+
+## Web framework integration
+
+```bash
+pip install 'signledger[flask]'    # signledger.contrib.flask
+pip install 'signledger[fastapi]'  # signledger.contrib.fastapi
+pip install 'signledger[django]'   # signledger.contrib.django
+```
+
+Request data is redacted before it is written: field names containing `password`, `token`,
+`secret`, `ssn`, `card`, `cvv` and friends are replaced — in the body, the headers **and**
+the query string. Matching is by substring, so it over-redacts rather than under-redacts.
+For a store nobody can edit afterwards, that is the correct direction to be wrong in.
 
 ```python
-from signledger import Ledger
-from signledger.backends import InMemoryBackend
-from datetime import datetime
+from signledger.contrib.redaction import RedactionPolicy
 
-def main():
-    # Create ledger
-    ledger = Ledger(backend=InMemoryBackend())
-
-    # Simulate user activities
-    activities = [
-        {"user": "alice", "action": "login", "ip": "192.168.1.10"},
-        {"user": "alice", "action": "view_document", "doc_id": "DOC123"},
-        {"user": "bob", "action": "login", "ip": "192.168.1.11"},
-        {"user": "alice", "action": "edit_document", "doc_id": "DOC123"},
-        {"user": "bob", "action": "delete_document", "doc_id": "DOC456"},
-    ]
-
-    # Log activities
-    for activity in activities:
-        activity["timestamp"] = datetime.utcnow().isoformat()
-        entry = ledger.append(activity)
-        print(f"Logged: {entry.id} - {activity['action']}")
-
-    # Query specific user's activities
-    alice_activities = ledger.query(
-        lambda e: e.data.get("user") == "alice"
-    )
-
-    print(f"\nAlice's activities: {len(alice_activities)}")
-    for entry in alice_activities:
-        print(f"  - {entry.data['action']} at {entry.timestamp}")
-
-    # Verify integrity
-    is_valid = ledger.verify_integrity()
-    print(f"\nLedger integrity: {'VALID' if is_valid else 'INVALID'}")
-
-    # Get statistics
-    stats = ledger.get_stats()
-    print(f"Total entries: {stats.total_entries}")
-    print(f"First entry: {stats.first_entry_time}")
-    print(f"Last entry: {stats.last_entry_time}")
-
-if __name__ == "__main__":
-    main()
+policy = RedactionPolicy()
+print(policy.payload({"user": "alice", "password": "hunter2"}))
 ```
 
-## Advanced Features
+## Compatibility
 
-### Batch Operations
+SemVer across three independent surfaces: the Python API, the on-disk schema, and the hash
+`format_version`. Verification supports every historical `format_version` forever; writing
+always uses the newest.
 
-```python
-from signledger.core.batch import BatchProcessor
+## Limitations
 
-# High-throughput batch processing
-batch = BatchProcessor(ledger, batch_size=1000)
+Stated plainly, because a security library that hides these is worse than useless.
 
-for i in range(10000):
-    batch.add_entry({"transaction_id": f"TXN{i}", "amount": i * 100})
+- **Without an anchor, tail truncation is undetectable.** Delete the last N entries and
+  what remains verifies perfectly. Use `checkpoint()` and keep the result elsewhere.
+- **`chain_only` does not survive a database insider.** See the table above.
+- **A process compromise beats signing.** Anyone who can read the signing key can produce
+  valid entries. Only external anchoring and an HSM/KMS signer help.
+- **`Entry.data` is not deeply frozen.** Mutating a returned entry's `data` dict in place
+  changes what it hashes to.
+- **Timestamps are limited to roughly 1684–2255**, a consequence of encoding them as
+  integer microseconds within the ±2^53 safe-integer bound.
+- **Merkle consistency proofs** are one element longer than RFC 6962's when the old tree
+  size is a power of two, because SignLedger binds the leaf count into the root.
 
-batch.flush()  # Commit remaining entries
+## Development
+
+```bash
+python3 -m pytest --cov=signledger --cov-branch --cov-report=term-missing
 ```
 
-### Compression
+PostgreSQL and MongoDB tests skip unless a live server is reachable; set
+`SIGNLEDGER_TEST_POSTGRES_DSN` / `SIGNLEDGER_TEST_MONGO_URI` to point at your own. Nothing
+in the suite mocks a database.
 
-```python
-from signledger.compression import Compressor
+Every fenced `python` block in this file is executed by `tests/test_docs_execute.py`.
 
-# Enable compression for storage optimization
-ledger = Ledger(
-    backend=SQLiteBackend("audit.db"),
-    compression=Compressor(algorithm="zstd", level=3)
-)
-```
-
-### Merkle Tree Verification
-
-```python
-from signledger.crypto.merkle import MerkleTree
-
-# Build Merkle tree from entries
-entries = list(ledger.get_entries())
-merkle_tree = MerkleTree()
-
-for entry in entries:
-    merkle_tree.add_leaf(entry.hash)
-
-merkle_tree.build()
-
-# Get Merkle root
-root_hash = merkle_tree.get_root()
-
-# Verify specific entry
-proof = merkle_tree.get_proof(0)
-is_valid = merkle_tree.verify_proof(proof, entries[0].hash, root_hash)
-```
-
-### Cryptographic Signatures
-
-```python
-from signledger.crypto.signatures import RSASigner, ECDSASigner, Ed25519Signer
-
-# RSA signatures
-rsa_signer = RSASigner(key_size=2048)
-entry = ledger.append(
-    {"action": "critical_operation"},
-    sign=True,
-    signer=rsa_signer.sign
-)
-
-# ECDSA signatures (faster, smaller)
-ecdsa_signer = ECDSASigner(curve="secp256k1")
-entry = ledger.append(
-    {"action": "blockchain_transaction"},
-    sign=True,
-    signer=ecdsa_signer.sign
-)
-
-# Ed25519 signatures (modern, fast)
-ed_signer = Ed25519Signer()
-entry = ledger.append(
-    {"action": "secure_message"},
-    sign=True,
-    signer=ed_signer.sign
-)
-```
-
-## Storage Backends
-
-### SQLite (Default for Small-Medium Deployments)
-
-```python
-from signledger.backends import SQLiteBackend
-
-ledger = Ledger(backend=SQLiteBackend("audit.db"))
-```
-
-### PostgreSQL (Recommended for Production)
-
-```python
-from signledger.backends import PostgreSQLBackend
-
-ledger = Ledger(
-    backend=PostgreSQLBackend(
-        host="localhost",
-        port=5432,
-        database="audit_log",
-        user="postgres",
-        password="secure_password"
-    )
-)
-```
-
-### MongoDB (Document-Oriented)
-
-```python
-from signledger.backends import MongoDBBackend
-
-ledger = Ledger(
-    backend=MongoDBBackend(
-        host="localhost",
-        port=27017,
-        database="audit_db",
-        collection="ledger_entries"
-    )
-)
-```
-
-### In-Memory (Testing/Development)
-
-```python
-from signledger.backends import InMemoryBackend
-
-ledger = Ledger(backend=InMemoryBackend())
-```
-
-## Performance
-
-SignLedger is optimized for high-throughput audit logging:
-
-- **Write Performance**: 2,000+ entries/second (batch mode: 10,000+/sec)
-- **Read Performance**: 50,000+ entries/second with caching
-- **Verification**: Full integrity check of 100,000 entries in ~2 seconds
-- **Storage Efficiency**: 50-70% reduction with compression
-- **Memory Usage**: ~1MB per 1,000 entries (without compression)
+Coverage is gated at 100% line *and* branch. That figure is only real with both databases
+running — without them 582 tests skip and it falls to ~91%, so CI runs them as services
+and fails if any database test is skipped.
 
 ## Security
 
-- **Immutability**: Entries cannot be modified after creation (Pydantic frozen models)
-- **Hash Chain**: Tamper detection through cryptographic linking
-- **Digital Signatures**: Non-repudiation with RSA/ECDSA/Ed25519
-- **Integrity Verification**: Automatic or on-demand verification
-- **Thread Safety**: Production-ready concurrent access protection
-
-## Requirements
-
-- Python 3.8+
-- pydantic >= 2.0.0
-- cryptography >= 41.0.0
+Report vulnerabilities privately — see [SECURITY.md](SECURITY.md). Release history and the
+full account of what was wrong with 1.0.0 are in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT License
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Support
-
-- GitHub Issues: https://github.com/vipin08/signledger/issues
-- Documentation: https://github.com/vipin08/signledger
-
-## Changelog
-
-### Version 1.0.0 (Initial Release)
-
-- Immutable audit logging with hash chain verification
-- Multiple storage backends (SQLite, PostgreSQL, MongoDB, In-Memory)
-- Cryptographic signatures (RSA, ECDSA, Ed25519)
-- Framework integrations (Django, Flask, FastAPI)
-- Batch operations for high-throughput scenarios
-- Compression support (zlib, gzip, lz4, zstd)
-- Thread-safe operations
-- Full type hints and Pydantic v2 validation
+MIT

@@ -1,214 +1,118 @@
-"""Cryptographic hashing for SignLedger."""
+"""The hash chain - digests over SLCS/1 preimages.
+
+A bare hash chain is *not* tamper-evidence on its own: SHA-256 is public, so anyone with
+write access to the store can edit a row and re-derive every digest after it. What this
+module provides is the deterministic, versioned foundation that signatures (section 6)
+and anchored checkpoints (section 8) build the real guarantee on top of.
+
+``calculate_hash`` dispatches on ``entry.format_version``. Verification must keep working
+against every historical format forever, so the encoder is chosen per entry rather than
+assumed; a v3 encoder is added by registering it in ``_PREIMAGE_ENCODERS``, and old
+ledgers keep verifying under the rules they were written with.
+"""
 
 import hashlib
-import json
-from typing import Any, Dict, Union
+import hmac
 from datetime import datetime
+from typing import TYPE_CHECKING, Callable, Dict
 
-from ..core.exceptions import ValidationError
+from signledger.core.exceptions import ConfigurationError, ValidationError
+from signledger.crypto.canonical import canonicalize, entry_preimage
+
+if TYPE_CHECKING:  # pragma: no cover
+    # Import-time only. ``signledger.core.entry`` imports this package for the
+    # canonicalizer, so importing Entry for real here would close the loop and break
+    # every ``signledger.crypto.*`` import - the exact circular-import trap v1 fell into.
+    from signledger.core.entry import Entry
+
+__all__ = [
+    "SUPPORTED_ALGORITHMS",
+    "DEFAULT_ALGORITHM",
+    "HashChain",
+    "genesis_hash",
+]
+
+#: Digest algorithms this build accepts. Anything else is refused rather than guessed at.
+SUPPORTED_ALGORITHMS = frozenset({"sha256", "sha512", "sha3_256", "sha3_512"})
+
+DEFAULT_ALGORITHM = "sha256"
+
+#: Domain tag that separates a genesis preimage from an entry preimage. No Entry preimage
+#: carries a ``type`` key, so the two encodings cannot collide.
+_GENESIS_TYPE = "signledger/genesis"
+
+#: Preimage encoder per hash format version. Historical versions stay registered forever.
+_PREIMAGE_ENCODERS: Dict[int, Callable[["Entry"], bytes]] = {
+    2: entry_preimage,
+}
 
 
 class HashChain:
-    """Implements cryptographic hash chain for ledger entries."""
-    
-    SUPPORTED_ALGORITHMS = {
-        "sha256": hashlib.sha256,
-        "sha512": hashlib.sha512,
-        "sha3_256": hashlib.sha3_256,
-        "sha3_512": hashlib.sha3_512,
-    }
-    
-    def __init__(self, algorithm: str = "sha256"):
-        if algorithm not in self.SUPPORTED_ALGORITHMS:
-            raise ValueError(
-                f"Unsupported algorithm: {algorithm}. "
-                f"Supported: {list(self.SUPPORTED_ALGORITHMS.keys())}"
+    """Computes and verifies the digest of an :class:`~signledger.core.entry.Entry`."""
+
+    def __init__(self, algorithm: str = DEFAULT_ALGORITHM) -> None:
+        if algorithm not in SUPPORTED_ALGORITHMS:
+            raise ConfigurationError(
+                f"unsupported hash algorithm {algorithm!r}; "
+                f"choose one of {sorted(SUPPORTED_ALGORITHMS)}"
             )
-        
         self.algorithm = algorithm
-        self._hash_func = self.SUPPORTED_ALGORITHMS[algorithm]
-    
-    def calculate_hash(self, entry: Any) -> str:
-        """Calculate hash for a ledger entry.
-        
-        Args:
-            entry: Entry object with to_dict() method or dict
-            
-        Returns:
-            Hex-encoded hash string
+
+    def calculate_hash(self, entry: "Entry") -> str:
+        """Return the hex digest of ``entry``'s preimage under its own format version."""
+        encoder = _PREIMAGE_ENCODERS.get(entry.format_version)
+        if encoder is None:
+            raise ValidationError(
+                f"format_version {entry.format_version} has no preimage encoder in this "
+                f"build; supported: {sorted(_PREIMAGE_ENCODERS)}"
+            )
+        return _digest(self.algorithm, encoder(entry))
+
+    def verify_hash(self, entry: "Entry") -> bool:
+        """Return whether ``entry.hash`` is the digest of ``entry``.
+
+        The comparison runs over UTF-8 bytes rather than ``str``: ``compare_digest``
+        raises ``TypeError`` on a non-ASCII ``str``, and a tampered row must make a
+        verifier answer False, not crash it.
         """
-        # Convert entry to dict if needed
-        if hasattr(entry, "to_dict"):
-            entry_dict = entry.to_dict()
-        else:
-            entry_dict = entry
-        
-        # Create a copy without the hash field
-        data_to_hash = {
-            k: v for k, v in entry_dict.items()
-            if k not in ("hash", "signature")
-        }
-        
-        # Convert datetime objects to ISO format
-        data_to_hash = self._prepare_for_hashing(data_to_hash)
-        
-        # Create canonical JSON representation
-        canonical_json = json.dumps(data_to_hash, sort_keys=True, separators=(',', ':'))
-        
-        # Calculate hash
-        hasher = self._hash_func()
-        hasher.update(canonical_json.encode('utf-8'))
-        
-        return hasher.hexdigest()
-    
-    def _prepare_for_hashing(self, data: Any) -> Any:
-        """Prepare data for hashing by converting special types."""
-        if isinstance(data, datetime):
-            return data.isoformat()
-        elif isinstance(data, dict):
-            return {k: self._prepare_for_hashing(v) for k, v in data.items()}
-        elif isinstance(data, (list, tuple)):
-            return [self._prepare_for_hashing(item) for item in data]
-        else:
-            return data
-    
-    def verify_hash(self, entry: Any, expected_hash: str) -> bool:
-        """Verify the hash of an entry.
-        
-        Args:
-            entry: Entry to verify
-            expected_hash: Expected hash value
-            
-        Returns:
-            True if hash matches
-        """
-        calculated_hash = self.calculate_hash(entry)
-        return calculated_hash == expected_hash
-    
-    def create_genesis_hash(self) -> str:
-        """Create hash for genesis block."""
-        genesis_data = {
-            "genesis": True,
-            "algorithm": self.algorithm,
-            "timestamp": "1970-01-01T00:00:00+00:00",
-        }
-        
-        canonical_json = json.dumps(genesis_data, sort_keys=True)
-        hasher = self._hash_func()
-        hasher.update(canonical_json.encode('utf-8'))
-        
-        return hasher.hexdigest()
+        expected = self.calculate_hash(entry).encode("utf-8")
+        return hmac.compare_digest(expected, entry.hash.encode("utf-8"))
 
 
-class MerkleTree:
-    """Merkle tree implementation for efficient verification."""
-    
-    def __init__(self, hash_algorithm: str = "sha256"):
-        self.hash_chain = HashChain(hash_algorithm)
-        self._tree = []
-        self._leaves = []
-    
-    def build(self, entries: list) -> str:
-        """Build Merkle tree from entries and return root hash.
-        
-        Args:
-            entries: List of entries
-            
-        Returns:
-            Root hash of the Merkle tree
-        """
-        if not entries:
-            return self.hash_chain.create_genesis_hash()
-        
-        # Create leaf nodes
-        self._leaves = [
-            self.hash_chain.calculate_hash(entry)
-            for entry in entries
-        ]
-        
-        # Build tree bottom-up
-        self._tree = [self._leaves]
-        current_level = self._leaves
-        
-        while len(current_level) > 1:
-            next_level = []
-            
-            # Process pairs
-            for i in range(0, len(current_level), 2):
-                if i + 1 < len(current_level):
-                    # Hash pair
-                    combined = current_level[i] + current_level[i + 1]
-                else:
-                    # Odd number, duplicate last hash
-                    combined = current_level[i] + current_level[i]
-                
-                hasher = self.hash_chain._hash_func()
-                hasher.update(combined.encode('utf-8'))
-                next_level.append(hasher.hexdigest())
-            
-            self._tree.append(next_level)
-            current_level = next_level
-        
-        return current_level[0] if current_level else ""
-    
-    def get_proof(self, index: int) -> list:
-        """Get Merkle proof for entry at given index.
-        
-        Args:
-            index: Index of entry in the original list
-            
-        Returns:
-            List of hashes forming the proof path
-        """
-        if not self._tree or index < 0 or index >= len(self._leaves):
-            return []
-        
-        proof = []
-        current_index = index
-        
-        for level in self._tree[:-1]:  # Exclude root level
-            # Determine sibling index
-            if current_index % 2 == 0:
-                sibling_index = current_index + 1
-            else:
-                sibling_index = current_index - 1
-            
-            # Add sibling hash if it exists
-            if sibling_index < len(level):
-                proof.append({
-                    "hash": level[sibling_index],
-                    "position": "right" if current_index % 2 == 0 else "left"
-                })
-            
-            # Move to next level
-            current_index //= 2
-        
-        return proof
-    
-    def verify_proof(self, entry_hash: str, proof: list, root_hash: str) -> bool:
-        """Verify Merkle proof for an entry.
-        
-        Args:
-            entry_hash: Hash of the entry to verify
-            proof: Merkle proof path
-            root_hash: Expected root hash
-            
-        Returns:
-            True if proof is valid
-        """
-        current_hash = entry_hash
-        
-        for proof_element in proof:
-            sibling_hash = proof_element["hash"]
-            position = proof_element["position"]
-            
-            if position == "left":
-                combined = sibling_hash + current_hash
-            else:
-                combined = current_hash + sibling_hash
-            
-            hasher = self.hash_chain._hash_func()
-            hasher.update(combined.encode('utf-8'))
-            current_hash = hasher.hexdigest()
-        
-        return current_hash == root_hash
+def genesis_hash(
+    ledger_id: str,
+    created_at: datetime,
+    format_version: int = 2,
+    *,
+    algorithm: str = DEFAULT_ALGORITHM,
+) -> str:
+    """Return the anchor digest that entry 0 links back to.
+
+    Verification asserts that entry 0's ``previous_hash`` equals this value, which is
+    what stops an attacker replacing the prefix of a chain with one of their own.
+
+    ``algorithm`` is keyword-only with a default, so the three-positional-argument form
+    in the contract keeps working; pass it to match a ledger that is not using SHA-256,
+    otherwise entry 0's ``previous_hash`` would be a different width from every other
+    link in the chain.
+    """
+    if not ledger_id:
+        raise ValidationError("ledger_id must not be empty")
+    preimage = canonicalize(
+        {
+            "created_at": created_at,
+            "format_version": format_version,
+            "ledger_id": ledger_id,
+            "type": _GENESIS_TYPE,
+        }
+    )
+    return _digest(algorithm, preimage)
+
+
+def _digest(algorithm: str, payload: bytes) -> str:
+    if algorithm not in SUPPORTED_ALGORITHMS:
+        raise ConfigurationError(
+            f"unsupported hash algorithm {algorithm!r}; "
+            f"choose one of {sorted(SUPPORTED_ALGORITHMS)}"
+        )
+    return hashlib.new(algorithm, payload).hexdigest()
