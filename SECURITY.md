@@ -58,9 +58,29 @@ carried *inside that same proof*, so every inclusion proof returned `True`.
 - **In a compliance context (HIPAA, SOX, PCI-DSS):** do not represent 1.0.0
   output as tamper-evident.
 
-Upgrade, then migrate with `signledger migrate`, which verifies the old ledger
-under the old rules and binds its head hash and entry count into the new genesis
-entry so the history stays cryptographically continuous.
+### There is no integrity-preserving upgrade path, and there cannot be
+
+Stated plainly rather than papered over: **a 1.0.0 ledger cannot be migrated into
+2.0.0 in a way that carries its integrity forward, because it has no integrity to
+carry.** On SQLite and PostgreSQL its rows are unlinked, so there is no chain
+head to bind into a new genesis entry. Any tool that claimed otherwise would be
+manufacturing evidence.
+
+`signledger migrate` copies a ledger that *verifies* from one store to another.
+It refuses a ledger that does not verify, and a 1.0.0 ledger does not.
+
+The honest path is:
+
+1. Read the old rows out as ordinary data.
+2. Start a fresh 2.0.0 ledger.
+3. Append the old rows to it, and treat the result as *"these are the records we
+   held on this date"* — not as *"these records are unaltered since they were
+   written"*. Only the second claim is tamper-evidence, and nothing can
+   retroactively establish it for data written by 1.0.0.
+
+If your retention obligations require attesting to the earlier period, that
+attestation has to come from outside the library — backups, database WAL
+archives, or whatever else your environment kept independently.
 
 ## What this library does and does not defend against
 

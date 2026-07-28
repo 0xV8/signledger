@@ -64,7 +64,9 @@ number would have left `pip install signledger` serving the withdrawn release.
   prove it is interchangeable with the shipped ones.
 - `signledger` CLI: `init`, `append`, `verify`, `checkpoint`, `anchor`,
   `export`, `migrate`. In 1.0.0 the console script was dead on arrival — an empty
-  `cli/` directory shadowed `cli.py`.
+  `cli/` directory shadowed `cli.py`. Note that `migrate` moves a ledger that
+  *verifies* between stores; it is not a 1.0.0 upgrade path, and no such path
+  exists — see [SECURITY.md](SECURITY.md).
 - `signledger.contrib` integrations for Flask, FastAPI and Django, all rebuilt.
   The 1.0.0 versions were shadowed the same way and never ran.
 - Field redaction (`signledger.contrib.redaction`) for keeping secrets out of

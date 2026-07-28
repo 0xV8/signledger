@@ -365,9 +365,26 @@ failing first.**
 SemVer over **three independent surfaces**: Python API, on-disk schema, hash `format_version`.
 
 Verification supports **every historical `format_version` forever**; writing always uses the newest.
-`HashChain.calculate_hash` dispatches on `format_version` and retains the v1 encoder so a v1
-ledger stays verifiable under v1 rules.
+`HashChain.calculate_hash` dispatches on `format_version` via `_PREIMAGE_ENCODERS`, and an
+encoder once registered is never removed. `format_version` 2 is the only one that has ever
+existed — v1.0.0 had no such field — so the dispatch table has one entry today. A v3 encoder is
+added by registering it alongside 2, never by replacing it.
 
-`signledger migrate` verifies a v1 ledger under v1 rules, then writes a signed migration record
-binding the v1 head hash and entry count into the v2 genesis preimage — so history remains
-cryptographically continuous across the upgrade.
+### No v1.0.0 upgrade path
+
+**This section previously specified one. It was withdrawn as unimplementable, and the reasoning
+is kept here so it is not proposed again.**
+
+The original text said `migrate` would verify a v1 ledger under v1 rules and bind its head hash
+and entry count into the v2 genesis, keeping history cryptographically continuous. It cannot,
+because a v1 ledger on SQLite or PostgreSQL **has no head hash**: `previous_hash` is `NULL` on
+every row (§3, and the note at line 152). There is no chain to verify under any rules, and
+binding a fabricated head into a v2 genesis would manufacture evidence — the precise failure
+this document exists to prevent.
+
+`signledger migrate` therefore does one honest thing: it copies a ledger that **verifies** from
+one store to another, refusing one that does not. A v1 ledger does not.
+
+Operators upgrading from v1 read the old rows out as data and append them to a fresh v2 ledger.
+The result attests that *these were the records held at migration time*, not that they are
+unaltered since being written. `SECURITY.md` states this to users in those terms.

@@ -15,8 +15,8 @@ pip install signledger
 > **If you are on 1.0.0, upgrade.** 1.0.0 is withdrawn: it did not provide the
 > tamper-evidence it documented. On SQLite and PostgreSQL — the documented default —
 > it built no hash chain at all, and its signatures were never verified.
-> [SECURITY.md](SECURITY.md) explains what to assume about a log written by it, and
-> `signledger migrate` carries an existing ledger forward without breaking its history.
+> [SECURITY.md](SECURITY.md) explains what to assume about a log written by it, and why
+> a 1.0.0 ledger cannot be migrated with its integrity intact — it never had any.
 
 ## Quick start
 
