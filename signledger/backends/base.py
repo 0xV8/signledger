@@ -485,6 +485,24 @@ def _raises(exception: type) -> Any:
     return pytest.raises(exception)
 
 
+def _require_assertions() -> None:
+    """Refuse to pretend. Every check in the suite below is a bare ``assert``.
+
+    ``python -O`` strips assert statements, so under ``-O`` the whole suite executes and
+    passes without testing anything - and it would report a backend that corrupts every
+    row as fully conformant. That is the exact failure contract section 5 rule 1 forbids
+    in ``check_integrity`` (an empty verification is reported as **not ok**, never as
+    success), and the suite has no business being held to a weaker standard than the code
+    it certifies.
+    """
+    if not __debug__:
+        raise ConfigurationError(
+            "BackendConformanceSuite cannot run because assertions are disabled "
+            "(python -O). Every check in the suite is an `assert`, so it would pass "
+            "without testing anything. Re-run without -O."
+        )
+
+
 class BackendConformanceSuite:
     """Behavioural tests every :class:`StorageBackend` must pass.
 
@@ -503,6 +521,16 @@ class BackendConformanceSuite:
     ledger_id = "conformance-0f1c9a2e-4b7d-4c1e-9b4a-5f2d8c3e7a10"
     created_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
     base_timestamp = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        # The hook fires at class-definition time, which is import time for the module
+        # that subclasses this - so a run under -O dies before pytest has collected a
+        # single test, rather than after reporting them all as passed.
+        #
+        # Deliberately NOT __init__: pytest refuses to collect a test class that defines
+        # one, so adding it here would silently stop every subclass from running at all.
+        super().__init_subclass__(**kwargs)
+        _require_assertions()
 
     # -- helpers ----------------------------------------------------------------------
 

@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+# Lower bound: PEP 639 (`license` as an SPDX string + `license-files`) needs 77.
+# Upper bound: a build backend is the one dependency that can change what is INSIDE the
+# artifact without any source change. This project already shipped a release whose wheel
+# omitted a required migration; an unbounded backend is that risk on someone else's
+# schedule. Raise it deliberately, with a wheel-diff, not implicitly.
+requires = ["setuptools>=77,<84", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,8 +13,11 @@ dynamic = ["version"]
 description = "Tamper-evident append-only audit logging with verified signatures and external anchoring"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
-authors = [{ name = "Vipin Kumar" }]
+# PEP 639. The TOML-table spelling and the License classifier below are both deprecated
+# with a stated removal date of 2027-Feb-18.
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Vipin Kumar", email = "vipin@buffercode.in" }]
 keywords = ["audit", "logging", "immutable", "ledger", "tamper-evident", "cryptography", "compliance"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -18,7 +26,6 @@ classifiers = [
     "Topic :: System :: Logging",
     "Topic :: Security :: Cryptography",
     "Topic :: Database",
-    "License :: OSI Approved :: MIT License",
     # The version list is checked against `requires-python` by
     # tests/test_packaging.py::TestDeclaredPythonSupport. It silently drifted a release
     # behind once (it stopped at 3.13 while 3.14 was released and verified end to end),
@@ -213,5 +220,31 @@ ignore = [
 "tests/*" = ["S", "N806"]
 
 [tool.mutmut]
-paths_to_mutate = "signledger/"
+# Renamed in mutmut 3.x; the old `paths_to_mutate` spelling emits a UserWarning on every
+# invocation, and this project runs with filterwarnings = ["error"].
+source_paths = "signledger/"
 tests_dir = "tests/"
+
+[tool.bandit]
+# Run as: bandit -c pyproject.toml -r signledger
+#
+# Both suppressions below are justified by a control that is itself tested. Neither is a
+# blanket "bandit is noisy" dismissal, and both should be re-examined if the control moves.
+#
+# B101 (assert_used) - 72 hits, all inside BackendConformanceSuite in backends/base.py.
+#   That class is a test harness that ships as library code so third-party backends can
+#   prove they are interchangeable, and `assert` is the right spelling there. The real risk
+#   bandit is pointing at is that `python -O` strips asserts, which would make the suite
+#   pass without testing anything - so the suite now refuses to run with assertions
+#   disabled (`_require_assertions`), pinned by
+#   tests/test_backend_conformance.py::TestTheSuiteRefusesToRunWithAssertionsDisabled.
+#   There are no asserts anywhere else in the package; if that changes, this skip is wrong.
+#
+# B608 (hardcoded_sql_expressions) - 7 hits in backends/sqlite.py. SQL has no parameter
+#   binding for an identifier, so a table name must be interpolated. Every one of those
+#   names passes through `validate_identifier`, which allowlists against a regex and
+#   refuses anything carrying a quote, semicolon, space or comment marker. Ruff enforces
+#   the same rule as S608 with a per-site `# noqa` carrying that justification; bandit does
+#   not read noqa comments, which is the only reason this appears here.
+skips = ["B101", "B608"]
+exclude_dirs = ["tests", "signledger/contrib/django/migrations"]

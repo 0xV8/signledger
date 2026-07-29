@@ -15,6 +15,8 @@ own output.
 import dataclasses
 import hashlib
 import math
+import subprocess
+import sys
 
 import pytest
 from hypothesis import assume, given, settings
@@ -1133,3 +1135,215 @@ def reference_tree_hash(leaves):
 def test_tree_hash_agrees_with_an_independently_written_implementation(size):
     leaves = items(size)
     assert MerkleTree(leaves).merkle_tree_hash == reference_tree_hash(leaves)
+
+
+# --------------------------------------------------------------------------------------
+# Mutation-sweep hardening
+#
+# Everything below kills a specific mutant that survived the sweep required by
+# docs/ARCHITECTURE.md section 11. Each test names the production edit it catches.
+# --------------------------------------------------------------------------------------
+
+
+def test_a_leaf_index_one_past_the_tree_is_refused_even_when_the_path_shape_fits():
+    """Kills ``0 <= leaf_index < tree_size`` -> ``0 <= leaf_index <= tree_size``.
+
+    ``test_a_proof_with_a_leaf_index_at_the_tree_size_returns_false`` uses an 8-leaf tree,
+    where ``_audit_directions(8, 8)`` demands a different direction tuple from any real
+    proof and the forgery dies on the shape check instead of the range check. At size 2
+    the two agree: ``_audit_directions(2, 2) == _audit_directions(2, 1) == (True,)``, so a
+    relaxed bound lets an out-of-range index chain all the way up to the honest root and
+    verify. The index is part of what an inclusion proof *asserts*; a verifier that
+    accepts ``leaf 2 of a 2-leaf tree`` has authenticated a statement that is false.
+    """
+    leaves = items(2)
+    tree = MerkleTree(leaves)
+    proof = tree.generate_inclusion_proof(1)
+
+    # Guard the premise: this forgery reaches the digest replay, it is not shape-rejected.
+    assert expected_path_length(2, 1) == len(proof.path)
+
+    out_of_range = dataclasses.replace(proof, leaf_index=2)
+    assert verify_inclusion(out_of_range, leaves[1], tree.root) is False
+
+
+def test_consistency_between_two_empty_trees_is_refused_rather_than_proven():
+    """Kills ``old_size < 1 or new_size < old_size`` -> ``... and ...``.
+
+    Both existing size-guard tests survive the ``and`` because each trips only one of the
+    two clauses and then fails later for an unrelated reason. A proof claiming 0 -> 0 with
+    one root repeated trips only the first clause *and* lands in the equal-sizes branch,
+    which answers True on an empty path. "Nothing is consistent with nothing" is exactly
+    the v1 shape: a statement about no data, read as proof.
+    """
+    empty_root = MerkleTree([]).root
+    forged = ConsistencyProof(old_size=0, new_size=0, path=(), algorithm="sha256")
+    assert verify_consistency(forged, empty_root, empty_root) is False
+
+
+def test_consistency_between_two_negative_sizes_is_refused():
+    """The same guard, below zero: no arithmetic on a negative size means anything."""
+    empty_root = MerkleTree([]).root
+    forged = ConsistencyProof(old_size=-3, new_size=-3, path=(), algorithm="sha256")
+    assert verify_consistency(forged, empty_root, empty_root) is False
+
+
+# --------------------------------------------------------------------------------------
+# Diagnostics: the operator-facing half of every guard above
+#
+# A `pytest.raises(ValidationError)` with no message assertion proves the guard fired and
+# nothing about what it reported. Every message below survived the sweep as
+# `raise ValidationError(None)` - a guard that refuses correctly and then says nothing.
+# --------------------------------------------------------------------------------------
+
+
+def test_empty_tree_inclusion_error_reports_the_leaf_count():
+    with pytest.raises(ValidationError) as excinfo:
+        MerkleTree([]).generate_inclusion_proof(0)
+    assert str(excinfo.value) == "a tree of 0 leaves has no leaf to prove"
+
+
+def test_out_of_range_leaf_index_error_reports_the_index_and_the_size():
+    with pytest.raises(ValidationError) as excinfo:
+        MerkleTree(items(4)).generate_inclusion_proof(7)
+    assert str(excinfo.value) == "leaf_index 7 is outside a tree of 4 leaves"
+
+
+def test_unsupported_algorithm_error_lists_the_supported_algorithms():
+    with pytest.raises(ConfigurationError) as excinfo:
+        MerkleTree([A], algorithm="md5")
+    assert str(excinfo.value) == (
+        "unsupported hash algorithm 'md5'; "
+        "choose one of ['sha256', 'sha3_256', 'sha3_512', 'sha512']"
+    )
+
+
+def test_zero_old_size_error_reports_the_size_it_was_given():
+    with pytest.raises(ValidationError) as excinfo:
+        MerkleTree(items(4)).generate_consistency_proof(0)
+    assert str(excinfo.value) == "old_size must be at least 1 to prove anything, got 0"
+
+
+def test_oversized_old_size_error_reports_both_sizes():
+    with pytest.raises(ValidationError) as excinfo:
+        MerkleTree(items(4)).generate_consistency_proof(5)
+    assert str(excinfo.value) == "old_size 5 exceeds the tree's 4 leaves"
+
+
+#: Stands in for "the honest proof" in the argument tables below, so a row can vary the
+#: proof or hold it fixed without every row having to build one.
+REAL_PROOF = object()
+
+
+@pytest.mark.parametrize(
+    ("proof_arg", "data_item", "expected_root", "expected"),
+    [
+        ("not a proof", b"item-3", "00" * 32, "proof must be an InclusionProof, got str"),
+        (None, b"item-3", "00" * 32, "proof must be an InclusionProof, got NoneType"),
+        (REAL_PROOF, "item-3", "00" * 32, "data_item must be bytes, got str"),
+        (
+            REAL_PROOF,
+            bytearray(b"item-3"),
+            "00" * 32,
+            "data_item must be bytes, got bytearray",
+        ),
+        (REAL_PROOF, b"item-3", b"\x00" * 32, "expected_root must be a hex str, got bytes"),
+        (REAL_PROOF, b"item-3", None, "expected_root must be a hex str, got NoneType"),
+        (REAL_PROOF, b"item-3", "", "expected_root must not be empty"),
+    ],
+)
+def test_verify_inclusion_argument_errors_say_what_was_wrong(
+    proof_arg, data_item, expected_root, expected
+):
+    _tree, proof, _item = honest()
+    with pytest.raises(ValidationError) as excinfo:
+        verify_inclusion(
+            proof if proof_arg is REAL_PROOF else proof_arg, data_item, expected_root
+        )
+    assert str(excinfo.value) == expected
+
+
+@pytest.mark.parametrize(
+    ("proof_arg", "old_root", "new_root", "expected"),
+    [
+        ("not a proof", "00" * 32, "00" * 32, "proof must be a ConsistencyProof, got str"),
+        (None, "00" * 32, "00" * 32, "proof must be a ConsistencyProof, got NoneType"),
+        (REAL_PROOF, b"\x00" * 32, "00" * 32, "old_root must be a hex str, got bytes"),
+        (REAL_PROOF, "", "00" * 32, "old_root must not be empty"),
+        (REAL_PROOF, "00" * 32, b"\x00" * 32, "new_root must be a hex str, got bytes"),
+        (REAL_PROOF, "00" * 32, "", "new_root must not be empty"),
+    ],
+)
+def test_verify_consistency_argument_errors_name_which_root_was_wrong(
+    proof_arg, old_root, new_root, expected
+):
+    """The two roots are separate arguments; an error that does not say which one is bad
+    sends the caller looking in the wrong place."""
+    proof = MerkleTree(items(4)).generate_consistency_proof(2)
+    with pytest.raises(ValidationError) as excinfo:
+        verify_consistency(proof if proof_arg is REAL_PROOF else proof_arg, old_root, new_root)
+    assert str(excinfo.value) == expected
+
+
+class TestTheReplayLoopCannotBeMadeToHang:
+    """``_replay_consistency`` must terminate on any input, not only on reachable input.
+
+    ``fn = old_size - 1``, and the loop ``while fn & 1: fn >>= 1`` does not terminate for a
+    negative ``fn``: ``-1 & 1`` is 1 and ``-1 >> 1`` is ``-1``, forever. Today that is
+    unreachable because ``verify_consistency`` refuses ``old_size < 1`` first, so exactly
+    one guard stands between an attacker-supplied ``ConsistencyProof`` and a wedged
+    verifier thread. A mutation sweep found two single-edit changes to that guard which
+    hang the process instead of returning False.
+
+    Depth is cheap here and the loop is the last thing that should trust its caller, so it
+    refuses non-positive sizes itself. Run in a subprocess: if this regresses, the test
+    must fail in seconds rather than wedging the suite until the global timeout.
+    """
+
+    def run_replay(self, old_size: int, new_size: int) -> subprocess.CompletedProcess:
+        program = (
+            "from signledger.crypto.merkle import _replay_consistency\n"
+            "path = [b'x' * 32, b'y' * 32]\n"
+            f"print(_replay_consistency('sha256', path, {old_size}, {new_size}))\n"
+        )
+        return subprocess.run(
+            [sys.executable, "-c", program], capture_output=True, text=True, timeout=15
+        )
+
+    def test_an_old_size_of_zero_returns_rather_than_spinning(self) -> None:
+        """``old_size=0`` is the one value that wedges the loop, and the only one.
+
+        ``fn`` becomes ``-1``, which is the fixed point of arithmetic right shift: ``-1``
+        is odd, so the loop continues, and ``-1 >> 1`` is ``-1`` again. Other negatives
+        terminate on their own — ``-(2**40)`` shifts down to ``-2`` in 40 steps and exits
+        because ``-2`` is even. Those are covered below as boundaries, but this is the
+        case that discriminates: it is the only one that hangs without the guard.
+        """
+        result = self.run_replay(0, 8)
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "None"
+
+    @pytest.mark.parametrize("old_size", [-1, -(2**40)])
+    def test_other_negative_sizes_are_refused_rather_than_answered(self, old_size: int) -> None:
+        """These already terminated, but by accident of the arithmetic, not by decision.
+
+        Before the guard they fell through the replay and returned ``None`` only because a
+        later ``sn != 0`` check happened to catch them. Refusing at the top makes that
+        deliberate instead of incidental.
+        """
+        result = self.run_replay(old_size, 8)
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "None"
+
+    def test_verify_consistency_still_answers_false_for_a_zero_sized_proof(self) -> None:
+        """The public guard stays; this only removes its sole responsibility for liveness."""
+        leaves = [b"a", b"b", b"c", b"d"]
+        tree = MerkleTree(leaves)
+
+        proof = ConsistencyProof(
+            old_size=0, new_size=0, path=(bytes.fromhex(tree.root),), algorithm="sha256"
+        )
+
+        assert verify_consistency(proof, tree.root, tree.root) is False

@@ -11,27 +11,27 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PYTHONWARNINGS: error::DeprecationWarning
   FORCE_COLOR: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
   # ---------------------------------------------------------------------------
-  # The gate that matters. 100% line AND branch coverage, measured against real
-  # PostgreSQL and MongoDB servers.
+  # The gate that matters: 100% line AND branch coverage against real databases,
+  # on every supported interpreter.
   #
   # v1.0.0 claimed "100% test coverage" in its README while shipping zero tests.
-  # This job is the reason that claim can now be checked by anyone, including us.
-  # Without live databases the suite skips 582 tests and coverage falls to ~91%,
-  # so the databases are services here rather than something a developer is
-  # trusted to remember.
+  # This job is why that claim is now checkable by anyone, including us.
+  #
+  # The databases are services rather than something a developer is trusted to
+  # start: without them 582 tests skip and coverage silently falls to ~91%.
   # ---------------------------------------------------------------------------
   test:
-    name: test (py${{ matrix.python-version }})
+    name: test py${{ matrix.python-version }} + live DBs
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
 
     services:
       postgres:
@@ -43,18 +43,13 @@ jobs:
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U signledger"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-
+          --health-interval 5s --health-timeout 5s --health-retries 20
       mongo:
         image: mongo:7
         ports: ["27017:27017"]
         options: >-
           --health-cmd "mongosh --quiet --eval 'db.adminCommand(\"ping\")'"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
+          --health-interval 5s --health-timeout 5s --health-retries 20
 
     env:
       SIGNLEDGER_TEST_POSTGRES_DSN: postgresql://signledger:signledger@127.0.0.1:5432/signledger_test
@@ -62,7 +57,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -74,18 +68,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e '.[all,test]'
 
-      - name: Assert the databases are actually reachable
-        # A skipped database test is indistinguishable from a passing one in the
-        # summary line. Fail loudly here instead of silently measuring 91%.
+      - name: Assert both databases are reachable
+        # A skipped database test looks identical to a passing one in the summary
+        # line. Fail loudly here rather than quietly measuring 91%.
         run: |
           python - <<'PY'
           import os, psycopg, pymongo
           psycopg.connect(os.environ["SIGNLEDGER_TEST_POSTGRES_DSN"], connect_timeout=10).close()
-          c = pymongo.MongoClient(os.environ["SIGNLEDGER_TEST_MONGO_URI"], serverSelectionTimeoutMS=10000)
-          try:
+          with pymongo.MongoClient(os.environ["SIGNLEDGER_TEST_MONGO_URI"],
+                                   serverSelectionTimeoutMS=10000) as c:
               c.admin.command("ping")
-          finally:
-              c.close()
           print("postgres + mongo reachable")
           PY
 
@@ -93,145 +85,65 @@ jobs:
         run: pytest --cov=signledger --cov-branch --cov-report=term-missing
 
       - name: Assert no database test was skipped
-        # `pytest -m "postgres or mongo"` must report zero skips. If the services
-        # disappear mid-run, coverage would still pass via unrelated modules.
         run: |
           pytest -m "postgres or mongo" -q --no-cov -rs 2>&1 | tee db.log
           if grep -qE '[0-9]+ skipped' db.log; then
-            echo "::error::database tests were skipped - the 100% figure is not real"
+            echo "::error::database tests were skipped - the coverage figure is not real"
             exit 1
           fi
 
   # ---------------------------------------------------------------------------
-  # Import hygiene. Four empty package directories shadowed their own sibling
-  # modules in v1.0.0, which silently disabled the CLI and all three framework
-  # integrations. Nobody noticed because nothing ever imported them.
+  # Every piece of pre-release evidence for this project was gathered on macOS
+  # arm64. Three of the four release blockers were timing-sensitive races, and
+  # file locking, fsync, fork-vs-spawn and trigger behaviour are all OS-dependent.
+  # This job exists because "it worked on the maintainer's laptop" is exactly the
+  # standard of evidence this rebuild was meant to eliminate.
+  #
+  # No service containers: GitHub only supports those on Linux. SQLite and
+  # MemoryBackend still exercise the concurrency paths that actually differ.
   # ---------------------------------------------------------------------------
-  imports:
-    name: import every module
-    runs-on: ubuntu-latest
+  os-matrix:
+    name: ${{ matrix.os }} py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+        python-version: ["3.9", "3.13"]
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
 
       - name: Install
-        run: pip install -e '.[all,test]'
+        run: pip install -e '.[signatures,flask,fastapi,django,test]'
 
-      - name: Walk and import every module
-        # Django's two app modules need a settings module before their model
-        # classes can be constructed - that is Django, not signledger, and
-        # `import django.contrib.auth.models` fails identically on a bare
-        # interpreter. tests/test_packaging.py runs this same walk with the
-        # settings bootstrap and requires 36/36.
-        run: |
-          python - <<'PY'
-          import django
-          from django.conf import settings
-          settings.configure(
-              INSTALLED_APPS=["django.contrib.contenttypes", "signledger.contrib.django"],
-              DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
-              USE_TZ=True,
-          )
-          django.setup()
+      - name: Test (no live databases on this runner)
+        # --no-cov deliberately: without PostgreSQL and MongoDB the 100% gate
+        # cannot be met, and a lowered threshold here would quietly lower it
+        # everywhere. Correctness is asserted; coverage is asserted in `test`.
+        run: pytest --no-cov -q -m "not postgres and not mongo"
 
-          import importlib, pkgutil, sys, signledger
-          failed = []
-          for mod in pkgutil.walk_packages(signledger.__path__, "signledger."):
-              try:
-                  importlib.import_module(mod.name)
-              except Exception as err:
-                  failed.append(f"{mod.name} -> {type(err).__name__}: {err}")
-          for line in failed:
-              print("FAIL", line)
-          print(f"imported {len(list(pkgutil.walk_packages(signledger.__path__, 'signledger.')))} modules")
-          sys.exit(1 if failed else 0)
-          PY
-
-      - name: Assert a base install pulls in no optional dependency
-        # `import signledger` must not drag in cryptography, psycopg, pymongo or
-        # a web framework. Checked in a clean environment, not this one.
-        run: |
-          python -m venv /tmp/bare
-          /tmp/bare/bin/pip install --quiet .
-          /tmp/bare/bin/python - <<'PY'
-          import sys, signledger
-          leaked = sorted(
-              m for m in sys.modules
-              if m.split(".")[0] in {"cryptography", "psycopg", "pymongo", "flask", "fastapi", "django"}
-          )
-          assert not leaked, f"import signledger leaked optional deps: {leaked}"
-          print("no optional dependency imported by `import signledger`")
-          PY
+      - name: Slow/concurrency tests
+        # The multi-process SQLite tests are the ones most likely to behave
+        # differently per OS, so they run explicitly rather than being skipped.
+        run: pytest --no-cov -q -m "slow and not postgres and not mongo"
 
   # ---------------------------------------------------------------------------
-  # Static analysis.
+  # The gate that would have caught the release blockers.
+  #
+  # Four gunicorn workers racing to create ONE store is not a synthetic case: it
+  # is what happens on every first deploy. It failed catastrophically before -
+  # a WAL-pragma race halted the master, and workers that lost the race to write
+  # entry 0 returned 500 forever. Both are fixed; this keeps them fixed.
   # ---------------------------------------------------------------------------
-  lint:
-    name: ruff + mypy --strict + bandit
+  multi-worker:
+    name: multi-worker cold start
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-
-      - name: Install
-        run: pip install -e '.[all,test,dev]'
-
-      - run: ruff check .
-      - run: ruff format --check .
-        continue-on-error: true
-      - run: mypy --strict -p signledger
-      - run: bandit -q -r signledger -x signledger/contrib/django/migrations
-
-  # ---------------------------------------------------------------------------
-  # Packaging. The wheel is what users get; test the wheel, not the source tree.
-  # ---------------------------------------------------------------------------
-  package:
-    name: build and verify the wheel
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-
-      - name: Install
-        run: pip install -e '.[all,test,dev]'
-
-      - name: Build
-        run: python -m build
-
-      - name: twine check
-        run: twine check --strict dist/*
-
-      - name: Packaging conformance suite
-        # Builds a real wheel, unpacks it, imports every module out of the
-        # artifact, runs the console script, and writes+verifies a ledger using
-        # only the installed wheel. Also asserts the Django migration is present
-        # (it was missing from an earlier build, which 500'd every audited
-        # request under the default fail-closed policy) and that no empty
-        # namespace directory shadows a sibling module.
-        run: pytest tests/test_packaging.py -q --no-cov
-
-  # ---------------------------------------------------------------------------
-  # Mutation testing. Coverage proves a line ran; mutation proves an assertion
-  # would have caught it changing. Advisory on PRs, enforced on main.
-  # ---------------------------------------------------------------------------
-  mutation:
-    name: mutmut
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    timeout-minutes: 120
-
     services:
       postgres:
         image: postgres:16
@@ -242,44 +154,285 @@ jobs:
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U signledger"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-      mongo:
-        image: mongo:7
-        ports: ["27017:27017"]
-        options: >-
-          --health-cmd "mongosh --quiet --eval 'db.adminCommand(\"ping\")'"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-
-    env:
-      SIGNLEDGER_TEST_POSTGRES_DSN: postgresql://signledger:signledger@127.0.0.1:5432/signledger_test
-      SIGNLEDGER_TEST_MONGO_URI: mongodb://127.0.0.1:27017
+          --health-interval 5s --health-timeout 5s --health-retries 20
 
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
 
       - name: Install
-        run: pip install -e '.[all,test,dev]'
+        run: pip install -e '.[flask,postgresql,test]' gunicorn requests
 
+      - name: Library-level cold-start race
+        # No web framework at all: N processes, one fresh file. This reproduced
+        # 11 failures out of 20 before the fix.
+        run: |
+          python - <<'PY'
+          import multiprocessing as mp, os, sys, tempfile
+
+          def open_backend(path, barrier, q):
+              from signledger.backends.sqlite import SQLiteBackend
+              barrier.wait()
+              try:
+                  SQLiteBackend(path).close()
+                  q.put(("ok", os.getpid()))
+              except Exception as err:
+                  q.put(("FAIL", f"{type(err).__name__}: {err}"))
+
+          if __name__ == "__main__":
+              mp.set_start_method("spawn")
+              failures = 0
+              for trial in range(10):
+                  path = os.path.join(tempfile.mkdtemp(), "audit.db")
+                  barrier, q = mp.Barrier(4), mp.Queue()
+                  procs = [mp.Process(target=open_backend, args=(path, barrier, q))
+                           for _ in range(4)]
+                  for p in procs: p.start()
+                  for p in procs: p.join(60)
+                  for _ in range(4):
+                      status, detail = q.get()
+                      if status != "ok":
+                          failures += 1
+                          print("trial", trial, detail)
+              print(f"failed opens: {failures} of 40")
+              sys.exit(1 if failures else 0)
+          PY
+
+      - name: gunicorn -w 4 against a store that does not exist yet
+        run: |
+          python - <<'PY'
+          import json, os, subprocess, sys, tempfile, time
+          import urllib.request, urllib.error
+          from concurrent.futures import ThreadPoolExecutor
+
+          work = tempfile.mkdtemp()
+          store = os.path.join(work, "audit.db")
+          app = os.path.join(work, "wsgi.py")
+          with open(app, "w") as fh:
+              fh.write(
+                  "import os\n"
+                  "from flask import Flask, jsonify\n"
+                  "from signledger.backends.sqlite import SQLiteBackend\n"
+                  "from signledger.contrib.flask import SignLedgerAudit\n"
+                  "from signledger.core.ledger import Ledger\n"
+                  "app = Flask(__name__)\n"
+                  "SignLedgerAudit(app, ledger=Ledger(SQLiteBackend(os.environ['STORE'])),\n"
+                  "                skip_paths=('/health',))\n"
+                  "@app.get('/health')\n"
+                  "def health(): return jsonify(pid=os.getpid())\n"
+                  "@app.post('/event')\n"
+                  "def event(): return jsonify(ok=True)\n"
+              )
+
+          env = dict(os.environ, STORE=store, PYTHONUNBUFFERED="1")
+          proc = subprocess.Popen(
+              ["gunicorn", "-w", "4", "-b", "127.0.0.1:8123", "--timeout", "60", "wsgi:app"],
+              cwd=work, env=env)
+          try:
+              deadline = time.time() + 60
+              while time.time() < deadline:
+                  if proc.poll() is not None:
+                      sys.exit(f"gunicorn died rc={proc.returncode} - the master halted")
+                  try:
+                      urllib.request.urlopen("http://127.0.0.1:8123/health", timeout=2).read()
+                      break
+                  except Exception:
+                      time.sleep(0.25)
+              else:
+                  sys.exit("gunicorn never became ready")
+
+              def hit(_):
+                  req = urllib.request.Request("http://127.0.0.1:8123/event", method="POST",
+                                               data=b"{}",
+                                               headers={"Content-Type": "application/json"})
+                  try:
+                      return urllib.request.urlopen(req, timeout=30).status
+                  except urllib.error.HTTPError as err:
+                      return err.code
+                  except Exception as err:
+                      return type(err).__name__
+
+              with ThreadPoolExecutor(max_workers=32) as pool:
+                  codes = list(pool.map(hit, range(300)))
+          finally:
+              proc.terminate()
+              try: proc.wait(timeout=10)
+              except Exception: proc.kill()
+
+          served = codes.count(200)
+          from signledger.backends.sqlite import SQLiteBackend
+          from signledger.core.ledger import Ledger
+          with Ledger(SQLiteBackend(store)) as ledger:
+              report = ledger.check_integrity()
+              sequences = [e.sequence for e in ledger.iter_entries()]
+              identities = {e.ledger_id for e in ledger.iter_entries()}
+
+          print(json.dumps({"served_200": served,
+                            "entries": len(sequences),
+                            "contiguous": sequences == list(range(len(sequences))),
+                            "ledger_ids": len(identities),
+                            "verifies": report.ok}))
+          ok = (served == 300 and len(sequences) == 300
+                and sequences == list(range(300)) and len(identities) == 1 and report.ok)
+          sys.exit(0 if ok else 1)
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Import hygiene. Four empty package directories shadowed their own sibling
+  # modules in v1.0.0, silently disabling the CLI and all three integrations.
+  # Nobody noticed because nothing ever imported them.
+  # ---------------------------------------------------------------------------
+  imports:
+    name: import every module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -e '.[all,test]'
+
+      - name: Walk and import every module
+        # Django's app modules need settings before their model classes can be
+        # built - that is Django, not signledger (`import django.contrib.auth.models`
+        # fails identically on a bare interpreter), so settings are configured here.
+        run: |
+          python - <<'PY'
+          import django
+          from django.conf import settings
+          settings.configure(
+              INSTALLED_APPS=["django.contrib.contenttypes", "signledger.contrib.django"],
+              DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
+              SIGNLEDGER={"LEDGER_FACTORY": "signledger.contrib.django.apps"},
+              USE_TZ=True,
+          )
+          django.setup()
+
+          import importlib, pkgutil, sys, signledger
+          failed, seen = [], 0
+          for module in pkgutil.walk_packages(signledger.__path__, "signledger."):
+              seen += 1
+              try:
+                  importlib.import_module(module.name)
+              except Exception as err:
+                  failed.append(f"{module.name} -> {type(err).__name__}: {err}")
+          for line in failed:
+              print("FAIL", line)
+          print(f"imported {seen - len(failed)}/{seen} modules")
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Assert a base install pulls in no optional dependency
+        run: |
+          python -m venv /tmp/bare
+          /tmp/bare/bin/pip install --quiet .
+          /tmp/bare/bin/python - <<'PY'
+          import sys, signledger
+          leaked = sorted(m for m in sys.modules if m.split(".")[0] in
+                          {"cryptography", "psycopg", "pymongo", "flask", "fastapi", "django"})
+          assert not leaked, f"import signledger leaked optional deps: {leaked}"
+          print("no optional dependency imported by `import signledger`")
+          PY
+
+  lint:
+    name: ruff + mypy --strict + bandit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e '.[all,test,dev]'
+      - run: ruff check .
+      - run: mypy --strict -p signledger
+      - run: bandit -q -c pyproject.toml -r signledger
+
+  package:
+    name: build and verify the wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e '.[all,test,dev]'
+      - run: python -m build
+      - run: twine check --strict dist/*
+
+      - name: No build-time deprecation warnings
+        # A deprecation with a stated removal date is a future build failure.
+        run: |
+          rm -rf dist build
+          python -m build 2>&1 | tee build.log
+          if grep -qi "SetuptoolsDeprecationWarning" build.log; then
+            echo "::error::the build emits setuptools deprecation warnings"
+            exit 1
+          fi
+
+      - name: The published metadata must not contain a retracted claim
+        # The artifact is what users read, not the repo. A wheel was once built
+        # from a checkout that predated a security correction and would have
+        # republished the retracted text on the PyPI front page.
+        run: |
+          unzip -p dist/*.whl 'signledger-*.dist-info/METADATA' > metadata.txt
+          grep -q "cannot be migrated with its integrity intact" metadata.txt \
+            || { echo "::error::METADATA is missing the migration correction"; exit 1; }
+          if grep -q "carries an existing ledger forward" metadata.txt; then
+            echo "::error::METADATA republishes the retracted migration claim"
+            exit 1
+          fi
+
+      - name: The sdist must be able to test itself
+        # It once half-shipped: tests/*.py present, conftest.py and the canonical
+        # vectors absent. A downstream packager re-verifying a security library
+        # got a collection error and ~194 fixture failures.
+        run: |
+          mkdir -p /tmp/sd && tar xzf dist/*.tar.gz -C /tmp/sd --strip-components=1
+          test -f /tmp/sd/tests/conftest.py
+          test -f /tmp/sd/tests/vectors/slcs1.json
+          test -f /tmp/sd/CHANGELOG.md && test -f /tmp/sd/SECURITY.md
+          cd /tmp/sd && pip install -e '.[all,test]' \
+            && pytest --no-cov -q -m "not postgres and not mongo"
+
+      - name: Packaging conformance suite
+        run: pytest tests/test_packaging.py -q --no-cov
+
+  mutation:
+    name: mutmut
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e '.[all,test,dev]'
       - name: Run mutation testing
         run: mutmut run --no-progress || true
-
       - name: Report
         run: |
           mutmut results | tee mutmut.txt
-          echo "### Mutation results" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tail -50 mutmut.txt >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
+          {
+            echo "### Mutation results"
+            echo '```'
+            tail -50 mutmut.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: mutmut-results

@@ -526,3 +526,182 @@ def test_allow_datetime_false_rejects_a_datetime_with_its_path():
 
 def test_allow_datetime_false_leaves_every_other_type_alone():
     assert canonicalize({"a": 1}, allow_datetime=False) == canonicalize({"a": 1})
+
+
+# --------------------------------------------------------------------------------------
+# Mutation-sweep hardening
+#
+# Everything below was written to kill a specific surviving mutant found by the sweep in
+# docs/ARCHITECTURE.md section 11. Each test names the production edit it would catch, so
+# that a future reader can tell whether it is still earning its place.
+# --------------------------------------------------------------------------------------
+
+
+class _OffsetOnlyForRealDatetimes(tzinfo):
+    """A tzinfo whose ``utcoffset`` needs the datetime, exactly like ``zoneinfo``.
+
+    ``zoneinfo.ZoneInfo(...).utcoffset(None)`` returns ``None`` - a real zone cannot say
+    what its offset is without knowing *when*. ``timezone(timedelta(...))`` answers
+    happily either way, which is why every fixed-offset test in this file passes against
+    an encoder that asks ``utcoffset(None)``. Reproduced here rather than importing
+    ``zoneinfo`` so the test needs no tz database on the machine running it.
+    """
+
+    def utcoffset(self, dt):
+        return None if dt is None else timedelta(hours=5, minutes=30)
+
+    def dst(self, dt):
+        return None
+
+    def tzname(self, dt):
+        return "IST"
+
+
+def test_a_datetime_whose_offset_depends_on_the_instant_is_not_treated_as_naive():
+    """Kills ``value.tzinfo.utcoffset(value)`` -> ``value.tzinfo.utcoffset(None)``.
+
+    That edit rejects every ``zoneinfo``-tagged datetime as "naive", which is the single
+    most common way a real application spells an aware timestamp.
+    """
+    zone = _OffsetOnlyForRealDatetimes()
+    assert zone.utcoffset(None) is None  # guard the premise
+
+    local = datetime(2024, 3, 1, 17, 30, tzinfo=zone)
+    assert canonicalize({"t": local}) == canonicalize(
+        {"t": datetime(2024, 3, 1, 12, 0, tzinfo=timezone.utc)}
+    )
+
+
+def test_a_datetime_inside_a_list_still_encodes_as_microseconds():
+    """Kills dropping ``allow_datetime`` on the way into, or through, an array.
+
+    Every other datetime test in this file passes a datetime as an object *value*, so an
+    encoder that forgot to forward the flag through ``_encode_array`` looked correct.
+    """
+    moment = datetime(1970, 1, 1, 0, 0, 1, 500000, tzinfo=timezone.utc)
+    assert canonicalize([moment]) == b"[1500000]"
+    assert canonicalize({"v": [moment]}) == b'{"v":[1500000]}'
+
+
+def test_a_far_future_datetime_is_rejected_with_the_path_of_the_field():
+    """Microseconds since the epoch pass through the same +/-2**53 gate as any int.
+
+    Kills dropping ``path`` on the way to ``_encode_int``: the offender is ``t``, not the
+    root.
+    """
+    with pytest.raises(CanonicalizationError, match=r"^t: int exceeds \+/-2\*\*53"):
+        canonicalize({"t": datetime(9999, 1, 1, tzinfo=timezone.utc)})
+
+
+def test_an_oversized_int_inside_a_container_reports_its_own_path():
+    """Kills dropping ``path`` on the way to ``_encode_int``.
+
+    The existing limit tests all canonicalize a bare int at the root, where a lost path
+    still renders as ``<root>``.
+    """
+    with pytest.raises(CanonicalizationError, match=r"^v\[1\]: int exceeds"):
+        canonicalize({"v": [0, 2**53 + 1]})
+
+
+def test_tuple_rejection_carries_the_documented_conversion_hint():
+    """Kills every mutation of the ``_CONVERSION_HINTS`` lookup.
+
+    The hint is the actionable half of the message; without it the error says only that
+    something is wrong.
+    """
+    with pytest.raises(
+        CanonicalizationError, match=r"^v: tuple is not JSON-native; convert to list$"
+    ):
+        canonicalize({"v": (1,)})
+
+
+def test_a_type_with_no_specific_hint_falls_back_to_the_generic_one():
+    """Kills ``_CONVERSION_HINTS.get(name)`` - the missing default renders as ``None``."""
+    with pytest.raises(
+        CanonicalizationError,
+        match=r"^v: object is not JSON-native; "
+        r"use only dict, list, str, int, float, bool or None$",
+    ):
+        canonicalize({"v": object()})
+
+
+def test_non_str_key_rejection_names_the_type_of_the_offending_key():
+    """Kills ``type(key).__name__`` -> a constant. The type is the whole diagnosis."""
+    with pytest.raises(CanonicalizationError, match=r"object keys must be str, got int$"):
+        canonicalize({1: "a"})
+
+
+def test_a_surrogate_in_a_nested_key_reports_the_containing_path():
+    """Kills dropping ``path`` in the key sort.
+
+    The existing surrogate-key test uses a root-level object, where a lost path is
+    indistinguishable from the real one.
+    """
+    with pytest.raises(CanonicalizationError, match=r"^a: str contains an unpaired surrogate"):
+        canonicalize({"a": {"\ud800": 1}})
+
+
+def test_depth_rejection_inside_a_list_reports_the_path_of_the_offending_array():
+    """Kills dropping ``path`` in the array depth guard.
+
+    Its object-shaped twin is already covered; the array branch is a separate call site.
+    """
+    obj = {"a": _nest_lists(MAX_NESTING_DEPTH)}  # one container too many, all told
+    expected = "a" + "[0]" * (MAX_NESTING_DEPTH - 1)
+    with pytest.raises(CanonicalizationError) as excinfo:
+        canonicalize(obj)
+    assert str(excinfo.value).startswith(expected + ": nesting depth")
+
+
+@pytest.mark.parametrize(
+    ("value", "name"),
+    [(float("nan"), "NaN"), (float("inf"), "Infinity"), (float("-inf"), "-Infinity")],
+)
+def test_non_finite_rejection_names_which_non_finite_value_it_was(value, name):
+    """Kills every mutation of ``_nonfinite_name``.
+
+    RFC 8785 names these three exactly; a reader debugging a rejected payload needs to
+    know which one arrived.
+    """
+    with pytest.raises(CanonicalizationError) as excinfo:
+        canonicalize({"v": value})
+    assert str(excinfo.value) == f"v: non-finite float ({name}) has no JSON form"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # Trailing-zero stripping must look at the *last* digit. `digits[1]` happens to
+        # agree for 1.0, 10.0 and 100.0 - every integral value already in the table
+        # above - and disagrees the moment the second digit is non-zero.
+        (12.0, b"12"),
+        (120.0, b"120"),
+        (1200.0, b"1200"),
+        # k > n with n == 1: the "0 < n <= 21" branch. 0.1 has n == 0 and 123.456 has
+        # n == 3, so the lower boundary of that range was never pinned.
+        (1.5, b"1.5"),
+        (9.75, b"9.75"),
+    ],
+)
+def test_ecmascript_number_formatting_at_the_boundaries_the_table_above_misses(value, expected):
+    assert canonicalize(value) == expected
+
+
+def test_entry_preimage_refuses_data_one_level_past_the_nesting_limit():
+    """Pins the preimage envelope's depth credit to exactly one level, no more.
+
+    ``test_entry_preimage_gives_data_the_full_nesting_budget`` pins the floor: a payload
+    at the limit must encode. This pins the ceiling: a payload one past it must not. With
+    only the floor test, an envelope that handed ``data`` 65 levels looked correct, and an
+    Entry rebuilt from a store - where the field validators do not run - could be hashed
+    with a payload deeper than SLCS/1 admits.
+    """
+    # model_copy skips the field validators, exactly as a store rehydrating a row does.
+    too_deep = make_entry().model_copy(
+        update={"data": _payload_of_depth(MAX_NESTING_DEPTH + 1)}
+    )
+    with pytest.raises(CanonicalizationError) as excinfo:
+        entry_preimage(too_deep)
+    message = str(excinfo.value)
+    assert "nesting depth exceeds the maximum of 64" in message
+    assert message.startswith("data")  # the seeded path is the field name, not a constant

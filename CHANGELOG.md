@@ -62,10 +62,10 @@ number would have left `pip install signledger` serving the withdrawn release.
   writer cannot reach.
 - A `BackendConformanceSuite` that every backend runs, so a custom backend can
   prove it is interchangeable with the shipped ones.
-- `signledger` CLI: `init`, `append`, `verify`, `checkpoint`, `anchor`,
-  `export`, `migrate`. In 1.0.0 the console script was dead on arrival — an empty
-  `cli/` directory shadowed `cli.py`. Note that `migrate` moves a ledger that
-  *verifies* between stores; it is not a 1.0.0 upgrade path, and no such path
+- `signledger` CLI: `verify`, `stats`, `inspect`, `checkpoint`, `anchor`, `export`,
+  `verify-bundle` and `migrate`. In 1.0.0 the console script was dead on arrival —
+  an empty `cli/` directory shadowed `cli.py`. Note that `migrate` moves a ledger
+  that *verifies* between stores; it is not a 1.0.0 upgrade path, and no such path
   exists — see [SECURITY.md](SECURITY.md).
 - `signledger.contrib` integrations for Flask, FastAPI and Django, all rebuilt.
   The 1.0.0 versions were shadowed the same way and never ran.
@@ -86,7 +86,13 @@ number would have left `pip install signledger` serving the withdrawn release.
   empty directories.
 - `import signledger` no longer imports `cryptography`, `psycopg`, `pymongo` or
   any web framework. Optional extras stay optional.
-- Minimum Python is 3.9.
+- **Minimum Python is 3.9. 1.0.0 supported 3.8; this release drops it.** The code was
+  measured to run on 3.8, so this is a policy decision rather than a technical one: 3.8
+  stopped receiving security fixes in October 2024, and a library whose only purpose is
+  producing evidence should not run on an unpatched interpreter. Note that a 3.8 user
+  running `pip install -U signledger` is not upgraded and is not warned — the resolver
+  simply keeps 1.0.0, which is why yanking it matters.
+  Verified working: CPython 3.9 through 3.14. PyPy is **not** supported.
 - Each backend has exactly one module name (`signledger.backends.postgresql`,
   `signledger.backends.mongodb`) — no aliases.
 

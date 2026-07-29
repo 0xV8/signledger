@@ -240,6 +240,18 @@ def test_genesis_hash_rejects_an_empty_ledger_id():
         genesis_hash("", TS)
 
 
+def test_genesis_hash_empty_ledger_id_message_is_the_documented_sentence():
+    """Kills every rewording of the guard's message.
+
+    ``match="ledger_id"`` passes against a message that has been mangled to anything
+    still containing the field name, so it proves the guard fired and nothing about what
+    it told the operator.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        genesis_hash("", TS)
+    assert str(excinfo.value) == "ledger_id must not be empty"
+
+
 def test_genesis_hash_honours_the_requested_algorithm():
     assert len(genesis_hash("led-1", TS, algorithm="sha512")) == 128
 

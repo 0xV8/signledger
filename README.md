@@ -15,7 +15,7 @@ pip install signledger
 > **If you are on 1.0.0, upgrade.** 1.0.0 is withdrawn: it did not provide the
 > tamper-evidence it documented. On SQLite and PostgreSQL — the documented default —
 > it built no hash chain at all, and its signatures were never verified.
-> [SECURITY.md](SECURITY.md) explains what to assume about a log written by it, and why
+> [SECURITY.md](https://github.com/0xV8/signledger/blob/main/SECURITY.md) explains what to assume about a log written by it, and why
 > a 1.0.0 ledger cannot be migrated with its integrity intact — it never had any.
 
 ## Quick start
@@ -403,6 +403,16 @@ Stated plainly, because a security library that hides these is worse than useles
   integer microseconds within the ±2^53 safe-integer bound.
 - **Merkle consistency proofs** are one element longer than RFC 6962's when the old tree
   size is a power of two, because SignLedger binds the leaf count into the root.
+- **On SQLite and PostgreSQL, `anchored` is a damage signal, not a configuration.** Both
+  arm their append-only triggers when they create the entries table, so a healthy signed
+  and anchored store reports `worm` — the level above. Seeing `anchored` on one of them
+  means the triggers are *gone*, which is worth an alert rather than a shrug. MongoDB
+  never reports `append_only_enforced`, so `anchored` is its normal ceiling.
+- **On Python 3.14, `fork()` in a pre-forking server warns** if the parent is
+  multi-threaded — which it is whenever `auto_verify=True` runs the background verifier.
+  It is a `DeprecationWarning` from CPython, not from SignLedger, and it does not appear
+  on 3.9–3.13. Building the ledger after the fork (which you should do anyway, see
+  Deployment) avoids both the warning and the reason for it.
 
 ## Development
 
@@ -424,8 +434,8 @@ and fails if any database test is skipped.
 
 ## Security
 
-Report vulnerabilities privately — see [SECURITY.md](SECURITY.md). Release history and the
-full account of what was wrong with 1.0.0 are in [CHANGELOG.md](CHANGELOG.md).
+Report vulnerabilities privately — see [SECURITY.md](https://github.com/0xV8/signledger/blob/main/SECURITY.md). Release history and the
+full account of what was wrong with 1.0.0 are in [CHANGELOG.md](https://github.com/0xV8/signledger/blob/main/CHANGELOG.md).
 
 ## License
 

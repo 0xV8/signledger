@@ -283,6 +283,16 @@ def _signer_from_pem(path: str, password_env: Optional[str]) -> Any:
             raise ConfigurationError(
                 f"the signing key password environment variable {password_env} is not set"
             )
+        if raw == "":
+            # `export SL_PASS=$(cat /secrets/missing)` sets the variable to an empty
+            # string, not to nothing. Passing b"" through as a real passphrase produced
+            # the generic "the password may be wrong", sending the operator to check a
+            # passphrase when the actual fault is an empty variable. Different causes
+            # need different messages; the value itself is never echoed either way.
+            raise ConfigurationError(
+                f"the signing key password environment variable {password_env} is set but "
+                f"empty; if the key is unencrypted, omit --password-env"
+            )
         password = raw.encode("utf-8")
 
     with open(path, "rb") as handle:
@@ -705,10 +715,20 @@ def _cmd_anchor(args: argparse.Namespace) -> Result:
 
 
 def _public_key_pems(paths: Optional[List[str]]) -> List[str]:
-    """The PEM text of every key named by ``--key``, verbatim."""
+    """The PEM text of every key named by ``--key``, verbatim.
+
+    Refuses an empty key directory for the same reason ``_key_resolver`` does, and it has
+    to be the same answer: the identical typo used to be an operational error on ``verify``
+    and a silent success on ``export``, which archived a signed ledger into a bundle
+    holding no keys and reported it as done. The operator found out whenever someone next
+    tried to verify the archive.
+    """
     pems: List[str] = []
     for path in paths or []:
-        for pem_path in _pem_files(path):
+        found = _pem_files(path)
+        if not found:
+            raise ConfigurationError(f"no .pem files were found in the key directory {path}")
+        for pem_path in found:
             with open(pem_path, encoding="utf-8") as handle:
                 pems.append(handle.read())
     return pems
@@ -967,10 +987,17 @@ def _cmd_verify_bundle(args: argparse.Namespace) -> Result:
         capabilities=frozenset(),
         extra_failures=extra,
     )
-    if embedded:
+    if embedded and result.payload["ok"]:
         # Keys carried inside the thing they authenticate cannot raise assurance: whoever
         # rewrote the entries could re-sign them and swap the key in the same edit. The
         # signature check still runs, so a broken signature is still reported.
+        #
+        # Only ever applied to a bundle that *passed*. This is a ceiling on what a passing
+        # check is worth, never a floor: a bundle that failed has established nothing
+        # (contract section 1, NONE = "chain broken or unverified"), and stamping
+        # CHAIN_ONLY on it would have printed "the signatures were checked ... proves
+        # internal consistency" directly above "sequence 1 has a signature that does not
+        # verify".
         result.payload["assurance"] = "chain_only"
         result.payload["assurance_note"] = EMBEDDED_KEY_NOTE
         result.lines = tuple(
@@ -1038,6 +1065,18 @@ def _cmd_migrate(args: argparse.Namespace) -> Result:
                 lines=tuple(lines),
             )
 
+        # Unlocked *before* anything is written. The signing key is the operator input
+        # most likely to be wrong - a mistyped passphrase, an unset variable, the wrong
+        # PEM - and it is only needed at the very end, to sign the record. Loading it
+        # there left a fully populated target behind a command that exited 2, and a
+        # populated target can never be migrated into again ("must be empty"); on an
+        # append-only store it cannot be emptied either, so the typo was permanent.
+        signer = (
+            None
+            if args.signing_key is None
+            else _signer_from_pem(args.signing_key, args.password_env)
+        )
+
         target = open_backend(args.target)
         if target.count() != 0:
             raise ConfigurationError(
@@ -1054,7 +1093,7 @@ def _cmd_migrate(args: argparse.Namespace) -> Result:
             target.save_checkpoint(checkpoint)
 
         moved, _ = _verify(target, algorithm=args.hash_algorithm)
-        record = _migration_record(args, entries, signed=args.signing_key is not None)
+        record = _migration_record(args, entries, signer=signer)
         if args.record is not None:
             with open(args.record, "w", encoding="utf-8") as handle:
                 json.dump(record, handle, indent=2, sort_keys=True)
@@ -1091,12 +1130,15 @@ def _cmd_migrate(args: argparse.Namespace) -> Result:
 
 
 def _migration_record(
-    args: argparse.Namespace, entries: List[Any], *, signed: bool
+    args: argparse.Namespace, entries: List[Any], *, signer: Any
 ) -> Dict[str, Any]:
-    """The record binding what was migrated, optionally signed.
+    """The record binding what was migrated, signed when ``signer`` is not ``None``.
 
     Only the *scheme* of each store is recorded. A DSN carries credentials, and this
     record is the one artefact of a migration meant to be handed to an auditor.
+
+    The signer arrives already unlocked: a key that cannot be loaded must stop the
+    migration before it copies anything, not after.
     """
     head = entries[-1]
     record = {
@@ -1112,8 +1154,7 @@ def _migration_record(
         "key_id": None,
         "signature": None,
     }
-    if signed:
-        signer = _signer_from_pem(args.signing_key, args.password_env)
+    if signer is not None:
         record["key_id"] = signer.key_id
         record["signature"] = signer.sign(migration_signing_payload(record))
     return record

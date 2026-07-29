@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, List
 
 import pytest
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 
 from signledger.anchor.sinks import FileAnchorSink
@@ -19,7 +20,9 @@ from signledger.backends.base import entry_to_row
 from signledger.backends.memory import MemoryBackend
 from signledger.backends.sqlite import SQLiteBackend
 from signledger.cli import (
+    ASSURANCE_NOTES,
     BUNDLE_FORMAT,
+    EMBEDDED_KEY_NOTE,
     EXIT_ERROR,
     EXIT_INVALID,
     EXIT_OK,
@@ -34,7 +37,13 @@ from signledger.core.entry import Entry
 from signledger.core.exceptions import ConfigurationError, SignLedgerError
 from signledger.core.ledger import Ledger
 from signledger.crypto.merkle import MerkleTree
-from signledger.crypto.signatures import Ed25519Signer, get_private_key_pem, verify
+from signledger.crypto.signatures import (
+    ECDSASigner,
+    Ed25519Signer,
+    RSASigner,
+    get_private_key_pem,
+    verify,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -2569,3 +2578,897 @@ def test_the_module_entry_point_delegates_to_the_cli() -> None:
     from signledger.cli import main as cli_main
 
     assert module_entry.main is cli_main
+
+
+# ======================================================================================
+# the key-handling surface an operator touches during an incident
+#
+# Everything below drives real key material through the command line: real Ed25519,
+# ECDSA and RSA PEMs on disk, real passphrase-encrypted PEMs, and the unknown_key /
+# bad_signature verdicts reached through argv rather than through the Python API.
+#
+# This is the surface someone reaches for at 3am with a suspected breach, so the things
+# under test are the ones that would mislead them: an exit code that says nothing is
+# wrong, an assurance level that claims more than was measured, and a passphrase that
+# ends up in a CI log.
+# ======================================================================================
+
+#: A real passphrase, used to encrypt a real PEM. Never appears in any output.
+PASSPHRASE = "correct horse battery staple"
+
+#: What an operator fat-fingers instead.
+WRONG_PASSPHRASE = "correct horse battery stapl"
+
+
+def write_ledger_signed_by(path: Any, signer: Any, count: int = 3) -> str:
+    """A real SQLite ledger signed by ``signer``; returns its ledger id."""
+    ledger = Ledger(SQLiteBackend(str(path)), enable_signatures=True, signer=signer)
+    try:
+        for index in range(count):
+            ledger.append({"event": "created", "index": index})
+        return ledger.ledger_id
+    finally:
+        ledger.close()
+
+
+def write_public_pem(path: Any, signer: Any) -> Any:
+    """Publish ``signer``'s public key to ``path``, the way an operator distributes one."""
+    Path(path).write_text(signer.public_key_pem(), encoding="utf-8")
+    return path
+
+
+def write_encrypted_signing_key(path: Any, passphrase: str = PASSPHRASE) -> Any:
+    """A real passphrase-encrypted Ed25519 private key PEM on disk."""
+    Path(path).write_text(
+        get_private_key_pem(
+            ed25519.Ed25519PrivateKey.generate(), password=passphrase.encode("utf-8")
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def swap_signatures(path: Any, first: int, second: int) -> None:
+    """Exchange two entries' signatures, leaving every digest and ``key_id`` alone.
+
+    Both signatures stay valid signatures by the ledger's own key, and ``signature`` is
+    outside the hash preimage - so the chain still verifies and the ``key_id`` still
+    resolves. The only thing left that can catch this is the signature check itself.
+    """
+    unlock_store(path)
+    connection = sqlite3.connect(str(path))
+    try:
+        held = dict(
+            connection.execute(
+                "SELECT sequence, signature FROM ledger_entries WHERE sequence IN (?, ?)",
+                (first, second),
+            ).fetchall()
+        )
+        connection.execute(
+            "UPDATE ledger_entries SET signature = ? WHERE sequence = ?", (held[second], first)
+        )
+        connection.execute(
+            "UPDATE ledger_entries SET signature = ? WHERE sequence = ?", (held[first], second)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def scribble_over_signatures(path: Any) -> None:
+    """Replace every signature with well-formed base64 that signs nothing."""
+    unlock_store(path)
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute(
+            "UPDATE ledger_entries SET signature = ?",
+            (base64.b64encode(b"\x00" * 64).decode("ascii"),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+# --------------------------------------------------------------------------------------
+# --key with an externally supplied public key
+# --------------------------------------------------------------------------------------
+
+
+def test_an_ecdsa_signed_ledger_verifies_against_the_public_pem_beside_it(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # p384, not the default p256: the CLI resolves a key by its own fingerprint, so it
+    # must never need telling which curve or algorithm the ledger was signed with.
+    path = tmp_path / "ledger.db"
+    signer = ECDSASigner.generate("p384")
+    key = write_public_pem(tmp_path / "audit.pem", signer)
+    write_ledger_signed_by(path, signer)
+
+    code, out, _ = run(
+        ["verify", "--backend", sqlite_uri(path), "--key", str(key), "--json"], capsys
+    )
+
+    assert (code, json.loads(out)["assurance"]) == (EXIT_OK, "signed")
+
+
+def test_an_rsa_signed_ledger_verifies_against_the_public_pem_beside_it(
+    tmp_path: Any, capsys: Any
+) -> None:
+    path = tmp_path / "ledger.db"
+    signer = RSASigner.generate(key_size=2048)
+    key = write_public_pem(tmp_path / "audit.pem", signer)
+    write_ledger_signed_by(path, signer)
+
+    code, out, _ = run(
+        ["verify", "--backend", sqlite_uri(path), "--key", str(key), "--json"], capsys
+    )
+
+    assert (code, json.loads(out)["assurance"]) == (EXIT_OK, "signed")
+
+
+def test_a_stranger_who_holds_the_wrong_public_key_gets_a_non_zero_exit(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # `signledger verify || alert` is the whole point of the exit code. A verification
+    # that could not check what it was asked to check must never exit 0.
+    path = tmp_path / "ledger.db"
+    write_signed_ledger(path, tmp_path / "audit.pem")
+    stranger = write_public_pem(tmp_path / "stranger.pem", Ed25519Signer.generate())
+
+    code, out, _ = run(
+        ["verify", "--backend", sqlite_uri(path), "--key", str(stranger), "--json"], capsys
+    )
+
+    assert (code, json.loads(out)["assurance"]) == (EXIT_INVALID, "none")
+
+
+def test_every_pem_in_a_key_directory_is_loaded_not_just_the_first(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # A key ring holds every key an auditor has been given. Loading one of them would make
+    # a correctly signed ledger look like it names a key nobody can supply.
+    path = tmp_path / "ledger.db"
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    signer = Ed25519Signer.generate()
+    write_public_pem(keys / "a-stranger.pem", Ed25519Signer.generate())
+    write_public_pem(keys / "b-audit.pem", signer)
+    write_public_pem(keys / "c-stranger.pem", Ed25519Signer.generate())
+    write_ledger_signed_by(path, signer)
+
+    code, out, _ = run(
+        ["verify", "--backend", sqlite_uri(path), "--key", str(keys), "--json"], capsys
+    )
+
+    assert (code, json.loads(out)["assurance"]) == (EXIT_OK, "signed")
+
+
+def test_each_repeated_key_option_is_loaded(tmp_path: Any, capsys: Any) -> None:
+    # `--key` is repeatable, and the ledger's own key is deliberately not the last one:
+    # taking only the final path would silently discard the rest of the key ring.
+    path = tmp_path / "ledger.db"
+    signer = Ed25519Signer.generate()
+    mine = write_public_pem(tmp_path / "audit.pem", signer)
+    stranger = write_public_pem(tmp_path / "stranger.pem", Ed25519Signer.generate())
+    write_ledger_signed_by(path, signer)
+
+    code, out, _ = run(
+        [
+            "verify",
+            "--backend",
+            sqlite_uri(path),
+            "--key",
+            str(mine),
+            "--key",
+            str(stranger),
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert (code, json.loads(out)["assurance"]) == (EXIT_OK, "signed")
+
+
+def test_supplying_a_key_for_a_ledger_that_was_never_signed_fails_closed(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # An operator who passes --key is asking "are these signed by this key?". The honest
+    # answer for an unsigned ledger is no, not "there was nothing to check, so yes".
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=3)
+    key = write_public_pem(tmp_path / "audit.pem", Ed25519Signer.generate())
+
+    code, out, _ = run(
+        ["verify", "--backend", sqlite_uri(path), "--key", str(key), "--json"], capsys
+    )
+
+    assert code == EXIT_INVALID
+    assert {failure["kind"] for failure in json.loads(out)["failures"]} == {"missing_signature"}
+
+
+# --------------------------------------------------------------------------------------
+# bad_signature, reached through the command line
+# --------------------------------------------------------------------------------------
+
+
+def test_two_signatures_swapped_between_entries_are_reported_as_bad_signatures(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # Both signatures were made by the ledger's own key, so the key_id resolves and the
+    # chain is untouched: unknown_key and bad_hash are both the wrong verdict here.
+    path = tmp_path / "ledger.db"
+    key = tmp_path / "audit.pem"
+    write_signed_ledger(path, key, count=3)
+    swap_signatures(path, 1, 2)
+
+    code, out, _ = run(
+        ["verify", "--backend", sqlite_uri(path), "--key", str(key), "--json"], capsys
+    )
+
+    assert code == EXIT_INVALID
+    assert {failure["kind"] for failure in json.loads(out)["failures"]} == {"bad_signature"}
+
+
+def test_a_swapped_signature_names_the_sequences_it_was_found_at(
+    tmp_path: Any, capsys: Any
+) -> None:
+    path = tmp_path / "ledger.db"
+    key = tmp_path / "audit.pem"
+    write_signed_ledger(path, key, count=3)
+    swap_signatures(path, 1, 2)
+
+    _, out, _ = run(
+        ["verify", "--backend", sqlite_uri(path), "--key", str(key), "--json"], capsys
+    )
+
+    assert {failure["sequence"] for failure in json.loads(out)["failures"]} == {1, 2}
+
+
+def test_a_bad_signature_never_lets_the_report_claim_an_assurance_level(
+    tmp_path: Any, capsys: Any
+) -> None:
+    path = tmp_path / "ledger.db"
+    key = tmp_path / "audit.pem"
+    write_signed_ledger(path, key, count=3)
+    swap_signatures(path, 1, 2)
+
+    _, out, _ = run(
+        ["verify", "--backend", sqlite_uri(path), "--key", str(key), "--json"], capsys
+    )
+
+    assert json.loads(out)["assurance"] == "none"
+
+
+def test_a_signature_failure_exits_non_zero_through_the_installed_console_script(
+    tmp_path: Any, capsys: Any
+) -> None:
+    path = tmp_path / "ledger.db"
+    key = tmp_path / "audit.pem"
+    write_signed_ledger(path, key, count=3)
+    swap_signatures(path, 1, 2)
+    script = write_console_script(tmp_path)
+
+    result = run_process(
+        [sys.executable, str(script), "verify", "-b", sqlite_uri(path), "--key", str(key)]
+    )
+
+    assert result.returncode == EXIT_INVALID, result.stderr
+
+
+# --------------------------------------------------------------------------------------
+# verify with no key at all: what a signed ledger reports when nobody checked
+# --------------------------------------------------------------------------------------
+
+
+def test_a_keyless_verify_never_reports_signed_assurance_for_a_signed_ledger(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # Every signature in this store is base64 padding. Nothing checked them, because no
+    # key was supplied - so the level reported has to be the one that promises nothing
+    # about signatures. Reporting `signed` because the column is populated is the v1
+    # defect: generating signatures and never verifying them.
+    path = tmp_path / "ledger.db"
+    write_signed_ledger(path, tmp_path / "audit.pem", count=3)
+    scribble_over_signatures(path)
+
+    code, out, _ = run(["verify", "--backend", sqlite_uri(path), "--json"], capsys)
+
+    report = json.loads(out)
+    assert (code, report["assurance"]) == (EXIT_OK, "chain_only")
+
+
+def test_a_keyless_verify_spells_out_that_a_rewrite_would_go_unnoticed(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # The exit code is 0 here, so the caveat is the only thing standing between a reader
+    # and "this ledger is tamper-proof".
+    path = tmp_path / "ledger.db"
+    write_signed_ledger(path, tmp_path / "audit.pem", count=3)
+
+    _, out, _ = run(["verify", "--backend", sqlite_uri(path)], capsys)
+
+    assert ASSURANCE_NOTES["chain_only"] in out
+    assert ASSURANCE_NOTES["signed"] not in out
+
+
+# --------------------------------------------------------------------------------------
+# key files an operator hands over by mistake
+# --------------------------------------------------------------------------------------
+
+
+def test_a_garbage_key_file_is_an_operational_error_not_a_stack_trace(
+    tmp_path: Any, capsys: Any
+) -> None:
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    junk = tmp_path / "audit.pem"
+    junk.write_text("-----BEGIN PUBLIC KEY-----\nnot base64 at all\n", encoding="utf-8")
+
+    code, out, err = run(
+        ["verify", "--backend", sqlite_uri(path), "--key", str(junk)], capsys
+    )
+
+    assert code == EXIT_ERROR
+    assert "public key could not be loaded" in err
+    assert "Traceback" not in out + err
+
+
+def test_a_truncated_key_file_is_an_operational_error(tmp_path: Any, capsys: Any) -> None:
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    signer = Ed25519Signer.generate()
+    half = tmp_path / "audit.pem"
+    half.write_text(signer.public_key_pem()[:40], encoding="utf-8")
+
+    code, _, err = run(["verify", "--backend", sqlite_uri(path), "--key", str(half)], capsys)
+
+    assert code == EXIT_ERROR
+    assert "public key could not be loaded" in err
+
+
+def test_a_private_key_handed_to_the_key_option_is_refused_without_echoing_it(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # --key takes a public key. An operator who points it at the signing key must get a
+    # refusal that does not paste the private key into the terminal, the log or the CI
+    # transcript (contract section 10).
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    private = tmp_path / "signing.pem"
+    pem = get_private_key_pem(ed25519.Ed25519PrivateKey.generate(), allow_unencrypted=True)
+    private.write_text(pem, encoding="utf-8")
+    secret = pem.splitlines()[1]
+
+    code, out, err = run(
+        ["verify", "--backend", sqlite_uri(path), "--key", str(private), "--json"], capsys
+    )
+
+    assert code == EXIT_ERROR
+    assert secret not in out + err
+
+
+def test_a_key_path_that_is_a_directory_of_directories_is_an_operational_error(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # A ".pem" that is really a directory: opened, not stat-ed, so it must surface as an
+    # operational error rather than an IsADirectoryError escaping main().
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    keys = tmp_path / "keys"
+    (keys / "audit.pem").mkdir(parents=True)
+
+    code, out, err = run(["verify", "--backend", sqlite_uri(path), "--key", str(keys)], capsys)
+
+    assert code == EXIT_ERROR
+    assert "Traceback" not in out + err
+
+
+# --------------------------------------------------------------------------------------
+# --signing-key with a real encrypted PEM and --password-env
+# --------------------------------------------------------------------------------------
+
+
+def test_an_encrypted_signing_key_is_refused_when_the_passphrase_is_wrong(
+    tmp_path: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    private = write_encrypted_signing_key(tmp_path / "signing.pem")
+    monkeypatch.setenv("SL_KEY_PASSWORD", WRONG_PASSPHRASE)
+
+    code, _, err = run(
+        [
+            "checkpoint",
+            "--backend",
+            sqlite_uri(path),
+            "--signing-key",
+            str(private),
+            "--password-env",
+            "SL_KEY_PASSWORD",
+        ],
+        capsys,
+    )
+
+    assert code == EXIT_ERROR
+    assert "private key could not be loaded" in err
+
+
+def test_a_wrong_passphrase_is_never_quoted_back_to_the_operator(
+    tmp_path: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    # Contract section 10. A refusal that echoes the attempted passphrase puts it in the
+    # terminal scrollback, the log and the CI transcript of everyone who reads the job.
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    private = write_encrypted_signing_key(tmp_path / "signing.pem")
+    monkeypatch.setenv("SL_KEY_PASSWORD", WRONG_PASSPHRASE)
+
+    _, out, err = run(
+        [
+            "checkpoint",
+            "--backend",
+            sqlite_uri(path),
+            "--signing-key",
+            str(private),
+            "--password-env",
+            "SL_KEY_PASSWORD",
+        ],
+        capsys,
+    )
+
+    assert WRONG_PASSPHRASE not in out + err
+    assert PASSPHRASE not in out + err
+
+
+def test_a_wrong_passphrase_never_reaches_the_json_output(
+    tmp_path: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    private = write_encrypted_signing_key(tmp_path / "signing.pem")
+    monkeypatch.setenv("SL_KEY_PASSWORD", WRONG_PASSPHRASE)
+
+    code, out, _ = run(
+        [
+            "checkpoint",
+            "--backend",
+            sqlite_uri(path),
+            "--signing-key",
+            str(private),
+            "--password-env",
+            "SL_KEY_PASSWORD",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert (code, WRONG_PASSPHRASE in json.dumps(json.loads(out))) == (EXIT_ERROR, False)
+
+
+def test_a_wrong_passphrase_ends_in_an_operational_error_and_no_traceback(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    # In-process this would surface as a test error; through the console script it is what
+    # an operator actually sees. A traceback here would mean cryptography's own exception
+    # escaped main(), and its args carry the material that was being decrypted.
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    private = write_encrypted_signing_key(tmp_path / "signing.pem")
+    script = write_console_script(tmp_path)
+    monkeypatch.setenv("SL_KEY_PASSWORD", WRONG_PASSPHRASE)
+
+    result = run_process(
+        [
+            sys.executable,
+            str(script),
+            "checkpoint",
+            "-b",
+            sqlite_uri(path),
+            "--signing-key",
+            str(private),
+            "--password-env",
+            "SL_KEY_PASSWORD",
+        ]
+    )
+
+    assert result.returncode == EXIT_ERROR
+    assert "Traceback" not in result.stdout + result.stderr
+    assert WRONG_PASSPHRASE not in result.stdout + result.stderr
+
+
+def test_a_password_env_var_pointed_at_a_plaintext_key_is_refused_clearly(
+    tmp_path: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    # The inverse mistake: --password-env against a key that is not encrypted. Underneath
+    # this is a TypeError, and an unhandled one exits 1 - which a monitoring script reads
+    # as "the ledger is broken" rather than "your command line is wrong".
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    private = tmp_path / "signing.pem"
+    private.write_text(
+        get_private_key_pem(ed25519.Ed25519PrivateKey.generate(), allow_unencrypted=True),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SL_KEY_PASSWORD", PASSPHRASE)
+
+    code, _, err = run(
+        [
+            "checkpoint",
+            "--backend",
+            sqlite_uri(path),
+            "--signing-key",
+            str(private),
+            "--password-env",
+            "SL_KEY_PASSWORD",
+        ],
+        capsys,
+    )
+
+    assert code == EXIT_ERROR
+    assert "password mismatch" in err
+
+
+def test_an_encrypted_signing_key_produces_a_checkpoint_that_verifies(
+    tmp_path: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    # The passphrase is right, so the whole path has to work end to end: unlock the PEM,
+    # sign the checkpoint, and produce a signature that verifies against the public key.
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    private = write_encrypted_signing_key(tmp_path / "signing.pem")
+    monkeypatch.setenv("SL_KEY_PASSWORD", PASSPHRASE)
+    signer = Ed25519Signer.from_pem(
+        Path(private).read_text(encoding="utf-8"), PASSPHRASE.encode("utf-8")
+    )
+
+    code, out, _ = run(
+        [
+            "checkpoint",
+            "--backend",
+            sqlite_uri(path),
+            "--signing-key",
+            str(private),
+            "--password-env",
+            "SL_KEY_PASSWORD",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert (code, json.loads(out)["key_id"]) == (EXIT_OK, signer.key_id)
+
+
+def test_an_encrypted_signing_key_signs_a_migration_record_from_the_environment(
+    tmp_path: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source.db"
+    record = tmp_path / "migration.json"
+    write_ledger(source, count=2)
+    private = write_encrypted_signing_key(tmp_path / "signing.pem")
+    monkeypatch.setenv("SL_KEY_PASSWORD", PASSPHRASE)
+    signer = Ed25519Signer.from_pem(
+        Path(private).read_text(encoding="utf-8"), PASSPHRASE.encode("utf-8")
+    )
+
+    code, _, err = run(
+        [
+            "migrate",
+            "--backend",
+            sqlite_uri(source),
+            "--target",
+            sqlite_uri(tmp_path / "target.db"),
+            "--record",
+            str(record),
+            "--signing-key",
+            str(private),
+            "--password-env",
+            "SL_KEY_PASSWORD",
+        ],
+        capsys,
+    )
+
+    assert code == EXIT_OK, err
+    decoded = json.loads(record.read_text(encoding="utf-8"))
+    assert verify(
+        migration_signing_payload(decoded), decoded["signature"], signer.public_key
+    )
+
+
+def test_a_mistyped_passphrase_leaves_the_migration_target_untouched(
+    tmp_path: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    # The key is what signs the record at the *end* of a migration, but it is the operator
+    # input most likely to be wrong. Loading it after the entries have been copied leaves
+    # a populated target behind a command that reported failure.
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    write_ledger(source, count=3)
+    private = write_encrypted_signing_key(tmp_path / "signing.pem")
+    monkeypatch.setenv("SL_KEY_PASSWORD", WRONG_PASSPHRASE)
+
+    code, _, _ = run(
+        [
+            "migrate",
+            "--backend",
+            sqlite_uri(source),
+            "--target",
+            sqlite_uri(target),
+            "--record",
+            str(tmp_path / "migration.json"),
+            "--signing-key",
+            str(private),
+            "--password-env",
+            "SL_KEY_PASSWORD",
+        ],
+        capsys,
+    )
+
+    backend = SQLiteBackend(str(target))
+    try:
+        assert (code, backend.count()) == (EXIT_ERROR, 0)
+    finally:
+        backend.close()
+
+
+def test_a_migration_refused_for_a_mistyped_passphrase_can_simply_be_retried(
+    tmp_path: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    # The recovery story. A half-copied target cannot be migrated into a second time -
+    # "the migration target must be empty" - and on an append-only store it cannot be
+    # emptied either, so a typo would poison the destination permanently.
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    record = tmp_path / "migration.json"
+    write_ledger(source, count=3)
+    private = write_encrypted_signing_key(tmp_path / "signing.pem")
+    argv = [
+        "migrate",
+        "--backend",
+        sqlite_uri(source),
+        "--target",
+        sqlite_uri(target),
+        "--record",
+        str(record),
+        "--signing-key",
+        str(private),
+        "--password-env",
+        "SL_KEY_PASSWORD",
+    ]
+    monkeypatch.setenv("SL_KEY_PASSWORD", WRONG_PASSPHRASE)
+    run(argv, capsys)
+
+    monkeypatch.setenv("SL_KEY_PASSWORD", PASSPHRASE)
+    code, _, err = run(argv, capsys)
+
+    assert code == EXIT_OK, err
+    assert json.loads(record.read_text(encoding="utf-8"))["signature"] is not None
+
+
+# --------------------------------------------------------------------------------------
+# --trust-embedded-keys: self-certification, and how loudly it says so
+# --------------------------------------------------------------------------------------
+
+
+def test_an_explicit_key_beats_the_bundles_own_keys(tmp_path: Any, capsys: Any) -> None:
+    # The bundle carries the key that really did sign it, and the operator supplies a
+    # different one. Falling back to the embedded key here would let any bundle prove
+    # itself against whatever key it chose to ship - the exact thing --key exists to stop.
+    path = tmp_path / "ledger.db"
+    key = tmp_path / "audit.pem"
+    bundle = tmp_path / "bundle.json"
+    write_signed_ledger(path, key)
+    export_bundle(path, bundle, capsys, "--key", str(key))
+    stranger = write_public_pem(tmp_path / "stranger.pem", Ed25519Signer.generate())
+
+    code, out, _ = run(
+        [
+            "verify-bundle",
+            str(bundle),
+            "--key",
+            str(stranger),
+            "--trust-embedded-keys",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert code == EXIT_INVALID
+    assert {failure["kind"] for failure in json.loads(out)["failures"]} == {"unknown_key"}
+
+
+def test_a_key_obtained_separately_still_earns_signed_assurance_alongside_the_flag(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # --trust-embedded-keys is a fallback, not a downgrade switch: a key the verifier
+    # obtained independently is real evidence whether or not the flag is also present.
+    path = tmp_path / "ledger.db"
+    key = tmp_path / "audit.pem"
+    bundle = tmp_path / "bundle.json"
+    write_signed_ledger(path, key)
+    export_bundle(path, bundle, capsys, "--key", str(key))
+
+    code, out, _ = run(
+        ["verify-bundle", str(bundle), "--key", str(key), "--trust-embedded-keys", "--json"],
+        capsys,
+    )
+
+    assert (code, json.loads(out)["assurance"]) == (EXIT_OK, "signed")
+
+
+def test_the_human_bundle_report_says_the_keys_came_from_inside_the_bundle(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # Most operators never pass --json. The self-certification caveat has to survive into
+    # the output they actually read.
+    path = tmp_path / "ledger.db"
+    key = tmp_path / "audit.pem"
+    bundle = tmp_path / "bundle.json"
+    write_signed_ledger(path, key)
+    export_bundle(path, bundle, capsys, "--key", str(key))
+
+    _, out, _ = run(["verify-bundle", str(bundle), "--trust-embedded-keys"], capsys)
+
+    assert EMBEDDED_KEY_NOTE in out
+    assert ASSURANCE_NOTES["signed"] not in out
+
+
+def test_trusting_embedded_keys_never_lifts_a_failed_bundle_above_none(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # Contract section 1: NONE is "chain broken or unverified". A bundle whose signature
+    # does not verify has established nothing, and the embedded-key caveat is a *ceiling*
+    # on assurance, never a floor to lift a failure up to.
+    path = tmp_path / "ledger.db"
+    key = tmp_path / "audit.pem"
+    bundle = tmp_path / "bundle.json"
+    write_signed_ledger(path, key)
+    decoded = export_bundle(path, bundle, capsys, "--key", str(key))
+    decoded["entries"][1]["signature"] = base64.b64encode(b"\x00" * 64).decode("ascii")
+    bundle.write_text(json.dumps(decoded), encoding="utf-8")
+
+    code, out, _ = run(
+        ["verify-bundle", str(bundle), "--trust-embedded-keys", "--json"], capsys
+    )
+
+    assert (code, json.loads(out)["assurance"]) == (EXIT_INVALID, "none")
+
+
+def test_a_failed_embedded_verification_never_claims_the_signatures_checked_out(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # The embedded note reads "the signatures were checked against keys carried inside the
+    # bundle, which proves internal consistency only". Printed against a bundle whose
+    # signature did not verify, that sentence is simply false.
+    path = tmp_path / "ledger.db"
+    key = tmp_path / "audit.pem"
+    bundle = tmp_path / "bundle.json"
+    write_signed_ledger(path, key)
+    decoded = export_bundle(path, bundle, capsys, "--key", str(key))
+    decoded["entries"][1]["signature"] = base64.b64encode(b"\x00" * 64).decode("ascii")
+    bundle.write_text(json.dumps(decoded), encoding="utf-8")
+
+    _, out, _ = run(["verify-bundle", str(bundle), "--trust-embedded-keys"], capsys)
+
+    assert ASSURANCE_NOTES["none"] in out
+    assert EMBEDDED_KEY_NOTE not in out
+
+
+def test_a_tampered_payload_is_still_reported_when_the_bundles_keys_are_trusted(
+    tmp_path: Any, capsys: Any
+) -> None:
+    # Self-certification is a limit on what a *passing* check is worth. It must not become
+    # a way to make a failing one quieter.
+    path = tmp_path / "ledger.db"
+    key = tmp_path / "audit.pem"
+    bundle = tmp_path / "bundle.json"
+    write_signed_ledger(path, key)
+    decoded = export_bundle(path, bundle, capsys, "--key", str(key))
+    decoded["entries"][1]["data"] = {"event": "created", "index": 999}
+    bundle.write_text(json.dumps(decoded), encoding="utf-8")
+
+    code, out, _ = run(
+        ["verify-bundle", str(bundle), "--trust-embedded-keys", "--json"], capsys
+    )
+
+    assert code == EXIT_INVALID
+    assert "bad_hash" in {failure["kind"] for failure in json.loads(out)["failures"]}
+
+
+def test_export_refuses_an_empty_key_directory_exactly_as_verify_does(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """The same typo must not be an error on one command and a silent success on another.
+
+    ``verify --key <empty dir>`` already exits 2 rather than reporting every entry as
+    UNKNOWN_KEY, so that a mistyped path is not mistaken for an attack. ``export`` took the
+    identical argument, found nothing, and wrote a bundle with ``public_keys: []`` while
+    exiting 0 - so an operator archiving a signed ledger got a keyless bundle and a success
+    message, and only discovered it whenever someone next tried to verify the archive.
+    """
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=1)
+    empty = tmp_path / "keys"
+    empty.mkdir()
+
+    code, _, err = run(
+        [
+            "export",
+            "--backend",
+            sqlite_uri(path),
+            "--bundle",
+            str(tmp_path / "bundle.json"),
+            "--key",
+            str(empty),
+        ],
+        capsys,
+    )
+
+    assert code == EXIT_ERROR
+    assert "no .pem files" in err
+
+
+def test_export_does_not_write_a_bundle_it_refused_to_build(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """A refused export must leave nothing behind to be mistaken for an archive."""
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=1)
+    empty = tmp_path / "keys"
+    empty.mkdir()
+    bundle = tmp_path / "bundle.json"
+
+    run(
+        [
+            "export",
+            "--backend",
+            sqlite_uri(path),
+            "--bundle",
+            str(bundle),
+            "--key",
+            str(empty),
+        ],
+        capsys,
+    )
+
+    assert not bundle.exists()
+
+
+def test_an_empty_password_variable_is_reported_as_unset_not_as_a_passphrase(
+    tmp_path: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    """``export SL_PASS=$(cat /secrets/missing)`` sets the variable to an empty string.
+
+    That was treated as a real, empty passphrase, so the operator got the generic "the
+    private key could not be loaded - the password may be wrong" instead of being told the
+    variable carries nothing. The two failures need different fixes, so they need
+    different messages.
+    """
+    private = tmp_path / "signing.pem"
+    private.write_bytes(
+        ed25519.Ed25519PrivateKey.generate().private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.BestAvailableEncryption(b"correct horse"),
+        )
+    )
+    monkeypatch.setenv("SL_EMPTY_PASS", "")
+
+    ledger = tmp_path / "ledger.db"
+    write_ledger(ledger, count=1)
+
+    code, _, err = run(
+        [
+            "checkpoint",
+            "--backend",
+            sqlite_uri(ledger),
+            "--signing-key",
+            str(private),
+            "--password-env",
+            "SL_EMPTY_PASS",
+        ],
+        capsys,
+    )
+
+    assert code == EXIT_ERROR
+    assert "SL_EMPTY_PASS" in err
+    assert "empty" in err

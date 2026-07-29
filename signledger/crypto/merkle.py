@@ -411,7 +411,15 @@ def _replay_consistency(
     unusable. Deriving both ends from the proof - rather than walking one and trusting
     the other - is what makes this a verifier and not a formality.
     """
-    if not path:
+    if not path or old_size < 1:
+        # `old_size < 1` is a LIVENESS guard, not only a correctness one, and it is
+        # repeated here deliberately even though `verify_consistency` already checks it.
+        # At old_size == 0, `fn` is -1, which is the fixed point of arithmetic right shift:
+        # -1 is odd so the loop below continues, and -1 >> 1 is -1 again, forever. A
+        # mutation sweep found two single-character edits to the caller's guard that turn
+        # an attacker-supplied ConsistencyProof into a wedged verifier thread rather than a
+        # False. One guard between untrusted input and a hang is not enough for the only
+        # loop in this file whose bound comes from its arguments.
         return None
     fn, sn = old_size - 1, new_size - 1
     while fn & 1:
@@ -424,7 +432,14 @@ def _replay_consistency(
         if fn & 1 or fn == sn:
             old_hash = _node_digest(algorithm, node, old_hash)
             new_hash = _node_digest(algorithm, node, new_hash)
-            while fn != 0 and not fn & 1:
+            # `fn != 0` was here and is provably dead: this branch is entered only when
+            # `fn & 1 or fn == sn`, and `sn == 0` has already returned above, so `fn` is
+            # never 0 at this point; and right-shifting a nonzero positive int always
+            # reaches an odd value before 0. Verified exhaustively over every valid
+            # consistency proof up to 32 leaves plus 20,000 hostile size pairs - both
+            # spellings agree on every one. Dead code in a verifier is a line no test can
+            # ever justify, so it is gone rather than covered.
+            while not fn & 1:
                 fn >>= 1
                 sn >>= 1
         else:

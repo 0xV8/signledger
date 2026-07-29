@@ -11,6 +11,8 @@ backend is built from.
 """
 
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -1444,3 +1446,51 @@ class TestCheckpointRowMappingFailsClosed:
             checkpoint_from_row(self.row(without=column))
 
         assert column in str(caught.value)
+
+
+class TestTheSuiteRefusesToRunWithAssertionsDisabled:
+    """The conformance suite is 72 bare ``assert`` statements, and ``python -O`` deletes them.
+
+    A third-party backend author running this suite under ``-O`` gets a green result that
+    proves nothing at all - the same defect as a verifier that returns success having
+    checked nothing, which contract section 5 rule 1 forbids in ``check_integrity``. The
+    suite has to hold itself to the rule it exists to enforce.
+    """
+
+    def test_the_suite_refuses_to_run_under_dash_o(self) -> None:
+        """Run a real interpreter with -O; the suite must fail loudly, not pass quietly."""
+        program = (
+            "from signledger.backends.base import BackendConformanceSuite\n"
+            "from signledger.backends.memory import MemoryBackend\n"
+            "class MySuite(BackendConformanceSuite):\n"
+            "    pass\n"
+            "MySuite().test_a_fresh_backend_is_empty(MemoryBackend())\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-O", "-c", program],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert result.returncode != 0, (
+            "the suite ran to completion with assertions disabled - every check was a no-op"
+        )
+        assert "assertions are disabled" in (result.stdout + result.stderr)
+
+    def test_the_suite_runs_normally_without_dash_o(self) -> None:
+        """The guard must not break the ordinary path."""
+        program = (
+            "from signledger.backends.base import BackendConformanceSuite\n"
+            "from signledger.backends.memory import MemoryBackend\n"
+            "class MySuite(BackendConformanceSuite):\n"
+            "    pass\n"
+            "MySuite().test_a_fresh_backend_is_empty(MemoryBackend())\n"
+            "print('ok')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", program], capture_output=True, text=True, timeout=60
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "ok" in result.stdout

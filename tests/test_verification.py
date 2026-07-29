@@ -9,11 +9,19 @@ adversary with write access would: the row is overwritten or removed underneath 
 ledger. A verifier tested against a fake store proves nothing about a real one.
 """
 
+import contextlib
+import os
+import socket
+import sqlite3
+import uuid
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import pytest
 
+from signledger.backends.base import CAP_APPEND_ONLY_ENFORCED
 from signledger.backends.memory import MemoryBackend
+from signledger.core.ledger import Ledger
 from signledger.core.verification import AssuranceLevel, FailureKind, verify_chain
 
 BASE_INSTANT = datetime(2024, 1, 1, tzinfo=timezone.utc)
@@ -350,16 +358,17 @@ def signed_entries(ledger_id, ledger_created_at, chain, signer):
     from signledger.backends.base import build_next_entry
     from signledger.crypto.signatures import signing_payload
 
-    def _append(target, count=4):
+    def _append(target, count=4, data=None):
         appended = []
         for index in range(count):
+            payload = {"event": "signed", "index": index} if data is None else dict(data)
 
-            def build(tip, index=index):
+            def build(tip, payload=payload):
                 sealed = build_next_entry(
                     tip,
                     ledger_id=ledger_id,
                     created_at=ledger_created_at,
-                    data={"event": "signed", "index": index},
+                    data=payload,
                     chain=chain,
                     key_id=signer.key_id,
                     signature_algorithm=signer.algorithm,
@@ -757,3 +766,458 @@ def test_digest_comparisons_are_made_over_bytes_never_str(store, sample_entries,
     verify_chain(store, chain=chain, genesis=genesis)
 
     assert all(pair == (bytes, bytes) for pair in seen)
+
+
+# --------------------------------------------------------------------------------------
+# a key the resolver does not hold (FailureKind.UNKNOWN_KEY, contract section 6)
+# --------------------------------------------------------------------------------------
+#
+# The realistic shape of this is not "no keys configured". It is a resolver that holds
+# *some* keys and not the one that signed: a rotation where the retired public key was
+# dropped, or an entry signed by a key that was never trusted at all. The resolver must
+# answer on the key the entry names, so a chain signed under key A cannot be waved
+# through by a verifier that happens to trust key B.
+
+
+@pytest.fixture
+def stranger_resolver():
+    """A populated resolver that holds a *different* key from the one that signed."""
+    pytest.importorskip("cryptography", reason="cryptography is not installed")
+    from signledger.crypto.keys import InMemoryKeyResolver
+    from signledger.crypto.signatures import Ed25519Signer
+
+    known = InMemoryKeyResolver()
+    known.add(Ed25519Signer.generate().public_key)
+    return known
+
+
+def test_a_chain_signed_by_a_key_the_resolver_does_not_hold_is_not_ok(
+    store, signed_entries, chain, genesis, stranger_resolver
+):
+    """The resolver holds a real key - just not this one. Failing closed is the whole point."""
+    signed_entries(store, 3)
+
+    report = verify_chain(
+        store, chain=chain, genesis=genesis, enable_signatures=True, key_resolver=stranger_resolver
+    )
+
+    assert report.ok is False
+
+
+def test_a_chain_signed_by_a_key_the_resolver_does_not_hold_is_reported_as_unknown_key(
+    store, signed_entries, chain, genesis, stranger_resolver
+):
+    signed_entries(store, 3)
+
+    report = verify_chain(
+        store, chain=chain, genesis=genesis, enable_signatures=True, key_resolver=stranger_resolver
+    )
+
+    assert kinds(report) == [FailureKind.UNKNOWN_KEY] * 3
+
+
+def test_a_resolver_holding_the_wrong_key_is_not_offered_as_a_substitute(
+    store, signed_entries, chain, genesis, stranger_resolver
+):
+    """A resolver that answered with whatever key it had would report BAD_SIGNATURE, which
+    reads like an attack. The lookup is by ``key_id``, so the honest diagnosis is that the
+    key is missing."""
+    signed_entries(store, 3)
+
+    report = verify_chain(
+        store, chain=chain, genesis=genesis, enable_signatures=True, key_resolver=stranger_resolver
+    )
+
+    assert FailureKind.BAD_SIGNATURE not in kinds(report)
+
+
+def test_an_unknown_key_failure_names_the_key_it_could_not_supply(
+    store, signed_entries, chain, genesis, stranger_resolver, signer
+):
+    """Without the fingerprint the operator cannot tell rotation from forgery."""
+    signed_entries(store, 2)
+
+    report = verify_chain(
+        store, chain=chain, genesis=genesis, enable_signatures=True, key_resolver=stranger_resolver
+    )
+
+    assert [failure.expected for failure in report.failures] == [signer.key_id] * 2
+
+
+def test_a_chain_signed_by_an_unknown_key_earns_no_assurance(
+    store, signed_entries, chain, genesis, stranger_resolver
+):
+    signed_entries(store, 2)
+
+    report = verify_chain(
+        store, chain=chain, genesis=genesis, enable_signatures=True, key_resolver=stranger_resolver
+    )
+
+    assert report.assurance is AssuranceLevel.NONE
+
+
+def test_an_unknown_key_failure_never_quotes_the_entry_payload(
+    store, signed_entries, chain, genesis, stranger_resolver
+):
+    """Contract section 10. An UNKNOWN_KEY report is exactly what an operator pastes into
+    a ticket, so the one thing it must not carry is the record itself."""
+    signed_entries(store, 1, data={"diagnosis": "MARKER-7f2c-do-not-log"})
+
+    report = verify_chain(
+        store, chain=chain, genesis=genesis, enable_signatures=True, key_resolver=stranger_resolver
+    )
+
+    assert "MARKER-7f2c-do-not-log" not in repr(report)
+
+
+# --------------------------------------------------------------------------------------
+# assurance measured on a REAL on-disk store (contract section 1)
+# --------------------------------------------------------------------------------------
+#
+# Everything above runs against MemoryBackend, which reports no ``append_only_enforced``
+# and therefore can never distinguish ANCHORED from WORM. SQLite and PostgreSQL can: they
+# arm a real append-only guard when they create the entries table, and ``capabilities()``
+# probes the live catalog for it rather than asserting it. What that means for the five
+# levels is established here, on live stores, with the damage inflicted the way an insider
+# would inflict it - over a second connection, in SQL, behind the ledger's back.
+
+POSTGRES_DSN_ENV = "SIGNLEDGER_TEST_POSTGRES_DSN"
+DEFAULT_POSTGRES_DSN = "postgresql://postgres@localhost:5432/signledger_test"
+
+
+def _postgres_dsn():
+    return os.environ.get(POSTGRES_DSN_ENV, DEFAULT_POSTGRES_DSN)
+
+
+def _require_postgres():
+    """Skip - never fail - when no server answers. Reports host:port, never the DSN."""
+    dsn = _postgres_dsn()
+    parts = urlsplit(dsn)
+    host, port = parts.hostname or "localhost", parts.port or 5432
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            pass
+    except OSError as err:
+        pytest.skip(f"no live PostgreSQL server at {host}:{port} ({type(err).__name__})")
+    return dsn
+
+
+class DurableStore:
+    """A live on-disk backend, plus the two moves an insider with database access has.
+
+    ``disarm`` and ``rewrite`` are issued over a **separate connection** in raw SQL, which
+    is the only honest way to test this: the backend's own API cannot perform either, and
+    that is precisely what the append-only guard is for.
+    """
+
+    def __init__(self, backend, disarm, rewrite, close):
+        self.backend = backend
+        self.disarm = disarm
+        self.rewrite = rewrite
+        self._close = close
+
+    def close(self):
+        self._close()
+
+
+def _make_sqlite_store(tmp_path, index):
+    from signledger.backends.sqlite import SQLiteBackend
+
+    path = str(tmp_path / f"assurance-{index}.db")
+    backend = SQLiteBackend(path)
+    table = backend.entries_table
+
+    def disarm():
+        """Drop every append-only trigger on the entries table, as a DBA would."""
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            cursor = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+                (table,),
+            )
+            names = [str(row[0]) for row in cursor.fetchall()]
+            cursor.close()
+            for name in names:
+                connection.execute(f"DROP TRIGGER {name}").close()
+            connection.commit()
+        return names
+
+    def rewrite(sequence, payload):
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            connection.execute(
+                f"UPDATE {table} SET data = ? WHERE sequence = ?", (payload, sequence)
+            ).close()
+            connection.commit()
+
+    return DurableStore(backend, disarm, rewrite, backend.close)
+
+
+def _make_postgres_store(tmp_path, index):
+    psycopg = pytest.importorskip("psycopg", reason="psycopg (v3) is not installed")
+    from psycopg import sql
+
+    from signledger.backends.postgresql import PostgresBackend
+
+    dsn = _require_postgres()
+    prefix = f"sl_{uuid.uuid4().hex[:10]}_{index}"
+    backend = PostgresBackend(
+        dsn, entries_table=f"{prefix}_entries", checkpoints_table=f"{prefix}_checkpoints"
+    )
+    table = backend.entries_table
+
+    def disarm():
+        with psycopg.connect(dsn, autocommit=True) as connection:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+                    "WHERE c.relname = %s AND NOT t.tgisinternal",
+                    (table,),
+                )
+                names = [str(row[0]) for row in cur.fetchall()]
+                for name in names:
+                    cur.execute(
+                        sql.SQL("DROP TRIGGER {trigger} ON {entries}").format(
+                            trigger=sql.Identifier(name), entries=sql.Identifier(table)
+                        )
+                    )
+        return names
+
+    def rewrite(sequence, payload):
+        with psycopg.connect(dsn, autocommit=True) as connection:
+            with connection.cursor() as cur:
+                cur.execute(
+                    sql.SQL("UPDATE {entries} SET data = %s WHERE sequence = %s").format(
+                        entries=sql.Identifier(table)
+                    ),
+                    (payload, sequence),
+                )
+
+    def close():
+        backend.close()
+        with psycopg.connect(dsn, autocommit=True) as connection:
+            with connection.cursor() as cur:
+                for name in (backend.entries_table, backend.checkpoints_table):
+                    cur.execute(
+                        sql.SQL("DROP TABLE IF EXISTS {name} CASCADE").format(
+                            name=sql.Identifier(name)
+                        )
+                    )
+                cur.execute(
+                    sql.SQL("DROP FUNCTION IF EXISTS {name}() CASCADE").format(
+                        name=sql.Identifier(backend.append_only_function)
+                    )
+                )
+
+    return DurableStore(backend, disarm, rewrite, close)
+
+
+_DURABLE_MAKERS = {"sqlite": _make_sqlite_store, "postgres": _make_postgres_store}
+
+
+@pytest.fixture(
+    params=[
+        pytest.param("sqlite", id="sqlite"),
+        pytest.param("postgres", id="postgres", marks=pytest.mark.postgres),
+    ]
+)
+def durable(request, tmp_path):
+    """Factory: a fresh live on-disk store of the parametrized kind, torn down after."""
+    made = []
+
+    def _make():
+        store = _DURABLE_MAKERS[request.param](tmp_path, len(made))
+        made.append(store)
+        return store
+
+    try:
+        yield _make
+    finally:
+        for store in made:
+            store.close()
+
+
+@pytest.fixture
+def external_anchor(tmp_path):
+    """A sink outside the ledger's own database - the only kind that can confer ANCHORED."""
+    from signledger.anchor.sinks import FileAnchorSink
+
+    return FileAnchorSink(str(tmp_path / "external-anchor.jsonl"))
+
+
+def test_a_fresh_on_disk_store_really_does_enforce_append_only(durable):
+    """The premise for everything below. If this token were not real on these stores,
+    every WORM assertion here would be measuring a claim rather than a guarantee."""
+    store = durable()
+
+    assert CAP_APPEND_ONLY_ENFORCED in store.backend.capabilities()
+
+
+def test_an_unsigned_ledger_on_an_append_only_store_still_earns_only_chain_only(durable):
+    """The store genuinely enforces append-only here - unlike MemoryBackend, where this
+    same assertion cannot tell "capabilities do not upgrade unearned assurance" from
+    "there was no capability to upgrade with"."""
+    store = durable()
+
+    with Ledger(store.backend) as ledger:
+        ledger.append({"event": "opened"})
+
+        assert ledger.assurance_level() is AssuranceLevel.CHAIN_ONLY
+
+
+def test_a_signed_ledger_with_no_anchor_earns_signed_on_a_real_store(durable, signer):
+    store = durable()
+
+    with Ledger(store.backend, enable_signatures=True, signer=signer) as ledger:
+        ledger.append({"event": "opened"})
+
+        assert ledger.assurance_level() is AssuranceLevel.SIGNED
+
+
+def test_a_checkpoint_kept_in_the_ledgers_own_database_is_not_an_anchor(durable, signer):
+    """Anyone who can truncate the chain can delete the local record of how long it was.
+    A checkpoint only anchors anything once it is somewhere they do not control."""
+    store = durable()
+
+    with Ledger(store.backend, enable_signatures=True, signer=signer) as ledger:
+        ledger.append({"event": "opened"})
+        ledger.checkpoint()
+
+        assert ledger.assurance_level() is AssuranceLevel.SIGNED
+
+
+def test_an_externally_anchored_signed_ledger_on_a_guarded_store_earns_worm(
+    durable, signer, external_anchor
+):
+    store = durable()
+
+    with Ledger(
+        store.backend, enable_signatures=True, signer=signer, anchor_sink=external_anchor
+    ) as ledger:
+        ledger.append({"event": "opened"})
+        ledger.checkpoint()
+
+        assert ledger.assurance_level() is AssuranceLevel.WORM
+
+
+def test_removing_the_append_only_guard_downgrades_worm_to_anchored(
+    durable, signer, external_anchor
+):
+    """ANCHORED, on a real on-disk store, at last.
+
+    SQLite and Postgres arm the guard when they create the entries table, so a healthy
+    signed-and-anchored deployment reports WORM and skips straight past ANCHORED. The
+    level is what remains after somebody with DDL rights removes the guard - and saying
+    so, instead of continuing to say WORM, is the entire reason ``capabilities()`` probes
+    the catalog. It used to assert the token unconditionally, which made this pair
+    indistinguishable and ANCHORED unreachable on disk.
+    """
+    store = durable()
+
+    with Ledger(
+        store.backend, enable_signatures=True, signer=signer, anchor_sink=external_anchor
+    ) as ledger:
+        ledger.append({"event": "opened"})
+        ledger.checkpoint()
+        before = ledger.assurance_level()
+        store.disarm()
+
+        assert (before, ledger.assurance_level()) == (
+            AssuranceLevel.WORM,
+            AssuranceLevel.ANCHORED,
+        )
+
+
+def test_a_row_rewritten_behind_the_ledger_earns_no_assurance(durable, signer, external_anchor):
+    store = durable()
+
+    with Ledger(
+        store.backend, enable_signatures=True, signer=signer, anchor_sink=external_anchor
+    ) as ledger:
+        ledger.append({"event": "opened"})
+        ledger.append({"event": "second"})
+        ledger.checkpoint()
+        store.disarm()
+        store.rewrite(1, '{"event": "forged"}')
+
+        assert ledger.assurance_level() is AssuranceLevel.NONE
+
+
+def test_a_row_rewritten_behind_the_ledger_is_reported_as_a_bad_hash(durable, signer):
+    """An UPDATE the guard would have refused, once the guard is gone."""
+    store = durable()
+
+    with Ledger(store.backend, enable_signatures=True, signer=signer) as ledger:
+        ledger.append({"event": "opened"})
+        ledger.append({"event": "second"})
+        store.disarm()
+        store.rewrite(1, '{"event": "forged"}')
+
+        assert FailureKind.BAD_HASH in kinds(ledger.check_integrity())
+
+
+def test_every_assurance_level_is_reachable_on_a_real_on_disk_store(
+    durable, signer, external_anchor
+):
+    """Contract section 1 names five levels. All five, observed on a live store.
+
+    ANCHORED had only ever been seen on MemoryBackend, and on SQLite it was unreachable by
+    construction while ``capabilities()`` asserted ``append_only_enforced`` instead of
+    probing for it. This walks one signed ledger down the lattice: anchor it, remove the
+    guard, then rewrite a row.
+    """
+    observed = []
+
+    unsigned = durable()
+    with Ledger(unsigned.backend) as ledger:
+        ledger.append({"event": "unsigned"})
+        observed.append(ledger.assurance_level())
+
+    guarded = durable()
+    with Ledger(
+        guarded.backend, enable_signatures=True, signer=signer, anchor_sink=external_anchor
+    ) as ledger:
+        ledger.append({"event": "signed"})
+        observed.append(ledger.assurance_level())
+        ledger.checkpoint()
+        observed.append(ledger.assurance_level())
+        guarded.disarm()
+        observed.append(ledger.assurance_level())
+        guarded.rewrite(0, '{"event": "forged"}')
+        observed.append(ledger.assurance_level())
+
+    assert observed == [
+        AssuranceLevel.CHAIN_ONLY,
+        AssuranceLevel.SIGNED,
+        AssuranceLevel.WORM,
+        AssuranceLevel.ANCHORED,
+        AssuranceLevel.NONE,
+    ]
+
+
+def test_a_ledger_whose_resolver_lacks_the_signing_key_reports_unknown_key_on_a_real_store(
+    durable, signer, stranger_resolver
+):
+    """Key rotation that dropped the retired public key, end to end through the API an
+    operator actually calls."""
+    store = durable()
+
+    with Ledger(
+        store.backend, enable_signatures=True, signer=signer, key_resolver=stranger_resolver
+    ) as ledger:
+        ledger.append({"event": "opened"})
+        report = ledger.check_integrity()
+
+    assert kinds(report) == [FailureKind.UNKNOWN_KEY]
+
+
+def test_a_ledger_whose_resolver_lacks_the_signing_key_is_not_ok_on_a_real_store(
+    durable, signer, stranger_resolver
+):
+    store = durable()
+
+    with Ledger(
+        store.backend, enable_signatures=True, signer=signer, key_resolver=stranger_resolver
+    ) as ledger:
+        ledger.append({"event": "opened"})
+        report = ledger.check_integrity()
+
+    assert report.ok is False

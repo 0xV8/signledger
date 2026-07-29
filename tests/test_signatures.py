@@ -15,8 +15,10 @@ from signledger.crypto.signatures import (
     RSASigner,
     Signer,
     _missing_dependency_error,
+    compute_key_id,
     get_private_key_pem,
     load_pem_private_key,
+    load_pem_public_key,
     signing_payload,
     verify,
 )
@@ -676,3 +678,314 @@ def test_missing_dependency_error_names_the_extra_and_keeps_the_original_cause()
 
     assert "signledger[signatures]" in str(error)
     assert error.__cause__ is cause
+
+
+# ---------------------------------------------------------------------------------
+# Mutation-sweep hardening
+#
+# Everything below kills a specific mutant that survived the sweep required by
+# docs/ARCHITECTURE.md section 11. Each test names the production edit it catches.
+# ---------------------------------------------------------------------------------
+
+
+def test_verify_refuses_a_signature_string_that_is_not_strict_base64() -> None:
+    """Kills ``b64decode(signature, validate=True)`` -> ``validate=False``.
+
+    Without ``validate=True`` base64 silently *discards* every non-alphabet character, so
+    ``sig`` and ``sig`` with a newline (or a comma, or a smiley) spliced into the middle
+    decode to the same bytes and both verify. That is signature malleability: the entry a
+    store holds no longer has one canonical signature string, so two rows that disagree
+    byte for byte both pass verification and a diff between replicas is unresolvable.
+    """
+    signer = Ed25519Signer.generate()
+    payload = signing_payload("ledger-a", "aa" * 32)
+    signature = signer.sign(payload)
+    assert verify(payload, signature, signer.public_key) is True
+
+    smuggled = signature[:8] + "\n" + signature[8:]
+    # Guard the premise: a lenient decoder really does read these as the same signature.
+    assert base64.b64decode(smuggled) == base64.b64decode(signature, validate=True)
+
+    assert verify(payload, smuggled, signer.public_key) is False
+
+
+@pytest.mark.parametrize("junk", ["\n", " ", ",", "*"])
+def test_verify_refuses_every_flavour_of_smuggled_non_alphabet_character(junk: str) -> None:
+    signer = Ed25519Signer.generate()
+    payload = signing_payload("ledger-a", "bb" * 32)
+    signature = signer.sign(payload)
+
+    assert verify(payload, signature[:8] + junk + signature[8:], signer.public_key) is False
+
+
+# ---------------------------------------------------------------------------------
+# load_pem_public_key: the verifying half of the key pair
+# ---------------------------------------------------------------------------------
+
+
+def test_load_pem_public_key_round_trips_a_text_pem() -> None:
+    """Nothing in this file exercised the public-key loader with cryptography present.
+
+    Every mutation of it - including ``raw = None``, which turns it into a TypeError -
+    survived the sweep because the only call site was the "extra is missing" probe.
+    """
+    signer = Ed25519Signer.generate()
+
+    assert compute_key_id(load_pem_public_key(signer.public_key_pem())) == signer.key_id
+
+
+def test_load_pem_public_key_round_trips_a_bytes_pem() -> None:
+    signer = Ed25519Signer.generate()
+
+    reloaded = load_pem_public_key(signer.public_key_pem().encode("ascii"))
+
+    assert compute_key_id(reloaded) == signer.key_id
+
+
+@pytest.mark.parametrize("curve", ["p256", "p384", "p521"])
+def test_a_signature_verifies_against_a_public_key_reloaded_from_its_pem(curve: str) -> None:
+    """End to end: the loader must return a key that actually verifies, not merely an
+    object. ``cast(PublicKey, None)`` is a returned-nothing mutant a key_id check alone
+    would catch, but only this proves the loaded key is the verifying key."""
+    signer = ECDSASigner.generate(curve=curve)
+    payload = signing_payload("ledger-a", "cc" * 32)
+    signature = signer.sign(payload)
+
+    assert verify(payload, signature, load_pem_public_key(signer.public_key_pem())) is True
+
+
+def test_load_pem_public_key_reports_a_malformed_pem_as_a_configuration_error() -> None:
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_pem_public_key(b"not a pem at all")
+
+    assert str(excinfo.value) == (
+        "public key could not be loaded; the PEM may be malformed or the key may use "
+        "an algorithm this build does not support"
+    )
+
+
+def test_load_pem_public_key_rejects_a_private_key_pem() -> None:
+    """A private key PEM in a public-key slot is a configuration mistake, not a crash."""
+    signer = Ed25519Signer.generate()
+    private_pem = get_private_key_pem(signer._private_key, allow_unencrypted=True)
+
+    with pytest.raises(ConfigurationError, match="public key could not be loaded"):
+        load_pem_public_key(private_pem)
+
+
+# ---------------------------------------------------------------------------------
+# Documented defaults
+# ---------------------------------------------------------------------------------
+
+
+def test_rsa_generate_defaults_to_a_3072_bit_key() -> None:
+    """Kills ``key_size: int = 3072`` -> any materially different size.
+
+    Every other RSA test in this file passes ``key_size=2048`` explicitly, so the shipped
+    default was never exercised at all. (A one-bit edit to 3073 is *not* caught, and is a
+    genuinely equivalent mutation: OpenSSL normalises the requested modulus size back to
+    3072, so no observable behaviour changes.)
+    """
+    assert RSASigner.generate().public_key.key_size == 3072
+
+
+def test_ecdsa_generate_defaults_to_p256() -> None:
+    """Kills ``curve: str = "p256"`` -> anything the alias table does not know. Every
+    ECDSA test in this file names a curve, so the default was never exercised."""
+    assert ECDSASigner.generate().algorithm == "ecdsa-p256-sha256"
+
+
+def test_ecdsa_constructor_defaults_to_p256() -> None:
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    assert ECDSASigner(ec.generate_private_key(ec.SECP256R1())).algorithm == "ecdsa-p256-sha256"
+
+
+def test_ecdsa_from_pem_defaults_to_p256() -> None:
+    signer = ECDSASigner.generate(curve="p256")
+    pem = get_private_key_pem(signer._private_key, password=b"pw")
+
+    assert ECDSASigner.from_pem(pem, password=b"pw").key_id == signer.key_id
+
+
+# ---------------------------------------------------------------------------------
+# Diagnostics: what every refusal above actually tells the operator
+#
+# A `match=` on one word passes against a message that has been mangled to anything still
+# containing that word. Each message below survived the sweep re-worded, re-cased, or
+# replaced outright by `None`.
+# ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ledger_id", "entry_hash", "expected"),
+    [
+        ("", "00ff", "ledger_id must not be empty"),
+        (
+            "led\x00ger",
+            "00ff",
+            "ledger_id must not contain a NUL byte; NUL is the field separator and an "
+            "embedded one would make the signed payload ambiguous",
+        ),
+        ("ledger-a", "", "entry hash must not be empty; seal the entry before signing"),
+        ("ledger-a", "zzzz", "entry hash must be an even-length hexadecimal string"),
+        ("ledger-a", "abc", "entry hash must be an even-length hexadecimal string"),
+        ("ledger-a", "00 ff", "entry hash must be an even-length hexadecimal string"),
+    ],
+)
+def test_signing_payload_refusals_carry_their_documented_message(
+    ledger_id: str, entry_hash: str, expected: str
+) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        signing_payload(ledger_id, entry_hash)
+
+    assert str(excinfo.value) == expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "type_name"),
+    [("deadbeef", "str"), (bytearray(b"x"), "bytearray"), (None, "NoneType")],
+)
+def test_a_non_bytes_payload_is_named_by_type_and_pointed_at_the_builder(
+    payload: object, type_name: str
+) -> None:
+    signer = Ed25519Signer.generate()
+
+    with pytest.raises(TypeError) as excinfo:
+        signer.sign(payload)  # type: ignore[arg-type]
+
+    assert str(excinfo.value) == (
+        f"payload must be bytes, not {type_name}; "
+        "build it with signing_payload(ledger_id, entry_hash_hex)"
+    )
+
+
+def test_verify_names_the_actual_key_type_it_cannot_use() -> None:
+    from cryptography.hazmat.primitives.asymmetric import x25519
+
+    key = x25519.X25519PrivateKey.generate().public_key()
+
+    with pytest.raises(SignatureError) as excinfo:
+        verify(b"payload", base64.b64encode(b"sig").decode(), key)
+
+    assert str(excinfo.value) == (
+        "unsupported public key type X25519PublicKey; "
+        "expected an RSA, elliptic-curve or Ed25519 public key"
+    )
+
+
+def test_a_malformed_private_key_pem_reports_the_three_things_it_could_be() -> None:
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_pem_private_key(b"not a pem at all")
+
+    assert str(excinfo.value) == (
+        "private key could not be loaded; the PEM may be malformed, the password may "
+        "be wrong, or the key may use an unsupported encryption algorithm"
+    )
+
+
+def test_a_password_mismatch_reports_both_directions_of_the_mismatch() -> None:
+    signer = Ed25519Signer.generate()
+    encrypted = get_private_key_pem(signer._private_key, password=b"correct horse")
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_pem_private_key(encrypted.encode())
+
+    assert str(excinfo.value) == (
+        "private key password mismatch: an encrypted key needs a password and a "
+        "plaintext key must not be given one"
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        (
+            {},
+            "refusing to write a plaintext private key: pass a password, or pass "
+            "allow_unencrypted=True to opt in explicitly",
+        ),
+        (
+            {"password": b"pw", "allow_unencrypted": True},
+            "pass either a password or allow_unencrypted=True, not both; the intent of "
+            "passing both is ambiguous",
+        ),
+        ({"password": b""}, "private key password must not be empty"),
+    ],
+)
+def test_private_key_serialization_refusals_carry_their_documented_message(
+    kwargs: dict, expected: str
+) -> None:
+    signer = Ed25519Signer.generate()
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        get_private_key_pem(signer._private_key, **kwargs)
+
+    assert str(excinfo.value) == expected
+
+
+def test_a_wrong_key_type_names_both_the_signer_and_the_key_it_was_handed() -> None:
+    """``match="RSAPrivateKey"`` only pins the *expected* type, which is spelled by the
+    class the signer asks for. The signer's own name and the type that actually arrived
+    both survived the sweep replaced by ``NoneType``."""
+    other = Ed25519Signer.generate()
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        RSASigner(other._private_key)
+
+    assert str(excinfo.value) == "RSASigner needs a RSAPrivateKey, got Ed25519PrivateKey"
+
+
+def test_a_weak_rsa_key_is_refused_with_the_size_it_had_and_the_size_required() -> None:
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    weak = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        RSASigner(weak)
+
+    assert str(excinfo.value) == (
+        "RSA key size 1024 is below the 2048-bit minimum SignLedger will sign with"
+    )
+
+
+def test_rsa_generate_refuses_a_weak_size_with_the_same_message() -> None:
+    with pytest.raises(ConfigurationError) as excinfo:
+        RSASigner.generate(key_size=1024)
+
+    assert str(excinfo.value) == (
+        "RSA key size 1024 is below the 2048-bit minimum SignLedger will sign with"
+    )
+
+
+def test_a_curve_mismatch_says_what_to_do_about_it() -> None:
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        ECDSASigner(ec.generate_private_key(ec.SECP256R1()), curve="p384")
+
+    assert str(excinfo.value) == (
+        "ECDSA key is on curve 'secp256r1' but 'secp384r1' was requested; "
+        "load a key on the requested curve rather than silently using the other one"
+    )
+
+
+def test_an_unknown_curve_is_refused_with_the_list_of_curves_that_work() -> None:
+    with pytest.raises(ConfigurationError) as excinfo:
+        ECDSASigner.generate(curve="p192")
+
+    assert str(excinfo.value) == (
+        "unsupported ECDSA curve 'p192'; choose one of "
+        "['secp256r1', 'secp384r1', 'secp521r1']"
+    )
+
+
+def test_missing_dependency_error_spells_the_whole_install_command() -> None:
+    """``"signledger[signatures]" in str(error)`` still passes against a message whose
+    prose has been mangled around it; the point of the message is the command."""
+    error = _missing_dependency_error(ImportError("No module named 'cryptography'"))
+
+    assert str(error) == (
+        "signledger signatures require the optional 'cryptography' dependency; "
+        "install it with: pip install 'signledger[signatures]'"
+    )
