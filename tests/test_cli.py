@@ -2,19 +2,25 @@
 
 import base64
 import contextlib
+import hashlib
 import json
 import os
+import re
+import socket
 import sqlite3
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Iterator, List, Tuple
+from urllib.parse import urlsplit
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 
+from signledger import __version__
 from signledger.anchor.sinks import FileAnchorSink
 from signledger.backends.base import entry_to_row
 from signledger.backends.memory import MemoryBackend
@@ -1863,11 +1869,17 @@ def test_a_bundle_can_be_verified_from_a_sequence_onwards(tmp_path: Any, capsys:
 def test_a_bundle_exported_from_a_tampered_ledger_does_not_verify(
     tmp_path: Any, capsys: Any
 ) -> None:
+    """``--force`` overrides the refusal to export, and nothing else.
+
+    Exporting a broken ledger is refused by default (an operator archiving on a schedule
+    needs the signal), but forensics needs the evidence out of the store - so the escape
+    hatch exists, and what comes out of it still fails verification.
+    """
     path = tmp_path / "ledger.db"
     bundle = tmp_path / "bundle.json"
     write_ledger(path, count=3)
     rewrite_payload(path, 1, '{"event":"created","index":999}')
-    export_bundle(path, bundle, capsys)
+    export_bundle(path, bundle, capsys, "--force")
 
     code, _, _ = run(["verify-bundle", str(bundle)], capsys)
 
@@ -3472,3 +3484,823 @@ def test_an_empty_password_variable_is_reported_as_unset_not_as_a_passphrase(
     assert code == EXIT_ERROR
     assert "SL_EMPTY_PASS" in err
     assert "empty" in err
+
+
+# ======================================================================================
+# naming the store: the database, the table and the collection
+#
+# Everything below was reproduced by a consumer project running against a live server.
+# A CLI that cannot be pointed at the store the library was pointed at is a CLI that
+# reports on some *other* store - which is worse than not answering at all.
+# ======================================================================================
+
+POSTGRES_DSN_ENV = "SIGNLEDGER_TEST_POSTGRES_DSN"
+DEFAULT_POSTGRES_DSN = "postgresql://postgres@localhost:5432/signledger_test"
+
+MONGO_URI_ENV = "SIGNLEDGER_TEST_MONGO_URI"
+DEFAULT_MONGO_URI = "mongodb://localhost:27017"
+
+
+def store_prefix() -> str:
+    """A table/collection prefix no other module in the suite uses."""
+    return "slcli_" + uuid.uuid4().hex[:12]
+
+
+def _require_server(url: str, default_port: int, label: str) -> str:
+    """Skip - never fail - when no live server answers. Names host:port, never the URI."""
+    parts = urlsplit(url)
+    host, port = parts.hostname or "localhost", parts.port or default_port
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            pass
+    except OSError as err:
+        pytest.skip(f"no live {label} server at {host}:{port} ({type(err).__name__})")
+    return url
+
+
+@pytest.fixture
+def pg_store(request: Any) -> Iterator[Tuple[str, str]]:
+    """A live PostgreSQL DSN plus a table prefix nothing else touches."""
+    pytest.importorskip("psycopg", reason="psycopg (v3) is not installed")
+    import psycopg
+    from psycopg import sql
+
+    dsn = _require_server(
+        os.environ.get(POSTGRES_DSN_ENV, DEFAULT_POSTGRES_DSN), 5432, "PostgreSQL"
+    )
+    prefix = store_prefix()
+    try:
+        yield dsn, prefix
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
+                    "AND tablename LIKE %s",
+                    (prefix + "%",),
+                )
+                for (name,) in cursor.fetchall():
+                    cursor.execute(
+                        sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(name))
+                    )
+
+
+@pytest.fixture
+def mongo_store() -> Iterator[Tuple[str, str, str]]:
+    """A live MongoDB URI, a throwaway *database* and a collection prefix.
+
+    The database is deliberately never ``signledger`` - the backend's own default is
+    exactly what a URI-borne database name has to be able to override.
+    """
+    pytest.importorskip("pymongo", reason="pymongo is not installed")
+    import pymongo
+
+    uri = _require_server(os.environ.get(MONGO_URI_ENV, DEFAULT_MONGO_URI), 27017, "MongoDB")
+    database = "signledger_test_" + uuid.uuid4().hex[:12]
+    try:
+        yield uri, database, store_prefix()
+    finally:
+        with pymongo.MongoClient(uri, serverSelectionTimeoutMS=1500) as client:
+            client.drop_database(database)
+
+
+def mongo_uri_for(uri: str, database: str) -> str:
+    """The URI an operator writes when they mean *that* database."""
+    return uri.rstrip("/") + "/" + database
+
+
+def write_postgres_ledger(dsn: str, prefix: str, count: int = 3) -> str:
+    """A real PostgreSQL ledger on tables only this test knows about."""
+    from signledger.backends.postgresql import PostgresBackend
+
+    ledger = Ledger(
+        PostgresBackend(
+            dsn,
+            entries_table=f"{prefix}_entries",
+            checkpoints_table=f"{prefix}_checkpoints",
+        )
+    )
+    try:
+        for index in range(count):
+            ledger.append({"event": "created", "index": index})
+        return ledger.ledger_id
+    finally:
+        ledger.close()
+
+
+def write_mongo_ledger(uri: str, database: str, count: int = 3, **named: str) -> str:
+    """A real MongoDB ledger in ``database``, on whichever collections were named."""
+    from signledger.backends.mongodb import MongoBackend
+
+    ledger = Ledger(MongoBackend(uri, database=database, **named))
+    try:
+        for index in range(count):
+            ledger.append({"event": "created", "index": index})
+        return ledger.ledger_id
+    finally:
+        ledger.close()
+
+
+# --------------------------------------------------------------------------------------
+# C1 - the database component of a mongodb URI
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.mongo
+def test_the_database_a_mongodb_uri_names_is_the_database_that_is_opened(
+    mongo_store: Tuple[str, str, str],
+) -> None:
+    """The URI said one database and the backend opened another one, silently.
+
+    ``MongoBackend`` defaults to ``database="signledger"``, and the CLI passed no
+    ``database=`` at all - so every mongodb URI, whatever it named, was answered from
+    ``signledger``.
+    """
+    uri, database, _ = mongo_store
+
+    backend = open_backend(mongo_uri_for(uri, database))
+    try:
+        assert backend.database_name == database
+    finally:
+        backend.close()
+
+
+@pytest.mark.mongo
+def test_verify_reports_the_ledger_that_lives_in_the_database_the_uri_names(
+    mongo_store: Tuple[str, str, str], capsys: Any
+) -> None:
+    """The worst failure this project has: VERIFIED, exit 0, about a different store."""
+    uri, database, _ = mongo_store
+    ledger_id = write_mongo_ledger(uri, database, count=3)
+
+    code, out, _ = run(["verify", "-b", mongo_uri_for(uri, database), "--json"], capsys)
+
+    report = json.loads(out)
+    assert (code, report["ledger_id"], report["entries_verified"]) == (EXIT_OK, ledger_id, 3)
+
+
+@pytest.mark.mongo
+def test_a_mongodb_uri_without_a_database_still_opens_the_default_one(
+    mongo_store: Tuple[str, str, str],
+) -> None:
+    """A URI that names no database is not an error; it means "the default"."""
+    uri, _, prefix = mongo_store
+
+    backend = open_backend(uri, entries_table=f"{prefix}_entries")
+    try:
+        assert backend.database_name == "signledger"
+    finally:
+        backend.close()
+        import pymongo
+
+        with pymongo.MongoClient(uri, serverSelectionTimeoutMS=1500) as client:
+            for name in client["signledger"].list_collection_names():
+                if name.startswith(prefix):
+                    client["signledger"].drop_collection(name)
+
+
+# --------------------------------------------------------------------------------------
+# C2 - addressing a table or collection that is not the default
+# --------------------------------------------------------------------------------------
+
+
+def test_verify_can_be_pointed_at_a_non_default_sqlite_table(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """``entries_table=`` is a documented constructor argument. The CLI had no flag."""
+    path = tmp_path / "ledger.db"
+    ledger = Ledger(
+        SQLiteBackend(
+            str(path), entries_table="audit_entries", checkpoints_table="audit_checkpoints"
+        )
+    )
+    try:
+        for index in range(3):
+            ledger.append({"event": "created", "index": index})
+        ledger_id = ledger.ledger_id
+    finally:
+        ledger.close()
+
+    code, out, _ = run(
+        [
+            "verify",
+            "-b",
+            sqlite_uri(path),
+            "--entries-table",
+            "audit_entries",
+            "--checkpoints-table",
+            "audit_checkpoints",
+            "--json",
+        ],
+        capsys,
+    )
+
+    report = json.loads(out)
+    assert (code, report["ledger_id"], report["entries_verified"]) == (EXIT_OK, ledger_id, 3)
+
+
+def test_a_checkpoint_is_written_to_the_checkpoints_table_that_was_named(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """The checkpoints table has to be addressable too, or `checkpoint` writes elsewhere."""
+    path = tmp_path / "ledger.db"
+    ledger = Ledger(
+        SQLiteBackend(
+            str(path), entries_table="audit_entries", checkpoints_table="audit_checkpoints"
+        )
+    )
+    try:
+        ledger.append({"event": "created"})
+    finally:
+        ledger.close()
+
+    code, _, err = run(
+        [
+            "checkpoint",
+            "-b",
+            sqlite_uri(path),
+            "--entries-table",
+            "audit_entries",
+            "--checkpoints-table",
+            "audit_checkpoints",
+        ],
+        capsys,
+    )
+
+    connection = sqlite3.connect(str(path))
+    try:
+        stored = connection.execute("SELECT COUNT(*) FROM audit_checkpoints").fetchone()[0]
+    finally:
+        connection.close()
+    assert (code, stored) == (EXIT_OK, 1), err
+
+
+def test_the_collection_spelling_of_the_flag_is_accepted_too(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """MongoDB has collections, not tables. One flag, both words."""
+    path = tmp_path / "ledger.db"
+    ledger = Ledger(SQLiteBackend(str(path), entries_table="audit_entries"))
+    try:
+        ledger.append({"event": "created"})
+    finally:
+        ledger.close()
+
+    code, _, err = run(
+        ["verify", "-b", sqlite_uri(path), "--entries-collection", "audit_entries"], capsys
+    )
+
+    assert code == EXIT_OK, err
+
+
+@pytest.mark.postgres
+def test_verify_can_be_pointed_at_a_non_default_postgres_table(
+    pg_store: Tuple[str, str], capsys: Any
+) -> None:
+    """`signledger verify || alert` was unavailable to anyone who named their tables."""
+    dsn, prefix = pg_store
+    ledger_id = write_postgres_ledger(dsn, prefix, count=3)
+
+    code, out, _ = run(
+        [
+            "verify",
+            "-b",
+            dsn,
+            "--entries-table",
+            f"{prefix}_entries",
+            "--checkpoints-table",
+            f"{prefix}_checkpoints",
+            "--json",
+        ],
+        capsys,
+    )
+
+    report = json.loads(out)
+    assert (code, report["ledger_id"], report["entries_verified"]) == (EXIT_OK, ledger_id, 3)
+
+
+@pytest.mark.mongo
+def test_verify_can_be_pointed_at_a_non_default_mongo_collection(
+    mongo_store: Tuple[str, str, str], capsys: Any
+) -> None:
+    dsn, database, prefix = mongo_store
+    ledger_id = write_mongo_ledger(
+        dsn,
+        database,
+        count=3,
+        entries_collection=f"{prefix}_entries",
+        checkpoints_collection=f"{prefix}_checkpoints",
+    )
+
+    code, out, _ = run(
+        [
+            "verify",
+            "-b",
+            mongo_uri_for(dsn, database),
+            "--entries-collection",
+            f"{prefix}_entries",
+            "--checkpoints-collection",
+            f"{prefix}_checkpoints",
+            "--json",
+        ],
+        capsys,
+    )
+
+    report = json.loads(out)
+    assert (code, report["ledger_id"], report["entries_verified"]) == (EXIT_OK, ledger_id, 3)
+
+
+def test_migrate_can_name_the_tables_in_the_target_store(tmp_path: Any, capsys: Any) -> None:
+    """A migration into a named table was impossible; only the source could be addressed."""
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    write_ledger(source, count=3)
+
+    code, _, err = run(
+        [
+            "migrate",
+            "-b",
+            sqlite_uri(source),
+            "--target",
+            sqlite_uri(target),
+            "--target-entries-table",
+            "archive_entries",
+            "--target-checkpoints-table",
+            "archive_checkpoints",
+        ],
+        capsys,
+    )
+
+    connection = sqlite3.connect(str(target))
+    try:
+        moved = connection.execute("SELECT COUNT(*) FROM archive_entries").fetchone()[0]
+    finally:
+        connection.close()
+    assert (code, moved) == (EXIT_OK, 3), err
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "sqlite:audit.db?entries_table=audit_entries",
+        "postgresql://postgres@127.0.0.1:1/nope?checkpoints_table=audit_checkpoints",
+        "mongodb://127.0.0.1:1/db?entries_collection=audit_entries",
+    ],
+    ids=["sqlite", "postgresql", "mongodb"],
+)
+def test_a_table_named_in_the_uri_query_string_is_refused_by_name(uri: str) -> None:
+    """``?entries_table=`` reached libpq and died as ``ProgrammingError``.
+
+    On MongoDB it was worse: pymongo warned, dropped the option and verified the default
+    collection of the default database anyway.
+    """
+    with pytest.raises(ConfigurationError) as caught:
+        open_backend(uri)
+
+    message = str(caught.value)
+    assert "--entries-table" in message
+    assert "--checkpoints-table" in message
+
+
+def test_a_connection_option_postgres_does_not_accept_is_named(capsys: Any) -> None:
+    """A typo in a libpq option used to be ``StorageError: connect failed:
+
+    ProgrammingError`` - which names neither the option nor the fix.
+    """
+    pytest.importorskip("psycopg", reason="psycopg (v3) is not installed")
+
+    code, _, err = run(
+        ["verify", "-b", "postgresql://postgres@127.0.0.1:1/nope?entires_table=x"], capsys
+    )
+
+    assert code == EXIT_ERROR
+    assert "entires_table" in err
+    assert "ProgrammingError" not in err
+
+
+def test_a_connection_option_postgres_does_accept_still_reaches_the_driver() -> None:
+    """Guards the check above: refusing every query parameter would pass that test too."""
+    pytest.importorskip("psycopg", reason="psycopg (v3) is not installed")
+
+    # Port 1 refuses immediately: reaching a *connection* failure is the proof.
+    with pytest.raises(SignLedgerError) as caught:
+        open_backend("postgresql://postgres@127.0.0.1:1/nope?sslmode=disable")
+
+    assert "sslmode" not in str(caught.value)
+
+
+def test_a_postgres_option_refusal_never_echoes_the_password() -> None:
+    pytest.importorskip("psycopg", reason="psycopg (v3) is not installed")
+
+    with pytest.raises(ConfigurationError) as caught:
+        open_backend("postgresql://someone:hunter2@127.0.0.1:1/nope?entries_table=x")
+
+    assert "hunter2" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "named",
+    [
+        {"entries_table": "audit_entries"},
+        {"checkpoints_table": "audit_checkpoints"},
+    ],
+    ids=["entries", "checkpoints"],
+)
+def test_naming_a_table_on_the_memory_backend_is_refused(named: Any) -> None:
+    """The memory backend has no tables. Accepting the flag would silently ignore it."""
+    with pytest.raises(ConfigurationError) as caught:
+        open_backend("memory://", **named)
+
+    assert "memory" in str(caught.value)
+
+
+def test_the_backend_help_says_how_to_name_a_table(capsys: Any) -> None:
+    with pytest.raises(SystemExit):
+        main(["verify", "--help"])
+
+    out = capsys.readouterr().out
+    assert "--entries-table" in out
+    assert "--checkpoints-table" in out
+
+
+# --------------------------------------------------------------------------------------
+# C3 - a read-only command must not provision the store it is reading
+# --------------------------------------------------------------------------------------
+
+
+def test_verify_does_not_create_the_store_it_was_pointed_at(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """An integrity check that writes to what it is checking is not an integrity check.
+
+    Reproduced against PostgreSQL: ``pg_tables`` was empty before ``verify`` and held
+    ``ledger_entries``, ``ledger_checkpoints`` and the append-only trigger after it. The
+    SQLite spelling of the same defect is a 32 KiB database file conjured out of a typo.
+    """
+    missing = tmp_path / "typo.db"
+
+    code, _, err = run(["verify", "-b", sqlite_uri(missing)], capsys)
+
+    assert not missing.exists()
+    assert code == EXIT_ERROR
+    assert "does not exist" in err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["verify"],
+        ["stats"],
+        ["inspect"],
+        ["export", "--bundle", "@out"],
+        ["anchor", "--anchor", "@out", "--show"],
+    ],
+    ids=["verify", "stats", "inspect", "export", "anchor-show"],
+)
+def test_a_read_only_command_refuses_a_store_that_does_not_exist(
+    argv: List[str], tmp_path: Any, capsys: Any
+) -> None:
+    missing = tmp_path / "typo.db"
+    filled = [str(tmp_path / "written") if word == "@out" else word for word in argv]
+
+    code, _, err = run([*filled, "-b", sqlite_uri(missing)], capsys)
+
+    assert (code, missing.exists()) == (EXIT_ERROR, False)
+    assert "does not exist" in err
+
+
+def test_the_refusal_to_open_a_missing_store_names_the_path(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """"It does not exist" is only actionable if it says *what* does not exist."""
+    missing = tmp_path / "typo.db"
+
+    _, _, err = run(["verify", "-b", sqlite_uri(missing)], capsys)
+
+    assert str(missing) in err
+
+
+def test_a_read_only_command_refuses_a_throwaway_in_memory_sqlite_database(
+    capsys: Any,
+) -> None:
+    """``sqlite://`` is a database that is created empty on the spot. Nothing to verify."""
+    code, _, err = run(["verify", "-b", "sqlite://"], capsys)
+
+    assert code == EXIT_ERROR
+    assert "in-memory" in err
+
+
+def test_checkpoint_still_creates_the_store_it_writes_to(tmp_path: Any, capsys: Any) -> None:
+    """Guards the refusals above: a *write* command may provision what it writes to."""
+    path = tmp_path / "new.db"
+
+    code, _, err = run(["checkpoint", "-b", sqlite_uri(path)], capsys)
+
+    assert path.exists()
+    # ... and then refuses, because an empty ledger has no head to record.
+    assert (code, "empty" in err) == (EXIT_ERROR, True)
+
+
+def test_migrate_refuses_a_source_store_that_does_not_exist(
+    tmp_path: Any, capsys: Any
+) -> None:
+    missing = tmp_path / "typo.db"
+
+    code, _, err = run(
+        ["migrate", "-b", sqlite_uri(missing), "--target", sqlite_uri(tmp_path / "t.db")],
+        capsys,
+    )
+
+    assert (code, missing.exists()) == (EXIT_ERROR, False)
+    assert "does not exist" in err
+
+
+def test_migrate_still_creates_the_target_it_is_asked_to_fill(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """Guards the refusal above: the target of a migration is meant to be created."""
+    source = tmp_path / "source.db"
+    target = tmp_path / "target.db"
+    write_ledger(source, count=2)
+
+    code, _, err = run(
+        ["migrate", "-b", sqlite_uri(source), "--target", sqlite_uri(target)], capsys
+    )
+
+    assert (code, target.exists()) == (EXIT_OK, True), err
+
+
+def database_digest(path: Any) -> str:
+    """Every byte of the SQLite file, so "wrote nothing" means exactly that."""
+    with open(str(path), "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def journal_mode(path: Any) -> str:
+    """The journal mode recorded in the file's own header."""
+    connection = sqlite3.connect(str(path))
+    try:
+        return str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["verify"],
+        ["stats"],
+        ["inspect", "--forks"],
+        ["export", "--bundle", "@out"],
+        ["anchor", "--anchor", "@out", "--show"],
+    ],
+    ids=["verify", "stats", "inspect", "export", "anchor-show"],
+)
+def test_a_read_only_command_leaves_an_existing_store_byte_identical(
+    argv: List[str], tmp_path: Any, capsys: Any
+) -> None:
+    """Not merely "creates no tables": the file itself must come back unchanged.
+
+    ``PRAGMA journal_mode = WAL`` is a write to the database header, and it ran on every
+    open - so even a ``verify`` against a store that already existed rewrote the file it
+    was checking.
+    """
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=3)
+    filled = [str(tmp_path / "written") if word == "@out" else word for word in argv]
+    before = database_digest(path)
+
+    run([*filled, "-b", sqlite_uri(path)], capsys)
+
+    assert database_digest(path) == before
+
+
+def test_verify_does_not_switch_the_store_into_wal_mode(tmp_path: Any, capsys: Any) -> None:
+    """A rollback-journal ledger stays one. The journal mode is the operator's choice."""
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=3)
+    connection = sqlite3.connect(str(path))
+    connection.execute("PRAGMA journal_mode = DELETE").fetchall()
+    connection.close()
+
+    code, _, err = run(["verify", "-b", sqlite_uri(path)], capsys)
+
+    assert (code, journal_mode(path)) == (EXIT_OK, "delete"), err
+
+
+# --------------------------------------------------------------------------------------
+# C4 - export must not archive a ledger that does not verify
+# --------------------------------------------------------------------------------------
+
+
+def test_export_refuses_a_ledger_that_does_not_verify(tmp_path: Any, capsys: Any) -> None:
+    """``checkpoint`` refuses and exits 1. ``export`` printed a merkle root and exited 0.
+
+    An operator scripting `signledger export -o nightly.json` got no signal at all.
+    """
+    path = tmp_path / "ledger.db"
+    bundle = tmp_path / "bundle.json"
+    write_ledger(path, count=3)
+    rewrite_payload(path, 1, '{"event":"created","index":999}')
+
+    code, out, _ = run(
+        ["export", "-b", sqlite_uri(path), "--bundle", str(bundle)], capsys
+    )
+
+    assert code == EXIT_INVALID
+    assert "refusing to export" in out
+
+
+def test_the_refused_export_writes_no_bundle(tmp_path: Any, capsys: Any) -> None:
+    path = tmp_path / "ledger.db"
+    bundle = tmp_path / "bundle.json"
+    write_ledger(path, count=3)
+    rewrite_payload(path, 1, '{"event":"created","index":999}')
+
+    run(["export", "-b", sqlite_uri(path), "--bundle", str(bundle)], capsys)
+
+    assert not bundle.exists()
+
+
+def test_the_refusal_to_export_says_how_to_override_it(tmp_path: Any, capsys: Any) -> None:
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=3)
+    rewrite_payload(path, 1, '{"event":"created","index":999}')
+
+    _, out, _ = run(
+        ["export", "-b", sqlite_uri(path), "--bundle", str(tmp_path / "b.json")], capsys
+    )
+
+    assert "--force" in out
+
+
+def test_the_refused_export_reports_what_it_found_as_json(
+    tmp_path: Any, capsys: Any
+) -> None:
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=3)
+    rewrite_payload(path, 1, '{"event":"created","index":999}')
+
+    _, out, _ = run(
+        ["export", "-b", sqlite_uri(path), "--bundle", str(tmp_path / "b.json"), "--json"],
+        capsys,
+    )
+
+    report = json.loads(out)
+    assert (report["command"], report["ok"], report["exit_code"]) == ("export", False, 1)
+    assert [failure["kind"] for failure in report["failures"]] == ["bad_hash"]
+
+
+def test_a_forced_export_of_a_broken_ledger_still_writes_the_bundle(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """Forensics needs the evidence out of the store. ``--force`` is how, as it is
+    for ``checkpoint``."""
+    path = tmp_path / "ledger.db"
+    bundle = tmp_path / "bundle.json"
+    write_ledger(path, count=3)
+    rewrite_payload(path, 1, '{"event":"created","index":999}')
+
+    code, _, err = run(
+        ["export", "-b", sqlite_uri(path), "--bundle", str(bundle), "--force"], capsys
+    )
+
+    assert (code, bundle.exists()) == (EXIT_OK, True), err
+
+
+# --------------------------------------------------------------------------------------
+# C5 - the first five minutes
+# --------------------------------------------------------------------------------------
+
+
+def test_the_version_flag_reports_the_version(capsys: Any) -> None:
+    """The first thing anyone types. It exited 2 with "unrecognized arguments"."""
+    with pytest.raises(SystemExit) as caught:
+        main(["--version"])
+
+    assert caught.value.code == EXIT_OK
+    assert __version__ in capsys.readouterr().out
+
+
+def documented_sqlite_uris(text: str) -> List[str]:
+    """Every ``sqlite:`` form a piece of user-facing text tells an operator to write."""
+    return re.findall(r"sqlite:[^\s,]*", text)
+
+
+def test_the_backend_help_only_names_sqlite_uris_the_parser_accepts(
+    tmp_path: Any, capsys: Any, monkeypatch: Any
+) -> None:
+    """``--help`` advertised ``sqlite://<path>``, which the parser rejects as a host."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit):
+        main(["verify", "--help"])
+    documented = documented_sqlite_uris(capsys.readouterr().out)
+    assert documented, "the help no longer documents a sqlite URI at all"
+
+    for form in documented:
+        open_backend(form.replace("<path>", "audit.db")).close()
+
+    assert (tmp_path / "audit.db").exists()
+
+
+def test_the_schemeless_refusal_only_names_sqlite_uris_the_parser_accepts(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """The same wrong form was in the error an operator sees when they omit the scheme."""
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ConfigurationError) as caught:
+        open_backend("/var/lib/ledger.db")
+
+    documented = documented_sqlite_uris(str(caught.value))
+    assert documented, "the refusal no longer says what a sqlite URI looks like"
+    for form in documented:
+        open_backend(form.replace("<path>", "audit.db")).close()
+
+
+def scribble_over_a_timestamp(path: Any) -> None:
+    """Put a string in the BIGINT the timestamp is rebuilt from.
+
+    SQLite stores it happily - column types are advisory - which is exactly how an
+    operator ends up with a store the library cannot read.
+    """
+    unlock_store(path)
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute("UPDATE ledger_entries SET timestamp_us = 'not-a-number'")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_a_column_holding_the_wrong_type_is_an_operational_error(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """It escaped ``main`` as a raw ``TypeError`` traceback and exited 1.
+
+    Exit 1 is the contract's "the ledger did not verify". A store the tool cannot read
+    is exit 2, and a traceback is not an operator-facing message.
+    """
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    scribble_over_a_timestamp(path)
+
+    code, _, err = run(["verify", "-b", sqlite_uri(path)], capsys)
+
+    assert code == EXIT_ERROR
+    assert err.startswith("error: ")
+    assert "Traceback" not in err
+
+
+def test_that_operational_error_names_the_fault_without_quoting_the_row(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """The type name, never the driver's message: it can carry the row itself."""
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    scribble_over_a_timestamp(path)
+
+    _, _, err = run(["verify", "-b", sqlite_uri(path)], capsys)
+
+    assert "TypeError" in err
+    assert "unsupported type for timedelta" not in err
+
+
+def test_that_operational_error_is_reported_as_json_when_json_was_asked_for(
+    tmp_path: Any, capsys: Any
+) -> None:
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=2)
+    scribble_over_a_timestamp(path)
+
+    code, out, _ = run(["verify", "-b", sqlite_uri(path), "--json"], capsys)
+
+    report = json.loads(out)
+    assert (code, report["ok"], report["exit_code"]) == (EXIT_ERROR, False, EXIT_ERROR)
+
+
+def test_a_failed_verification_does_not_say_the_entries_were_verified(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """"entries 3 verified" printed directly above "result FAILED" reads as reassurance."""
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=3)
+    rewrite_payload(path, 1, '{"event":"created","index":999}')
+
+    _, out, _ = run(["verify", "-b", sqlite_uri(path)], capsys)
+
+    entries_line = next(line for line in out.splitlines() if line.startswith("entries"))
+    assert "FAILED" in out
+    assert "verified" not in entries_line
+
+
+def test_a_passing_verification_still_says_the_entries_were_verified(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """Guards the line above: dropping the word entirely would pass it."""
+    path = tmp_path / "ledger.db"
+    write_ledger(path, count=3)
+
+    _, out, _ = run(["verify", "-b", sqlite_uri(path)], capsys)
+
+    entries_line = next(line for line in out.splitlines() if line.startswith("entries"))
+    assert "3 verified" in entries_line

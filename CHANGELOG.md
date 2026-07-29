@@ -109,19 +109,83 @@ number would have left `pip install signledger` serving the withdrawn release.
 
 ### Fixed
 
+Found by building four real consumer projects — a Flask service, a FastAPI
+service, a Django project and a plain/CLI project — installing the published
+wheel into each, and driving them with real traffic. Everything below was
+reproduced by execution.
+
+- **PostgreSQL reported `append_only_enforced` on a table with no trigger.** The
+  catalog probe matched `pg_class.relname` with no schema join, so once any schema
+  held a `ledger_entries` trigger, a backend opened against a *different* schema
+  both skipped creating its own guard and kept claiming the capability. With
+  signatures and an anchor, `assurance_level()` therefore reported `worm` about a
+  table anyone could freely `UPDATE`. Resolution is now by relation OID.
+- **Request bodies leaked whole categories of credential.** Two rule sets shipped:
+  `?api_key=` was redacted and `{"api_key": ...}` was written verbatim. Unified
+  onto one rule, then widened after fuzzing 146,000 generated field names found
+  one-time codes, crypto material, bearer tokens, certificates and PII
+  identifiers (`otp`, `passcode`, `salt`, `mnemonic`, `jwt`, `pem`, `iban`, …)
+  still passing through. A fuzz corpus now guards the rule in CI.
+- **A field name could stall the audit write.** Name-splitting was quadratic, so a
+  4 KB JSON key — client-controlled — took 79 seconds on a per-request path. Found
+  by the new fuzz test while it was being written.
+- **An unpaired UTF-16 surrogate anywhere in a request was an unauthenticated
+  DoS.** It passed redaction and was then refused by the canonicalizer, so one
+  request could 500 every audited endpoint, or under `fail_open` silently suppress
+  its own audit record — letting an attacker choose whether to be logged. Fixed at
+  the single choke point all three integrations share.
+- **`verify` wrote to the store it was verifying.** Every read-only command
+  provisioned tables, triggers and indexes, so it could not run as a read-only
+  role or against a hot standby — and a mistyped DSN reported "your ledger is
+  empty" (exit 1, an integrity verdict) instead of "that store does not exist"
+  (exit 2). Backends now accept `create=False`; SQLite additionally sets
+  `query_only` and skips the WAL pragma, which is itself a write.
+- **`verify` on `mongodb://host/database` ignored the database** and reported
+  VERIFIED, exit 0, about an entirely different ledger.
+- **No CLI command could address a non-default table**, so `signledger verify ||
+  alert` was unavailable to anyone who used the documented `entries_table=`
+  argument. All four projects hit this.
+- **Django recorded `status: 200` for requests that returned 500.** An `AuditIndex`
+  mirror-write failure re-raised *after* the ledger entry was already permanent,
+  making the tamper-evident log assert an outcome the client never received.
+- Opening a PostgreSQL or MongoDB store silently re-armed dropped triggers,
+  validators and indexes, repairing the evidence that someone had removed them.
+  Both now report rather than repair, matching SQLite.
+- `USER_RESOLVER` accepted only a live callable while `LEDGER_FACTORY` accepted a
+  dotted path, so the natural settings idiom passed `manage.py check` and then
+  raised `TypeError` on every request. Both forms now work, with a system check.
+- `export` exited 0 on a ledger that failed verification, while `checkpoint`
+  correctly refused.
 - A genuine circular import between `crypto.canonical`, `core.exceptions` and
   `core.entry`, live but masked by package `__init__` ordering. Reordering two
   lines would have broken every `import signledger.crypto.*` at once.
 - The Django integration's migration was missing from the built wheel, so
   `manage.py migrate` created no table and every audited request failed under the
   default fail-closed policy.
+- The Django admin registration the models promised but never shipped.
 
 ### Testing
 
-2,810 tests. 100% line **and** branch coverage across all 37 modules, measured
-against live PostgreSQL and MongoDB rather than mocks — 582 of those tests need a
-real server, and CI fails if any of them is skipped. `ruff` and `mypy --strict`
-are clean. Property-based tests use Hypothesis; mutation testing runs in CI.
+3,691 tests. 100% line **and** branch coverage across every module, measured
+against live PostgreSQL and MongoDB rather than mocks — CI fails if any database
+test is skipped, because a skipped one is indistinguishable from a passing one in
+the summary line. `ruff`, `mypy --strict` and `bandit` are clean. Property-based
+tests use Hypothesis; mutation testing runs in CI.
+
+Two things the test suite alone did not catch, and what now covers them:
+
+- Mutation testing over the crypto core found four security-relevant gaps that
+  100% coverage did not — signature malleability, an off-by-one in Merkle
+  inclusion, a consistency-proof size guard, and two canonical-number boundaries.
+  Coverage proves a line ran; mutation proves an assertion would notice it
+  changing.
+- Four real consumer projects, installing the wheel and following only the
+  published documentation, found everything in **Fixed** above. A green unit suite
+  is not evidence that a deployment works, and neither is a green suite evidence
+  that anyone can figure out how to use the thing.
+
+Every fenced `python` block in the README — including all the framework wiring —
+is executed on every test run.
 
 Stated plainly because the last release did not: 1.0.0 shipped **zero** tests
 while its README claimed "100% test coverage".

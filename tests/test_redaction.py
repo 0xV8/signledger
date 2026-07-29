@@ -10,6 +10,11 @@ So the tests here are not "does the helper work" tests. They are "can this value
 the ledger" tests, and the answer has to be no by default.
 """
 
+import json
+import os
+import socket
+import time
+import uuid
 from typing import Iterator
 
 import pytest
@@ -27,9 +32,12 @@ from signledger.contrib.redaction import (
     OVERSIZED,
     REDACTED,
     TRUNCATED,
+    UNENCODABLE,
     UNPARSEABLE,
     BodyDecision,
     RedactionPolicy,
+    is_sensitive_field,
+    is_sensitive_header,
     redact_headers,
     redact_payload,
 )
@@ -461,6 +469,65 @@ def test_the_audit_record_is_never_empty_so_the_ledger_always_accepts_it() -> No
     assert record
 
 
+def test_a_user_carrying_a_lone_surrogate_cannot_break_the_audit_write() -> None:
+    """The other half of the unpaired-surrogate DoS.
+
+    ``user`` is whatever a deployment's resolver returned, and real resolvers read it out
+    of the request body, so it is attacker-controlled text that never passed through
+    redaction on its way here. Before this, one anonymous POST 500ed every audited
+    endpoint under ``fail_closed``.
+    """
+    record = build_audit_record(
+        integration="flask",
+        method="GET",
+        path="/",
+        status=401,
+        client_ip=None,
+        headers={},
+        user="\ud800",
+    )
+    from signledger.crypto.canonical import canonicalize
+
+    assert record["user"] == UNENCODABLE
+    canonicalize(record, allow_datetime=False)
+
+
+def test_a_path_or_error_carrying_a_lone_surrogate_is_sanitised_too() -> None:
+    """``path``, ``method``, ``integration`` and ``error`` reach the record by the same
+    unsanitised route ``user`` does."""
+    record = build_audit_record(
+        integration="\ud800",
+        method="\ud800",
+        path="/\ud800",
+        status=500,
+        client_ip=None,
+        headers={},
+        error="\ud800",
+    )
+    assert (record["integration"], record["method"], record["path"], record["error"]) == (
+        UNENCODABLE,
+        UNENCODABLE,
+        UNENCODABLE,
+        UNENCODABLE,
+    )
+    from signledger.crypto.canonical import canonicalize
+
+    canonicalize(record, allow_datetime=False)
+
+
+def test_an_absent_user_stays_absent_rather_than_becoming_a_marker() -> None:
+    """``None`` means "nobody was resolved", which is not the same as unencodable text."""
+    record = build_audit_record(
+        integration="flask",
+        method="GET",
+        path="/",
+        status=200,
+        client_ip=None,
+        headers={},
+    )
+    assert record["user"] is None
+
+
 def test_the_audit_record_can_be_canonicalized(ledger: Ledger) -> None:
     """Whatever the record holds, the ledger has to be able to hash it."""
     record = build_audit_record(
@@ -488,16 +555,12 @@ def test_an_error_free_request_records_no_error_field() -> None:
 
 
 def test_a_query_parameter_named_api_key_is_redacted() -> None:
-    """``?api_key=`` is a credential in transit, exactly like a header.
-
-    The payload field list alone would miss it - it has no ``key`` entry - so query
-    parameter names are checked against the header rule as well.
-    """
-    assert RedactionPolicy().query({"api_key": ["sk-live-1"]})["api_key"] == REDACTED
+    """``?api_key=`` is a credential in transit, exactly like a header."""
+    assert RedactionPolicy().query({"api_key": ["sk-live-1"]})["api_key"] == [REDACTED]
 
 
 def test_a_query_parameter_named_token_is_redacted() -> None:
-    assert RedactionPolicy().query({"reset_token": ["abc"]})["reset_token"] == REDACTED
+    assert RedactionPolicy().query({"reset_token": ["abc"]})["reset_token"] == [REDACTED]
 
 
 def test_an_ordinary_query_parameter_is_kept() -> None:
@@ -507,3 +570,876 @@ def test_an_ordinary_query_parameter_is_kept() -> None:
 def test_query_parameter_names_keep_their_case() -> None:
     """Unlike headers, query parameters are case-sensitive and ``?Page`` is not ``?page``."""
     assert "Page" in RedactionPolicy().query({"Page": ["2"]})
+
+
+# ======================================================================================
+# B1 - one name rule, not two
+#
+# Two rules shipped: a regex (``token|secret|password|key``) guarding headers and query
+# strings, and a shorter word list guarding *bodies*. So ``?api_key=`` was redacted and
+# ``{"api_key": ...}`` was notarised in the clear - the same credential, protected on one
+# path and permanently recorded on the other. These tests pin the two paths together.
+# ======================================================================================
+
+
+#: Credential names a real client actually sends. Every one of these was returned
+#: verbatim by ``policy.payload`` before the rules were unified.
+CREDENTIAL_NAMES = [
+    "api_key",
+    "apikey",
+    "access_key",
+    "private_key",
+    "secret_key",
+    "signing_key",
+    "pwd",
+    "passwd",
+    "user_pwd",
+    "passphrase",
+    "session_id",
+    "sessionid",
+    "session_token",
+    "auth",
+    "authorization",
+    "basic_auth",
+    "oauth_token",
+    "credentials",
+    "cookie",
+    "set-cookie",
+    "password",
+    "password_confirmation",
+    "ssn",
+    "card_number",
+    "cvv",
+    "client_secret",
+    "reset_token",
+]
+
+
+@pytest.mark.parametrize("name", CREDENTIAL_NAMES)
+def test_a_credential_name_is_redacted_in_the_body(name: str) -> None:
+    """The body is where the credentials actually are.
+
+    A login POST carries the password in the body, never in the query string, and this
+    library's whole reason to exist is that an append-only store cannot be cleaned up
+    afterwards.
+    """
+    assert RedactionPolicy().payload({name: "SECRET"})[name] == REDACTED
+
+
+@pytest.mark.parametrize("name", CREDENTIAL_NAMES)
+def test_the_body_rule_and_the_header_rule_are_the_same_rule(name: str) -> None:
+    """One rule, or an operator has to know which transport a value arrived on."""
+    assert is_sensitive_field(name) is is_sensitive_header(name) is True
+
+
+@pytest.mark.parametrize("name", CREDENTIAL_NAMES)
+def test_a_credential_name_is_redacted_in_the_query_string_too(name: str) -> None:
+    assert RedactionPolicy().query({name: ["SECRET"]})[name] == [REDACTED]
+
+
+@pytest.mark.parametrize("name", CREDENTIAL_NAMES)
+def test_a_credential_name_is_redacted_however_it_is_capitalised(name: str) -> None:
+    """``X-Api-Key`` in a header, ``API_KEY`` in a body: one ledger, one answer."""
+    assert RedactionPolicy().payload({name.upper(): "SECRET"})[name.upper()] == REDACTED
+
+
+#: The price of substring matching on ``key``, ``auth`` and ``session``. Paid knowingly:
+#: see the comment on :data:`SENSITIVE_FIELDS`.
+ACCEPTED_FALSE_POSITIVES = [
+    "monkey",
+    "donkey",
+    "keyboard",
+    "keyword",
+    "key_count",
+    "public_key",
+    "author",
+    "authority",
+    "session_count",
+    "discard",
+]
+
+
+@pytest.mark.parametrize("name", ACCEPTED_FALSE_POSITIVES)
+def test_a_name_that_merely_contains_a_credential_word_is_redacted_anyway(name: str) -> None:
+    """Over-redaction is the chosen direction, and it is chosen on purpose.
+
+    ``public_key`` is not a secret and ``monkey`` is not a key at all. Losing either
+    from an audit record costs an operator one field. Notarising a ``private_key``
+    costs the key, permanently, with no way to erase it. There is no substring that
+    separates ``api_key`` from ``monkey`` without also letting through the next
+    credential name somebody invents, so this stays wrong in the safe direction.
+    """
+    assert RedactionPolicy().payload({name: "value"})[name] == REDACTED
+
+
+#: The other side of the choice: names that must survive, or an audit trail records
+#: nothing but ``[REDACTED]``.
+#:
+#: ``passport`` used to be on this list, as evidence that ``passw`` had not been widened
+#: to a bare ``pass``. It is a credential now - a field called ``passport`` holds a
+#: passport number, which is the same PII class as ``passport_number`` - so the pass/passw
+#: boundary is pinned by ``passenger_count``, ``compass`` and ``bypass`` instead.
+NAMES_THAT_MUST_SURVIVE = [
+    "page",
+    "limit",
+    "offset",
+    "amount",
+    "currency",
+    "email",
+    "username",
+    "user_id",
+    "account_id",
+    "status",
+    "passenger_count",
+    "compass",
+    "bypass",
+    "message",
+    # The price of *not* squashing separators away before applying the short legacy
+    # stems: ``metrics_snapshot`` holds no ``ssn``, and ``metricssnapshot`` would.
+    "metrics_snapshot",
+]
+
+
+@pytest.mark.parametrize("name", NAMES_THAT_MUST_SURVIVE)
+def test_an_ordinary_field_name_is_not_redacted(name: str) -> None:
+    """Pins the upper bound of the pattern.
+
+    Widening ``passw`` to a bare ``pass`` - the obvious "be even safer" edit - silently
+    blanks ``passenger_count``, ``compass`` and ``bypass``, and an audit trail of
+    ``[REDACTED]`` is not an audit trail. ``passw``/``pwd``/``passphrase`` already cover
+    every real spelling of a password field, so the wider rule buys nothing.
+    """
+    assert RedactionPolicy().payload({name: "value"})[name] == "value"
+
+
+def test_a_nested_body_credential_is_redacted_at_depth() -> None:
+    """The Flask consumer posted a nested body and the credential was stored."""
+    payload = {"payment": {"meta": {"api_key": "SECRETBODYAPIKEY55"}}}
+    assert redact_payload(payload)["payment"]["meta"]["api_key"] == REDACTED
+
+
+def test_a_credential_in_a_body_never_reaches_the_stored_bytes() -> None:
+    """End to end, the way the Flask consumer proved the leak.
+
+    It ran ``grep -a SECRETBODYAPIKEY55 audit.db`` and got two hits. The equivalent
+    assertion here is against the serialised entry the backend actually holds.
+    """
+    policy = RedactionPolicy(capture_body=True)
+    body = policy.decode_body(b'{"api_key": "SECRETBODYAPIKEY55", "amount": 10}')
+    record = build_audit_record(
+        integration="flask",
+        method="POST",
+        path="/api/transfer",
+        status=200,
+        client_ip="127.0.0.1",
+        headers={},
+        body=body,
+        body_reason="captured",
+    )
+    with Ledger(backend=MemoryBackend(), ledger_id="b1") as led:
+        entry = led.append(record)
+    assert "SECRETBODYAPIKEY55" not in json.dumps(entry.data)
+
+
+# ======================================================================================
+# B4 - the families the denylist never had
+#
+# Unifying the three rules fixed the ``api_key`` family and stopped there. Nobody had
+# ever fuzzed the *list* itself, so five whole categories of credential were still being
+# notarised in the clear: one-time codes, crypto material, bearer tokens, key material and
+# PII identifiers.
+#
+# ``passcode`` is the shape of the entire defect. The password family is spelled
+# ``passw``/``pwd``/``passphrase``; ``passcode`` shares no substring with any of them, so
+# a login form that calls its field ``passcode`` was stored verbatim, permanently, in a
+# log that cannot be edited.
+#
+# The tests below therefore run in three parts: every missed family redacts, every
+# ordinary field name still survives, and a generated corpus of credential-shaped names
+# keeps both true so the *next* missing family is caught here rather than by a reviewer.
+# ======================================================================================
+
+
+#: One-time codes. None of these shares a substring with ``passw``/``pwd``/``passphrase``.
+ONE_TIME_CODE_NAMES = [
+    "otp",
+    "totp",
+    "hotp",
+    "otp_code",
+    "mfa",
+    "mfa_code",
+    "2fa_code",
+    "pin",
+    "pincode",
+    "pin_code",
+    "security_code",
+    "verification_code",
+    "confirmation_code",
+    "recovery_code",
+    "backup_code",
+    "passcode",
+    "one_time_code",
+    "two_factor_code",
+    "sms_otp",
+    # A leading separator is what a Mongo-shaped payload looks like, and it is also the
+    # only way an empty token reaches the splitter.
+    "_otp",
+]
+
+#: Crypto material. A salt or a nonce is not a secret on its own; a seed, a mnemonic and
+#: an HMAC key are the whole credential, and none of them can be rotated out of a log.
+CRYPTO_MATERIAL_NAMES = [
+    "salt",
+    "seed",
+    "mnemonic",
+    "seed_phrase",
+    "entropy",
+    "nonce",
+    "hmac",
+    "signature",
+    "password_salt",
+    "recovery_seed",
+    "hmac_sha256",
+    "request_signature",
+]
+
+#: Bearer credentials that never say "token".
+BEARER_TOKEN_NAMES = [
+    "bearer",
+    "jwt",
+    "creds",
+    "bearer_value",
+    "jwt_header",
+    "user_creds",
+]
+
+#: Key material in its file-format spellings. A ``.pem`` or a ``.p12`` posted to an
+#: enrolment endpoint carries the private half.
+KEY_MATERIAL_NAMES = [
+    "cert",
+    "pem",
+    "pfx",
+    "p12",
+    "certificate",
+    "client_cert",
+    "cert_chain",
+    "certs",
+]
+
+#: PII identifiers. Not passwords, and exactly what an append-only ledger must not be
+#: holding when someone asks for erasure.
+PII_IDENTIFIER_NAMES = [
+    "account_number",
+    "routing_number",
+    "iban",
+    "tax_id",
+    "passport_number",
+    "sin",
+    "passport",
+    "social_security_number",
+    "bank_account_number",
+]
+
+MISSED_CREDENTIAL_NAMES = [
+    *ONE_TIME_CODE_NAMES,
+    *CRYPTO_MATERIAL_NAMES,
+    *BEARER_TOKEN_NAMES,
+    *KEY_MATERIAL_NAMES,
+    *PII_IDENTIFIER_NAMES,
+]
+
+
+@pytest.mark.parametrize("name", MISSED_CREDENTIAL_NAMES)
+def test_a_credential_family_the_denylist_missed_is_redacted(name: str) -> None:
+    """Each of these was returned verbatim by ``policy.payload`` before this change."""
+    assert RedactionPolicy().payload({name: "SECRET"})[name] == REDACTED
+
+
+@pytest.mark.parametrize("name", MISSED_CREDENTIAL_NAMES)
+def test_a_missed_family_is_redacted_on_every_transport(name: str) -> None:
+    """Still one rule. Widening it must not reintroduce a per-transport answer."""
+    policy = RedactionPolicy()
+    assert (
+        policy.payload({name: "S"})[name],
+        policy.query({name: ["S"]})[name],
+        redact_headers({name: "S"})[name.lower()],
+        is_sensitive_field(name),
+        is_sensitive_header(name),
+    ) == (REDACTED, [REDACTED], REDACTED, True, True)
+
+
+#: A multi-word credential name arrives spelled every way a language and a framework can
+#: spell it. One entry in the list has to cover all of them or the list is decoration.
+COMPOUND_SPELLINGS = [
+    "security_code",
+    "SECURITY_CODE",
+    "security-code",
+    "security.code",
+    "securityCode",
+    "SecurityCode",
+    "securitycode",
+    "user_security_code",
+    "SecurityCodeInput",
+]
+
+
+@pytest.mark.parametrize("name", COMPOUND_SPELLINGS)
+def test_a_compound_credential_name_is_redacted_however_it_is_spelled(name: str) -> None:
+    assert RedactionPolicy().payload({name: "S"})[name] == REDACTED
+
+
+#: The short stems - ``pin``, ``sin``, ``seed``, ``salt``, ``cert``, ``otp`` - are matched
+#: as whole words, not as substrings. This is the list that pays for that decision, and
+#: every one of them is a field an operator would be embarrassed to find blanked.
+NAMES_A_SHORT_STEM_MUST_NOT_BLANK = [
+    "shipping",
+    "shipping_address",
+    "spinner_state",
+    "pinned_at",
+    "mapping_rules",
+    "single_use",
+    "using_cache",
+    "business_unit",
+    "seeded_at",
+    "seedling_count",
+    "certainty_score",
+    "concert_venue",
+    "certification_status",
+    "assault_charges",
+    "announcement_body",
+    "insurance_plan",
+    "security_group",
+    "opt_in",
+    "options_list",
+    "zip_code",
+    "promo_code",
+    "coupon_code",
+    "country_code",
+    "status_code",
+    "error_code",
+    "invoice_number",
+    "order_number",
+    "phone_number",
+    "tracking_number",
+    "serial_number",
+    "tax_rate",
+    "tax_amount",
+    "sales_tax",
+    "line_items",
+    "delivery_status",
+    "customer_email",
+    "order_total",
+    "first_name",
+    "created_at",
+    "assignment_id",
+    "designation",
+]
+
+
+@pytest.mark.parametrize("name", NAMES_A_SHORT_STEM_MUST_NOT_BLANK)
+def test_an_ordinary_field_name_survives_the_widened_rule(name: str) -> None:
+    """The other direction, tested as hard as the first.
+
+    ``pin`` as a substring blanks ``shipping``, ``spinner`` and ``mapping``; ``sin`` blanks
+    ``business`` and ``using``; ``cert`` blanks ``certain``. A ledger whose every field
+    reads ``[REDACTED]`` is not an audit trail, so the short stems match whole words only.
+    """
+    assert RedactionPolicy().payload({name: "value"})[name] == "value"
+
+
+#: Redacted on purpose despite being ordinary-ish English, and listed so the cost of the
+#: widening is written down rather than discovered.
+WIDENED_FALSE_POSITIVES = [
+    # ``certificate`` is deliberate: a field holding a certificate usually holds the PEM
+    # blob, and a PEM blob sometimes holds the private half.
+    "certificate_authority",
+    # A database ``seed_data`` fixture is not crypto material. ``seed`` is worth it anyway.
+    "seed_data",
+    "random_seed",
+    # The cost of matching ``tax_id`` with separators stripped, so that ``taxId`` cannot
+    # slip through: one contrived field name pays for every real spelling.
+    "syntax_id",
+]
+
+
+@pytest.mark.parametrize("name", WIDENED_FALSE_POSITIVES)
+def test_a_known_false_positive_of_the_widened_rule_is_redacted(name: str) -> None:
+    """Wrong in the safe direction, and known to be wrong."""
+    assert RedactionPolicy().payload({name: "value"})[name] == REDACTED
+
+
+# --------------------------------------------------------------------------------------
+# The fuzz. A reviewer generating 146,237 credential-shaped names found 73 misses that
+# five rounds of hand-written examples had not. That generator belongs in CI, not in a
+# review, so it lives here - deterministic and exhaustive rather than random, because a
+# corpus that differs between runs turns a real miss into a flake.
+# --------------------------------------------------------------------------------------
+
+#: One stem per family the rule claims to cover, including the ones it always covered.
+FUZZ_STEMS = [
+    "otp",
+    "totp",
+    "hotp",
+    "mfa",
+    "2fa",
+    "pin",
+    "pincode",
+    "passcode",
+    "security_code",
+    "verification_code",
+    "confirmation_code",
+    "recovery_code",
+    "backup_code",
+    "one_time_code",
+    "salt",
+    "seed",
+    "seed_phrase",
+    "mnemonic",
+    "entropy",
+    "nonce",
+    "hmac",
+    "signature",
+    "bearer",
+    "jwt",
+    "creds",
+    "cert",
+    "certificate",
+    "pem",
+    "pfx",
+    "p12",
+    "account_number",
+    "routing_number",
+    "iban",
+    "tax_id",
+    "passport",
+    "sin",
+    "api_key",
+    "password",
+    "secret",
+    "token",
+    "session",
+    "cvv",
+    "ssn",
+    "credential",
+]
+
+#: What deployments put in front of a credential name.
+FUZZ_PREFIXES = ["", "user", "client", "customer", "current", "x", "old"]
+
+#: And behind it. ``hash`` is included because a hashed credential is still an oracle.
+FUZZ_SUFFIXES = ["", "value", "field", "input", "confirm", "hash", "1"]
+
+
+def _seams_survive_camel_casing(words: list) -> bool:
+    """Whether camelCasing these words leaves any seam a reader could still see.
+
+    ``p12`` followed by ``1`` is ``p121``; ``x`` followed by ``p12`` is ``XP12`` in
+    PascalCase. In both the boundary is gone from the string itself, and the result is a
+    different word rather than a badly spelled one. Asserting that a matcher must find a
+    word that is no longer there would be testing a fiction, so those spellings are left
+    out of the corpus instead of being quietly special-cased in the matcher.
+    """
+    return all(
+        not (before[-1].isdigit() and after[0].isdigit())
+        and (len(before) > 1 or after[1:2].isalpha())
+        for before, after in zip(words, words[1:])
+    )
+
+
+def _spellings(words: list) -> list:
+    """Every way a real codebase writes one multi-word field name.
+
+    Deliberately *not* including the all-lowercase run-together form for these: the short
+    stems are matched as whole words, so ``userpin`` is a name this rule does not claim to
+    catch, and a test that pretended otherwise would be testing a promise nobody made.
+    """
+    lower = [word.lower() for word in words]
+    joined = "_".join(lower)
+    spellings = [joined, joined.upper(), "-".join(lower), ".".join(lower)]
+    if _seams_survive_camel_casing(lower):
+        camel = lower[0] + "".join(word.capitalize() for word in lower[1:])
+        spellings += [camel, camel[:1].upper() + camel[1:]]
+    return spellings
+
+
+def _fuzz_corpus() -> list:
+    """stems x prefixes x suffixes x spelling. ~13k names, one pass, no randomness."""
+    names = []
+    for stem in FUZZ_STEMS:
+        for prefix in FUZZ_PREFIXES:
+            for suffix in FUZZ_SUFFIXES:
+                words = [*([prefix] if prefix else []), *stem.split("_")]
+                words += [suffix] if suffix else []
+                names.extend(_spellings(words))
+    return names
+
+
+def test_every_credential_shaped_name_in_the_generated_corpus_is_redacted() -> None:
+    """The test that is supposed to find the *next* missing family.
+
+    A denylist is only as good as the names somebody thought to try, so the names are
+    generated rather than typed. Failure prints the misses themselves - that list is the
+    bug report.
+    """
+    misses = [name for name in _fuzz_corpus() if not is_sensitive_field(name)]
+    assert misses == [], f"{len(misses)} credential-shaped names stored in the clear: {misses[:20]}"
+
+
+def test_the_generated_corpus_is_large_enough_to_be_worth_running() -> None:
+    """A generator that silently shrinks to nothing still passes. Pin the size."""
+    assert len(_fuzz_corpus()) > 10_000
+
+
+#: The negative corpus. Same spellings, ordinary names.
+ORDINARY_FUZZ_NAMES = [
+    "shipping_address",
+    "spinner_state",
+    "pinned_at",
+    "mapping_rules",
+    "single_use",
+    "using_cache",
+    "business_unit",
+    "seeded_at",
+    "seedling_count",
+    "certainty_score",
+    "concert_venue",
+    "certification_status",
+    "assault_charges",
+    "announcement_body",
+    "insurance_plan",
+    "security_group",
+    "opt_in",
+    "options_list",
+    "zip_code",
+    "promo_code",
+    "invoice_number",
+    "phone_number",
+    "tracking_number",
+    "tax_rate",
+    "sales_tax",
+    "line_items",
+    "delivery_status",
+    "customer_email",
+    "order_total",
+    "first_name",
+    "created_at",
+    "passenger_count",
+]
+
+
+def test_no_ordinary_field_name_in_the_generated_corpus_is_blanked() -> None:
+    """Over-redaction is free only until it starts eating the audit trail."""
+    blanked = [
+        name
+        for ordinary in ORDINARY_FUZZ_NAMES
+        for name in _spellings(ordinary.split("_"))
+        if is_sensitive_field(name)
+    ]
+    assert blanked == [], f"{len(blanked)} ordinary names blanked: {blanked[:20]}"
+
+
+# --------------------------------------------------------------------------------------
+# What this cannot do. Written down as tests, because an undocumented limit reads as a
+# guarantee to whoever is deciding what to capture.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(60)
+def test_a_hostile_object_key_cannot_stall_the_audit_write() -> None:
+    """Splitting a name into words has to stay linear in the length of the name.
+
+    An object key is client-written text. Reading one name as ``user`` + ``2fa`` + a
+    joined ``user2fa`` means considering runs of letters and digits together, and
+    considering *every* span of them is quadratic: ``{"a1a1a1...": 1}`` at 4 KB took 79
+    seconds before this bound, on one key, in a middleware that runs on every request.
+    That is the same denial of service the depth limit and the ``Content-Length`` check
+    already exist to prevent, arriving through the field name instead of the value.
+    """
+    hostile = "a1" * 1_000
+    started = time.perf_counter()
+    assert redact_payload({hostile: "x"})[hostile] == "x"
+    assert time.perf_counter() - started < 1.0
+
+
+def test_a_credential_inside_free_text_is_stored_verbatim() -> None:
+    """The honest limit of a denylist of *field names*: it never reads a value.
+
+    A reviewer recovered exactly this string from a raw store. ``notes`` is not a
+    credential name and the sentence inside it is never scanned, so the password is
+    notarised. Nothing in this module changes that; only not capturing the body does.
+    """
+    note = "the customer said their password is hunter2"
+    assert redact_payload({"notes": note})["notes"] == note
+
+
+def test_a_deployment_can_widen_the_rule_with_its_own_field_names() -> None:
+    """``extra_sensitive_fields`` is the supported answer to the paragraph above."""
+    policy = RedactionPolicy(extra_sensitive_fields=["patient_note"])
+    assert policy.payload({"patient_note": "hunter2"})["patient_note"] == REDACTED
+
+
+@pytest.mark.parametrize("name", ["patient_name", "patientName", "Patient-Name", "PATIENT.NAME"])
+def test_an_extra_sensitive_field_matches_every_spelling_of_itself(name: str) -> None:
+    """An operator writes the name once; the API that sends it chooses the separators."""
+    policy = RedactionPolicy(extra_sensitive_fields=["patient_name"])
+    assert policy.payload({name: "ada"})[name] == REDACTED
+
+
+def test_an_extra_sensitive_field_does_not_widen_to_everything_else() -> None:
+    policy = RedactionPolicy(extra_sensitive_fields=["patient_name"])
+    assert policy.payload({"page": "2"})["page"] == "2"
+
+
+def test_an_extra_sensitive_field_covers_headers_as_well_as_bodies() -> None:
+    """B1's defect, one layer up: the *added* names have to be one rule too.
+
+    The built-in list stopped depending on which transport a credential arrived on;
+    ``extra_sensitive_fields`` still did. A deployment that added ``x-tenant-passcode``
+    got it scrubbed from bodies and query strings and notarised from the header - the
+    exact shape of the bug that made ``?api_key=`` safe and ``{"api_key": ...}`` not.
+    """
+    policy = RedactionPolicy(extra_sensitive_fields=["x-tenant-note"])
+    assert policy.headers({"X-Tenant-Note": "hunter2"})["x-tenant-note"] == REDACTED
+
+
+# ======================================================================================
+# B2 - an unpaired surrogate is a remote kill switch
+#
+# ``json.loads('{"u": "\\ud800"}')`` happily yields a Python str holding a lone
+# surrogate. SLCS/1 rejects it, because it has no UTF-8 encoding. So one request body
+# either 500s every audited endpoint (fail_closed) or deletes its own audit record
+# (fail_open) - and the attacker picks which.
+# ======================================================================================
+
+#: A JSON body that parses cleanly and cannot be canonicalized.
+SURROGATE_BODY = b'{"username": "\\ud800"}'
+
+
+def test_a_string_that_utf8_cannot_encode_is_replaced_by_a_marker() -> None:
+    assert redact_payload({"u": "\ud800"})["u"] == UNENCODABLE
+
+
+def test_a_body_holding_an_unpaired_surrogate_is_marked_not_passed_through() -> None:
+    assert RedactionPolicy(capture_body=True).decode_body(SURROGATE_BODY) == {
+        "username": UNENCODABLE
+    }
+
+
+def test_a_body_holding_an_unpaired_surrogate_can_still_be_written_to_the_ledger() -> None:
+    """The denial of service, reproduced with no web framework in the picture."""
+    body = RedactionPolicy(capture_body=True).decode_body(SURROGATE_BODY)
+    with Ledger(backend=MemoryBackend(), ledger_id="b2") as led:
+        assert led.append({"body": body}).sequence == 0
+
+
+def test_an_object_key_holding_an_unpaired_surrogate_is_marked_too() -> None:
+    """SLCS/1 sorts keys by UTF-16 code unit, so it rejects an unencodable *key* as well."""
+    assert redact_payload({"\ud800": "x"}) == {UNENCODABLE: "x"}
+
+
+def test_a_sensitive_key_is_still_recognised_when_it_holds_a_surrogate() -> None:
+    """Marking the key must not lose the reason its value had to go."""
+    assert redact_payload({"password\ud800": "hunter2"}) == {UNENCODABLE: REDACTED}
+
+
+def test_a_surrogate_inside_a_list_is_marked() -> None:
+    assert redact_payload({"xs": ["ok", "\ud800"]})["xs"] == ["ok", UNENCODABLE]
+
+
+def test_a_header_value_that_utf8_cannot_encode_is_marked() -> None:
+    assert redact_headers({"x-note": "\ud800"})["x-note"] == UNENCODABLE
+
+
+def test_a_header_name_that_utf8_cannot_encode_is_marked() -> None:
+    assert redact_headers({"x-\ud800": "v"}) == {UNENCODABLE: "v"}
+
+
+def test_a_client_ip_that_utf8_cannot_encode_is_marked() -> None:
+    """``X-Forwarded-For`` is client-written text, and it becomes ``client_ip``."""
+    policy = RedactionPolicy(trusted_proxy_count=1)
+    assert policy.client_ip(peer="10.0.0.9", forwarded_for="\ud800") == UNENCODABLE
+
+
+def test_a_peer_address_that_utf8_cannot_encode_is_marked() -> None:
+    assert RedactionPolicy().client_ip(peer="\ud800", forwarded_for=None) == UNENCODABLE
+
+
+def test_a_valid_astral_character_is_left_alone() -> None:
+    """A *paired* surrogate is an ordinary emoji and must survive verbatim."""
+    assert redact_payload({"u": "\U0001f600"})["u"] == "\U0001f600"
+
+
+def test_a_whole_hostile_request_survives_canonicalization() -> None:
+    """Everything this module emits is storable - that is the module's contract."""
+    from signledger.crypto.canonical import canonicalize
+
+    policy = RedactionPolicy(capture_body=True)
+    record = build_audit_record(
+        integration="fastapi",
+        method="POST",
+        path="/x",
+        status=200,
+        client_ip=policy.client_ip(peer="\ud800", forwarded_for=None),
+        headers=policy.headers({"x-\ud801": "\ud802"}),
+        query=policy.query({"q": ["\ud803"]}),
+        body=policy.decode_body(SURROGATE_BODY),
+        body_reason="captured",
+    )
+    canonicalize(record, allow_datetime=False)
+
+
+# ======================================================================================
+# B3 - one query key, one stored type
+#
+# Middlewares hand over a multi-dict, so a retained parameter was stored as ``["2"]``
+# while a redacted one collapsed to the bare string ``"[REDACTED]"``. Anything reading
+# the ledger then had to branch on the type of every value.
+# ======================================================================================
+
+
+def test_a_redacted_and_a_retained_query_value_have_the_same_type() -> None:
+    result = RedactionPolicy().query({"api_key": ["sk-live-1"], "page": ["2"]})
+    assert type(result["api_key"]) is type(result["page"])
+
+
+def test_a_flat_query_mapping_is_normalised_to_lists() -> None:
+    """Not every caller hands over a multi-dict; the stored shape must not depend on it."""
+    assert RedactionPolicy().query({"page": "2"}) == {"page": ["2"]}
+
+
+def test_a_repeated_query_parameter_keeps_every_value() -> None:
+    assert RedactionPolicy().query({"tag": ["a", "b"]})["tag"] == ["a", "b"]
+
+
+def test_a_repeated_sensitive_query_parameter_redacts_every_value() -> None:
+    """Arity is kept - how many were sent is auditable, what they were is not."""
+    assert RedactionPolicy().query({"api_key": ["a", "b"]})["api_key"] == [REDACTED, REDACTED]
+
+
+def test_a_query_value_is_sanitised_like_any_other_payload() -> None:
+    assert RedactionPolicy().query({"n": [2**53 + 1]})["n"] == ["9007199254740993"]
+
+
+def test_an_empty_query_mapping_stays_empty() -> None:
+    assert RedactionPolicy().query({}) == {}
+
+
+# ======================================================================================
+# Live PostgreSQL: the ledger row a DBA can actually read
+#
+# The Flask consumer's proof was ``grep -a SECRETBODYAPIKEY55`` over the raw store. This
+# is that grep, against a real server, on the real ``data`` column.
+# ======================================================================================
+
+_PG_DSN = os.environ.get(
+    "SIGNLEDGER_TEST_POSTGRES_DSN", "postgresql://postgres@localhost:5432/signledger_test"
+)
+
+
+@pytest.fixture
+def redaction_pg_table() -> Iterator[str]:
+    """A table name nothing else in the suite can collide with."""
+    psycopg = pytest.importorskip("psycopg", reason="psycopg (v3) is not installed")
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(_PG_DSN)
+    host, port = parts.hostname or "localhost", parts.port or 5432
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            pass
+    except OSError as err:
+        pytest.skip(f"no live PostgreSQL at {host}:{port} ({type(err).__name__})")
+    table = "sl_redact_" + uuid.uuid4().hex[:10]
+    try:
+        yield table
+    finally:
+        with psycopg.connect(_PG_DSN, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                for suffix in ("_entries", "_checkpoints", "_entries_state"):
+                    cursor.execute(f'DROP TABLE IF EXISTS "{table}{suffix}" CASCADE')
+            connection.commit()
+
+
+@pytest.mark.postgres
+def test_a_body_credential_is_absent_from_the_raw_postgres_row(redaction_pg_table: str) -> None:
+    psycopg = pytest.importorskip("psycopg", reason="psycopg (v3) is not installed")
+    from signledger.backends.postgresql import PostgresBackend
+
+    policy = RedactionPolicy(capture_body=True)
+    record = build_audit_record(
+        integration="flask",
+        method="POST",
+        path="/api/transfer",
+        status=200,
+        client_ip="127.0.0.1",
+        headers=policy.headers({"X-Api-Key": "SECRETHEADERAPIKEY99"}),
+        query=policy.query({"api_key": ["SECRETQUERYAPIKEY77"]}),
+        body=policy.decode_body(b'{"api_key": "SECRETBODYAPIKEY55", "amount": 10}'),
+        body_reason="captured",
+    )
+    backend = PostgresBackend(
+        _PG_DSN,
+        entries_table=f"{redaction_pg_table}_entries",
+        checkpoints_table=f"{redaction_pg_table}_checkpoints",
+    )
+    with Ledger(backend=backend, ledger_id="b1-pg") as led:
+        led.append(record)
+
+    with psycopg.connect(_PG_DSN, connect_timeout=5) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(f'SELECT data FROM "{redaction_pg_table}_entries"')  # noqa: S608
+            stored = "".join(row[0] for row in cursor.fetchall())
+    assert "SECRETBODYAPIKEY55" not in stored
+    assert "SECRETQUERYAPIKEY77" not in stored
+    assert "SECRETHEADERAPIKEY99" not in stored
+
+
+@pytest.mark.postgres
+def test_no_missed_family_reaches_the_raw_postgres_row(redaction_pg_table: str) -> None:
+    """The same grep, for the families the list did not have.
+
+    One request carrying a one-time code, a wallet seed, a bearer credential, key material
+    and a national identifier - the five categories that were being notarised in the clear
+    - and then a read of the column a DBA, a backup tape or a replica actually holds.
+    """
+    psycopg = pytest.importorskip("psycopg", reason="psycopg (v3) is not installed")
+    from signledger.backends.postgresql import PostgresBackend
+
+    policy = RedactionPolicy(capture_body=True)
+    body = json.dumps(
+        {
+            "otp": "OTPVALUE111",
+            "mnemonic": "MNEMONICVALUE222",
+            "jwt": "JWTVALUE333",
+            "client_cert": "CERTVALUE444",
+            "account": {"passport_number": "PASSPORTVALUE555"},
+            "amount": 10,
+        }
+    ).encode("utf-8")
+    record = build_audit_record(
+        integration="flask",
+        method="POST",
+        path="/api/enroll",
+        status=200,
+        client_ip="127.0.0.1",
+        headers=policy.headers({"X-Otp": "HEADEROTP666"}),
+        query=policy.query({"backup_code": ["QUERYBACKUP777"]}),
+        body=policy.decode_body(body),
+        body_reason="captured",
+    )
+    backend = PostgresBackend(
+        _PG_DSN,
+        entries_table=f"{redaction_pg_table}_entries",
+        checkpoints_table=f"{redaction_pg_table}_checkpoints",
+    )
+    with Ledger(backend=backend, ledger_id="b4-pg") as led:
+        led.append(record)
+
+    with psycopg.connect(_PG_DSN, connect_timeout=5) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(f'SELECT data FROM "{redaction_pg_table}_entries"')  # noqa: S608
+            stored = "".join(row[0] for row in cursor.fetchall())
+    leaked = [value for value in ("OTPVALUE111", "MNEMONICVALUE222", "JWTVALUE333",
+                                  "CERTVALUE444", "PASSPORTVALUE555", "HEADEROTP666",
+                                  "QUERYBACKUP777") if value in stored]
+    assert leaked == []

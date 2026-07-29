@@ -12,13 +12,18 @@ does not match its models breaks every ``manage.py migrate`` that installs it.
 """
 
 import ast
+import contextlib
 import json
+import logging
 import pathlib
 from typing import Any, Dict, Iterator, List
 
 import django
 import pytest
 from django.conf import settings
+
+#: The audit middleware, by path, so a test can rebuild ``MIDDLEWARE`` around it.
+AUDIT_MIDDLEWARE = "signledger.contrib.django.middleware.SignLedgerAuditMiddleware"
 
 if not settings.configured:
     settings.configure(
@@ -30,28 +35,64 @@ if not settings.configured:
         DATABASES={
             "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}
         },
-        INSTALLED_APPS=["signledger.contrib.django"],
-        MIDDLEWARE=["signledger.contrib.django.middleware.SignLedgerAuditMiddleware"],
+        # ``django.contrib.admin`` and its dependencies are installed deliberately.
+        # ``models.py`` promises an operator "can use the ORM and the Django admin to
+        # find a record", and the only way to know that promise holds is to reach the
+        # admin the way an operator does: a real superuser, a real URL, a real response.
+        INSTALLED_APPS=[
+            "django.contrib.contenttypes",
+            "django.contrib.auth",
+            "django.contrib.sessions",
+            "django.contrib.messages",
+            "django.contrib.admin",
+            "signledger.contrib.django",
+        ],
+        MIDDLEWARE=[
+            "django.contrib.sessions.middleware.SessionMiddleware",
+            "django.contrib.auth.middleware.AuthenticationMiddleware",
+            "django.contrib.messages.middleware.MessageMiddleware",
+            AUDIT_MIDDLEWARE,
+        ],
+        TEMPLATES=[
+            {
+                "BACKEND": "django.template.backends.django.DjangoTemplates",
+                "APP_DIRS": True,
+                "OPTIONS": {
+                    "context_processors": [
+                        "django.template.context_processors.request",
+                        "django.contrib.auth.context_processors.auth",
+                        "django.contrib.messages.context_processors.messages",
+                    ]
+                },
+            }
+        ],
+        STATIC_URL="/static/",
         ROOT_URLCONF="test_contrib_django",
         DEFAULT_AUTO_FIELD="django.db.models.BigAutoField",
     )
     django.setup()
 
+from django.contrib import admin  # noqa: E402
 from django.core.exceptions import ImproperlyConfigured  # noqa: E402
 from django.core.management import call_command  # noqa: E402
 from django.core.management.base import SystemCheckError  # noqa: E402
+from django.db import connection, transaction  # noqa: E402
 from django.http import HttpResponse, JsonResponse  # noqa: E402
 from django.test import Client, override_settings  # noqa: E402
-from django.urls import path  # noqa: E402
+from django.urls import path, reverse  # noqa: E402
 
 from signledger.backends.memory import MemoryBackend  # noqa: E402
-from signledger.contrib import FAIL_OPEN  # noqa: E402
+from signledger.contrib import FAIL_CLOSED, FAIL_OPEN  # noqa: E402
 from signledger.contrib.django import (  # noqa: E402
     SignLedgerDjangoConfigurationError,
     get_ledger,
     reset_ledger,
 )
+from signledger.contrib.django.admin import AuditIndexAdmin, register  # noqa: E402
 from signledger.contrib.django.apps import SignLedgerConfig  # noqa: E402
+from signledger.contrib.django.middleware import (  # noqa: E402
+    SignLedgerAuditMiddleware,
+)
 from signledger.contrib.django.models import AuditIndex  # noqa: E402
 from signledger.contrib.redaction import REDACTED  # noqa: E402
 from signledger.core.exceptions import ConfigurationError  # noqa: E402
@@ -88,6 +129,10 @@ urlpatterns = [
     path("boom", boom_view),
     path("health", health_view),
     path("echo", echo_view),
+    # Mounted exactly as ``startproject`` mounts it. ``admin.site.urls`` is built from
+    # whatever autodiscovery registered during ``django.setup()`` above, so this line is
+    # only useful if the package really does ship an ``admin`` module.
+    path("admin/", admin.site.urls),
 ]
 
 
@@ -104,6 +149,17 @@ def build_ledger() -> Ledger:
     ledger = Ledger(backend=MemoryBackend(), ledger_id="django-test")
     CURRENT["ledger"] = ledger
     return ledger
+
+
+def resolve_actor(request: Any) -> str:
+    """A ``USER_RESOLVER`` reachable by dotted path, the way a settings module names it.
+
+    Naming it rather than importing it is the whole point: importing a callable into
+    ``settings.py`` forces its module - and everything that module imports - to load
+    while the settings are still being read.
+    """
+    CURRENT.setdefault("resolver_calls", []).append(request)
+    return "actor-from-path"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -264,6 +320,54 @@ def test_an_unknown_audit_failure_policy_is_rejected() -> None:
         Client().get("/items")
 
 
+def test_a_ledger_factory_that_is_neither_callable_nor_a_path_is_reported() -> None:
+    """A built ``Ledger`` assigned straight to the setting has no ``rsplit``, so
+    ``import_string`` used to die with ``AttributeError`` - the one exception a
+    ``ConfigurationError`` handler does not catch."""
+    with override_settings(
+        SIGNLEDGER={"LEDGER_FACTORY": Ledger(backend=MemoryBackend())}
+    ), pytest.raises(ConfigurationError):
+        get_ledger()
+
+
+# --------------------------------------------------------------------------------------
+# USER_RESOLVER
+#
+# ``LEDGER_FACTORY`` takes a dotted path or a callable. ``USER_RESOLVER`` took a callable
+# only: a dotted path was stored verbatim, passed ``manage.py check``, and raised
+# ``TypeError: 'str' object is not callable`` on every single request. The inconsistency
+# *is* the trap, because a dotted path is the natural thing to write in a settings module.
+# --------------------------------------------------------------------------------------
+
+
+def test_a_user_resolver_given_as_a_dotted_path_is_imported() -> None:
+    with audited(USER_RESOLVER="test_contrib_django.resolve_actor"):
+        Client().get("/items")
+        assert entries()[0].data["user"] == "actor-from-path"
+
+
+def test_a_user_resolver_dotted_path_that_does_not_resolve_is_reported() -> None:
+    with audited(USER_RESOLVER="myapp.audit.no_such_resolver"), pytest.raises(
+        ConfigurationError
+    ):
+        Client().get("/items")
+
+
+def test_a_user_resolver_that_is_neither_callable_nor_a_path_is_reported() -> None:
+    with audited(USER_RESOLVER=42), pytest.raises(ConfigurationError):
+        Client().get("/items")
+
+
+def test_a_user_resolver_error_names_the_setting_it_came_from() -> None:
+    """``LEDGER_FACTORY`` and ``USER_RESOLVER`` resolve through the same code. An error
+    naming the wrong setting sends the reader to the wrong line of ``settings.py``."""
+    with audited(USER_RESOLVER="myapp.audit.no_such_resolver"), pytest.raises(
+        ConfigurationError
+    ) as caught:
+        Client().get("/items")
+    assert "USER_RESOLVER" in str(caught.value)
+
+
 # ======================================================================================
 # Django system checks
 #
@@ -393,6 +497,79 @@ def test_the_check_never_echoes_the_configured_value_back() -> None:
     assert "hunter2" not in rendered
 
 
+# --------------------------------------------------------------------------------------
+# ... and the same treatment for USER_RESOLVER, which had none: a dotted path there
+# passed every check there was and then 500ed every request.
+# --------------------------------------------------------------------------------------
+
+
+def test_manage_py_check_fails_when_the_user_resolver_does_not_import() -> None:
+    with audited(USER_RESOLVER="myapp.audit.no_such_resolver"), pytest.raises(
+        SystemCheckError
+    ) as caught:
+        call_command("check")
+    assert "USER_RESOLVER" in str(caught.value)
+
+
+def test_manage_py_check_fails_when_the_user_resolver_is_the_wrong_type() -> None:
+    with audited(USER_RESOLVER=42), pytest.raises(SystemCheckError):
+        call_command("check")
+
+
+def test_manage_py_check_passes_with_a_dotted_path_user_resolver() -> None:
+    with audited(USER_RESOLVER="test_contrib_django.resolve_actor"):
+        call_command("check")
+
+
+def test_an_unimportable_user_resolver_has_its_own_error_id() -> None:
+    from signledger.contrib.django.apps import check_user_resolver
+
+    with audited(USER_RESOLVER="myapp.audit.no_such_resolver"):
+        assert [error.id for error in check_user_resolver(None)] == [
+            "signledger_django.E004"
+        ]
+
+
+def test_a_user_resolver_of_the_wrong_type_has_its_own_error_id() -> None:
+    from signledger.contrib.django.apps import check_user_resolver
+
+    with audited(USER_RESOLVER=42):
+        assert [error.id for error in check_user_resolver(None)] == [
+            "signledger_django.E005"
+        ]
+
+
+def test_the_user_resolver_check_reports_nothing_when_there_is_none() -> None:
+    """It is optional, and absent is the default."""
+    from signledger.contrib.django.apps import check_user_resolver
+
+    with audited():
+        assert check_user_resolver(None) == []
+
+
+def test_the_user_resolver_check_reports_nothing_for_a_good_configuration() -> None:
+    from signledger.contrib.django.apps import check_user_resolver
+
+    with audited(USER_RESOLVER="test_contrib_django.resolve_actor"):
+        assert check_user_resolver(None) == []
+
+
+def test_the_user_resolver_check_resolves_it_without_calling_it() -> None:
+    """Checks run in the master process against a request that does not exist."""
+    with audited(USER_RESOLVER="test_contrib_django.resolve_actor"):
+        call_command("check")
+    assert "resolver_calls" not in CURRENT
+
+
+def test_the_user_resolver_check_never_echoes_the_configured_value_back() -> None:
+    from signledger.contrib.django.apps import check_user_resolver
+
+    secret = "myapp.audit.postgres://user:hunter2@db/audit"
+    with audited(USER_RESOLVER=secret):
+        rendered = " ".join(str(error) for error in check_user_resolver(None))
+    assert "hunter2" not in rendered
+
+
 # ======================================================================================
 # The headline requirement: credentials must not reach the ledger
 # ======================================================================================
@@ -426,10 +603,11 @@ def test_a_cookie_is_never_recorded() -> None:
 
 
 def test_a_query_parameter_carrying_an_api_key_is_redacted() -> None:
+    """Every value stays a list, redacted or not: arity is auditable, the value is not."""
     with audited():
         Client().get("/items?page=2&api_key=sk-live-1")
         query = entries()[0].data["query"]
-        assert (query["api_key"], query["page"]) == (REDACTED, ["2"])
+        assert (query["api_key"], query["page"]) == ([REDACTED], ["2"])
 
 
 # ======================================================================================
@@ -483,7 +661,18 @@ def test_the_resolved_user_is_recorded() -> None:
 
 
 def test_no_user_is_recorded_when_the_request_has_none() -> None:
-    """The auth app is not installed here, so ``request.user`` does not exist."""
+    """No ``AuthenticationMiddleware``, so ``request.user`` does not exist at all.
+
+    Not a hypothetical: an API-only deployment with token auth commonly runs without it,
+    and the middleware must not assume the attribute is there.
+    """
+    with audited(), override_settings(MIDDLEWARE=[AUDIT_MIDDLEWARE]):
+        Client().get("/items")
+        assert entries()[0].data["user"] is None
+
+
+def test_an_anonymous_django_user_is_recorded_as_no_user() -> None:
+    """The real ``AnonymousUser`` this time, attached by real auth middleware."""
     with audited():
         Client().get("/items")
         assert entries()[0].data["user"] is None
@@ -526,6 +715,166 @@ def test_the_index_is_written_for_every_request() -> None:
         for _ in range(3):
             Client().get("/items")
         assert AuditIndex.objects.count() == 3
+
+
+# ======================================================================================
+# The index is a convenience and is never the reason a request fails
+#
+# The ledger entry is written *first*, and only then is the index row. So an index write
+# that re-raised - which it did under the default ``fail_closed`` - turned a request the
+# ledger had already recorded, permanently and immutably, as a 200 into a 500 the client
+# actually received. A tamper-evident log asserting an outcome that did not happen is the
+# most damaging thing this library can produce, and the module docstring already promised
+# it could not: "the index is a convenience, and it is never allowed to be the reason a
+# request fails."
+# ======================================================================================
+
+
+@contextlib.contextmanager
+def no_index_table() -> Iterator[None]:
+    """Really drop the index table for the duration of the block.
+
+    A real ``OperationalError`` from real SQLite, and - unlike a colliding row - not
+    something the middleware can recover from. The table is dropped and rebuilt with
+    Django's own schema editor from the same model, so nothing here is simulated.
+    """
+    with connection.schema_editor() as editor:
+        editor.delete_model(AuditIndex)
+    try:
+        yield
+    finally:
+        with connection.schema_editor() as editor:
+            editor.create_model(AuditIndex)
+
+
+def test_the_ledger_never_records_an_outcome_the_client_did_not_receive() -> None:
+    """The headline of D1, stated as the invariant it broke."""
+    with audited(), no_index_table():
+        response = Client(raise_request_exception=False).get("/items")
+        assert entries()[0].data["status"] == response.status_code
+
+
+@pytest.mark.parametrize("policy", [FAIL_CLOSED, FAIL_OPEN])
+def test_an_index_failure_serves_the_real_response_under_either_policy(
+    policy: str,
+) -> None:
+    """``audit_failure_policy`` governs the *ledger* write. The index is not evidence,
+    so no setting may make it able to fail a request."""
+    with audited(AUDIT_FAILURE_POLICY=policy), no_index_table():
+        assert Client().get("/items").status_code == 200
+
+
+def test_the_evidence_is_still_written_when_the_mirror_cannot_be() -> None:
+    """And the fix must not be "index first": that would lose the entry instead."""
+    with audited(), no_index_table():
+        Client().get("/items")
+        assert get_ledger().count() == 1
+
+
+def test_an_index_failure_is_logged_rather_than_silently_dropped(caplog: Any) -> None:
+    """``fail_open`` used to swallow it whole: no row, no exception, no trace of either."""
+    with audited(AUDIT_FAILURE_POLICY=FAIL_OPEN), no_index_table():
+        with caplog.at_level(logging.WARNING, logger="signledger"):
+            Client().get("/items")
+    assert [record.levelno for record in caplog.records] == [logging.WARNING]
+    assert "OperationalError" in caplog.text
+
+
+def test_an_index_failure_log_never_carries_the_request_payload(caplog: Any) -> None:
+    """Contract section 10. The record being mirrored holds a redacted body, but the
+    exception a database raises can quote the row it refused."""
+    with audited(CAPTURE_BODY=True), no_index_table():
+        with caplog.at_level(logging.WARNING, logger="signledger"):
+            Client().post(
+                "/login",
+                data=json.dumps({"user": "ada", "password": "hunter2"}),
+                content_type="application/json",
+                HTTP_AUTHORIZATION="Bearer sk-live-51H8xQsecret",
+            )
+    rendered = caplog.text + repr([record.__dict__ for record in caplog.records])
+    assert caplog.records, "the failure was not reported at all"
+    assert "hunter2" not in rendered
+    assert "sk-live-51H8xQsecret" not in rendered
+
+
+def test_the_index_docstring_does_not_contradict_the_module_promise() -> None:
+    """The defect was two docstrings saying opposite things, with the code implementing
+    the damaging one. A method that conditions on the failure policy is the wrong one."""
+    method_doc = (SignLedgerAuditMiddleware._index.__doc__ or "").lower()
+    assert "never" in method_doc
+    assert FAIL_CLOSED not in method_doc
+    assert FAIL_OPEN not in method_doc
+
+
+# ======================================================================================
+# A stale index row is recoverable, not a reason to refuse traffic
+#
+# ``AuditIndex`` carries UNIQUE (ledger_id, sequence). The README Deployment section says
+# to read one stable ``ledger_id`` from configuration and hand it to every worker. Repoint
+# ``LEDGER_FACTORY`` at a fresh store - a new file, a restored backup, a wiped staging
+# database - while keeping that id, and the new chain starts again at sequence 0 on top of
+# index rows mirroring a store that no longer exists. The Django consumer took 307
+# consecutive 500s doing exactly what the README instructs.
+# ======================================================================================
+
+
+def test_repointing_the_store_under_a_stable_ledger_id_still_serves_traffic() -> None:
+    with audited():
+        Client().get("/items")
+        reset_ledger()  # a fresh store, the same configured ledger_id
+        assert Client(raise_request_exception=False).get("/items").status_code == 200
+
+
+def test_a_stale_index_row_is_replaced_by_the_entry_that_now_holds_the_position() -> None:
+    with audited():
+        Client().get("/items")
+        stale = AuditIndex.objects.get()
+        reset_ledger()
+        Client(raise_request_exception=False).get("/items")
+        rows = AuditIndex.objects.filter(ledger_id="django-test", sequence=0)
+        assert [row.entry_id for row in rows] == [entries()[0].entry_id]
+        assert rows[0].entry_id != stale.entry_id
+
+
+def test_the_index_keeps_mirroring_after_a_stale_row_was_replaced() -> None:
+    """A failed statement can leave a connection unusable. The next request must be
+    indexed normally, and the whole table must mirror the store that is live now."""
+    with audited():
+        Client().get("/items")
+        reset_ledger()
+        Client(raise_request_exception=False).get("/items")
+        Client().get("/items")
+        assert [row.sequence for row in AuditIndex.objects.all()] == [0, 1]
+        assert [row.entry_id for row in AuditIndex.objects.all()] == [
+            entry.entry_id for entry in entries()
+        ]
+
+
+def test_a_stale_index_row_is_replaced_inside_an_enclosing_transaction() -> None:
+    """A consumer's own ``TestCase`` wraps every request it makes in a transaction, and
+    a transaction middleware ahead of this one does the same in production. A rejected
+    INSERT that is not rolled back to a savepoint takes that transaction down with it."""
+    with audited():
+        Client().get("/items")
+        reset_ledger()
+        with transaction.atomic():
+            Client(raise_request_exception=False).get("/items")
+            rows = AuditIndex.objects.filter(ledger_id="django-test", sequence=0)
+            assert [row.entry_id for row in rows] == [entries()[0].entry_id]
+
+
+def test_replacing_a_stale_index_row_says_what_happened_and_what_to_do(
+    caplog: Any,
+) -> None:
+    """Refusing the request was the old answer, and it explained nothing to anyone."""
+    with audited():
+        Client().get("/items")
+        reset_ledger()
+        with caplog.at_level(logging.WARNING, logger="signledger"):
+            Client(raise_request_exception=False).get("/items")
+    assert [record.levelno for record in caplog.records] == [logging.WARNING]
+    assert "LEDGER_FACTORY" in caplog.text
+    assert "django-test" in caplog.text
 
 
 # ======================================================================================
@@ -676,9 +1025,6 @@ def attach_anonymous_user(get_response: Any) -> Any:
     return middleware
 
 
-AUDIT_MIDDLEWARE = "signledger.contrib.django.middleware.SignLedgerAuditMiddleware"
-
-
 def test_a_signed_in_user_is_recorded_by_primary_key() -> None:
     """The pk, not the username: it survives a rename and is less likely to be personal
     data than the name someone chose."""
@@ -706,66 +1052,6 @@ def test_an_explicit_resolver_wins_over_the_request_user() -> None:
         assert entries()[0].data["user"] is None
 
 
-def test_an_index_write_failure_under_fail_closed_fails_the_request() -> None:
-    """A real unique-constraint violation from real SQLite, not a simulated one."""
-    with audited():
-        Client().get("/items")
-        entry = entries()[0]
-        AuditIndex.objects.all().delete()
-        AuditIndex.objects.create(
-            ledger_id=entry.ledger_id,
-            sequence=1,
-            entry_id="pre-existing",
-            entry_hash="0" * 64,
-            timestamp=entry.timestamp,
-            method="GET",
-            path="/items",
-            status=200,
-            actor=None,
-        )
-        assert Client(raise_request_exception=False).get("/items").status_code == 500
-
-
-def test_an_index_write_failure_under_fail_open_still_serves_the_request() -> None:
-    """The evidence is already in the ledger. A convenience table must not 500 a request."""
-    with audited(AUDIT_FAILURE_POLICY=FAIL_OPEN):
-        Client().get("/items")
-        entry = entries()[0]
-        AuditIndex.objects.all().delete()
-        AuditIndex.objects.create(
-            ledger_id=entry.ledger_id,
-            sequence=1,
-            entry_id="pre-existing",
-            entry_hash="0" * 64,
-            timestamp=entry.timestamp,
-            method="GET",
-            path="/items",
-            status=200,
-            actor=None,
-        )
-        assert Client().get("/items").status_code == 200
-
-
-def test_an_index_write_failure_is_counted_rather_than_swallowed() -> None:
-    with audited(AUDIT_FAILURE_POLICY=FAIL_OPEN):
-        Client().get("/items")
-        entry = entries()[0]
-        AuditIndex.objects.all().delete()
-        AuditIndex.objects.create(
-            ledger_id=entry.ledger_id,
-            sequence=1,
-            entry_id="pre-existing",
-            entry_hash="0" * 64,
-            timestamp=entry.timestamp,
-            method="GET",
-            path="/items",
-            status=200,
-            actor=None,
-        )
-        Client().get("/items")
-        assert get_ledger().count() == 2
-
-
 def test_an_unparseable_content_length_is_treated_as_absent() -> None:
     with audited(CAPTURE_BODY=True):
         Client().post(
@@ -782,6 +1068,137 @@ def test_an_index_row_names_its_chain_position_when_printed() -> None:
     with audited():
         Client().get("/items")
         assert str(AuditIndex.objects.get()).endswith("#0")
+
+
+# ======================================================================================
+# The Django admin
+#
+# ``models.py`` says the index exists "so an operator can use the ORM and the Django
+# admin to find a record", and no ``admin.py`` shipped: ``AuditIndex`` was registered
+# with no admin site and its URL 404ed. An operator with a UI is the reason the mirror
+# table is worth having, so the promise is kept - read-only, because every row mirrors
+# an append-only log that nobody may edit through a web form.
+# ======================================================================================
+
+#: The changelist an operator lands on. ``reverse()`` only knows this name if the model
+#: is registered, so every use of it is also an assertion that it is.
+CHANGELIST = "admin:signledger_django_auditindex_changelist"
+
+
+@pytest.fixture
+def operator() -> Client:
+    """A logged-in superuser, the way an operator actually reaches the admin."""
+    from django.contrib.auth.models import User
+
+    User.objects.all().delete()
+    user = User.objects.create(username="operator", is_staff=True, is_superuser=True)
+    client = Client()
+    client.force_login(user)
+    return client
+
+
+def test_the_audit_index_is_registered_with_the_admin() -> None:
+    """Autodiscovery imported it during ``django.setup()``; nothing here helped it."""
+    assert admin.site.is_registered(AuditIndex)
+
+
+def test_the_admin_url_for_the_index_resolves() -> None:
+    assert reverse(CHANGELIST) == "/admin/signledger_django/auditindex/"
+
+
+def test_an_operator_can_find_a_recorded_request_in_the_admin(operator: Client) -> None:
+    with audited():
+        Client().get("/items")
+        response = operator.get(reverse(CHANGELIST))
+    assert response.status_code == 200
+    assert "/items" in response.content.decode("utf-8")
+
+
+def test_an_operator_can_open_the_row_for_a_recorded_request(operator: Client) -> None:
+    with audited():
+        Client().get("/items")
+        row = AuditIndex.objects.get()
+        url = reverse("admin:signledger_django_auditindex_change", args=[row.pk])
+        assert operator.get(url).status_code == 200
+
+
+def test_the_admin_refuses_to_add_a_row(operator: Client) -> None:
+    """There is no such thing as an audit entry that was not audited."""
+    with audited():
+        url = reverse("admin:signledger_django_auditindex_add")
+        assert operator.get(url).status_code == 403
+
+
+def test_the_admin_refuses_to_change_a_row(operator: Client) -> None:
+    with audited():
+        Client().get("/items")
+        row = AuditIndex.objects.get()
+        url = reverse("admin:signledger_django_auditindex_change", args=[row.pk])
+        assert operator.post(url, {"status": "500"}).status_code == 403
+        # The operator's own request is audited too, so this names the row it aimed at.
+        assert AuditIndex.objects.get(pk=row.pk).status == 200
+
+
+def test_the_admin_refuses_to_delete_a_row(operator: Client) -> None:
+    with audited():
+        Client().get("/items")
+        row = AuditIndex.objects.get()
+        url = reverse("admin:signledger_django_auditindex_delete", args=[row.pk])
+        assert operator.post(url, {"post": "yes"}).status_code == 403
+        assert AuditIndex.objects.filter(pk=row.pk).exists()
+
+
+def test_the_model_admin_grants_no_write_permission_to_anyone() -> None:
+    """Not even a superuser, and not for any object: the answer never depends on who
+    is asking, because the row is a mirror of something that cannot change."""
+    from django.test import RequestFactory
+
+    model_admin = AuditIndexAdmin(AuditIndex, admin.site)
+    request = RequestFactory().get("/admin/")
+    assert not model_admin.has_add_permission(request)
+    assert not model_admin.has_change_permission(request)
+    assert not model_admin.has_delete_permission(request)
+
+
+def test_every_field_is_read_only_in_the_admin() -> None:
+    """Belt and braces with the permissions above: a field that is not listed here
+    renders as an editable widget the moment someone adds a change permission back."""
+    from django.test import RequestFactory
+
+    model_admin = AuditIndexAdmin(AuditIndex, admin.site)
+    request = RequestFactory().get("/admin/")
+    assert set(model_admin.get_readonly_fields(request)) == {
+        field.name for field in AuditIndex._meta.fields
+    }
+
+
+def test_registering_on_a_second_admin_site_works() -> None:
+    """A deployment with its own ``AdminSite`` is normal, and ``register()`` is the
+    documented way to reach it."""
+    site = admin.AdminSite()
+    assert register(site) is True
+    assert site.is_registered(AuditIndex)
+
+
+def test_registering_twice_is_not_an_error() -> None:
+    """``admin.site.register`` raises ``AlreadyRegistered``. Autodiscovery, an explicit
+    call and an autoreload can all land on the same site."""
+    site = admin.AdminSite()
+    register(site)
+    assert register(site) is True
+
+
+def test_nothing_is_registered_when_the_admin_app_is_not_installed() -> None:
+    """The module must import in a project without ``django.contrib.admin``: touching
+    ``admin.site`` there raises ``LookupError: No installed app with label 'admin'``,
+    and ``tests/test_packaging.py`` imports every module in the package in exactly such
+    a project."""
+    site = admin.AdminSite()
+    with override_settings(
+        INSTALLED_APPS=["django.contrib.contenttypes", "signledger.contrib.django"]
+    ):
+        assert register(site) is False
+    assert not site.is_registered(AuditIndex)
 
 
 # ======================================================================================

@@ -289,10 +289,185 @@ pip install 'signledger[fastapi]'  # signledger.contrib.fastapi
 pip install 'signledger[django]'   # signledger.contrib.django
 ```
 
-Request data is redacted before it is written: field names containing `password`, `token`,
-`secret`, `ssn`, `card`, `cvv` and friends are replaced — in the body, the headers **and**
-the query string. Matching is by substring, so it over-redacts rather than under-redacts.
-For a store nobody can edit afterwards, that is the correct direction to be wrong in.
+Every example below is taken from a working project that was built against the published
+wheel and driven with real traffic under `gunicorn -w 4` or `uvicorn --workers 4`.
+
+One rule applies to all three: **build the `Ledger` inside your application factory, not at
+module scope.** A pre-forking server imports your module once and then forks, so a ledger
+built at import time hands every worker the same database handle. On PostgreSQL that
+corrupts the wire protocol between processes. Build it per worker, after the fork, and pass
+the same `ledger_id` to each — see [Deployment](#deployment).
+
+### Flask
+
+```python
+from flask import Flask
+from signledger import Ledger
+from signledger.backends import SQLiteBackend
+from signledger.contrib.flask import SignLedgerAudit, audit_blueprint
+from signledger.contrib.redaction import RedactionPolicy
+
+
+def create_app():
+    app = Flask(__name__)
+
+    ledger = Ledger(SQLiteBackend("audit.db"), ledger_id="billing-api")
+
+    SignLedgerAudit(
+        app,
+        ledger=ledger,
+        redaction=RedactionPolicy(capture_body=True),
+        audit_failure_policy="fail_closed",
+        skip_paths=("/health",),
+        user_resolver=lambda request: getattr(request, "actor", None),
+    )
+    return app
+```
+
+`audit_failure_policy` is the decision that matters. `fail_closed` (the default) means a
+request whose audit entry cannot be written **fails** — the client gets a 500 and nothing
+happens unrecorded. `fail_open` serves the request anyway and drops the record. For a
+compliance log the first is almost always right; choosing the second should be a decision
+someone wrote down.
+
+`skip_paths` keeps health checks out of the ledger. A load balancer polling `/health` twice
+a second will otherwise bury every real event.
+
+`audit_blueprint(ledger, authenticator=...)` mounts a read-only console at `/_audit/status`,
+`/_audit/entries` and `/_audit/verify`. It exposes hashes, sequences and timestamps — never
+payloads. There is deliberately no default authenticator: it is your audit log, and the
+library will not guess who may read it.
+
+### FastAPI
+
+```python
+from fastapi import FastAPI, Request
+from signledger import Ledger
+from signledger.backends import SQLiteBackend
+from signledger.contrib.fastapi import SignLedgerAuditMiddleware, audit_router
+from signledger.contrib.redaction import RedactionPolicy
+
+
+def create_app():
+    ledger = Ledger(SQLiteBackend("audit.db"), ledger_id="payments-api")
+
+    app = FastAPI()
+    app.add_middleware(
+        SignLedgerAuditMiddleware,
+        ledger=ledger,
+        redaction=RedactionPolicy(capture_body=True),
+        skip_paths=("/health",),
+        user_resolver=lambda request: request.headers.get("x-actor"),
+    )
+    app.include_router(
+        audit_router(
+            ledger,
+            authenticator=lambda request: request.headers.get("x-audit-key") == "…",
+        )
+    )
+    return app
+```
+
+The `audited` decorator records a *business* event rather than an HTTP request, and composes
+with the middleware rather than replacing it:
+
+```python
+from fastapi import APIRouter
+from signledger import Ledger
+from signledger.contrib.fastapi import audited
+
+ledger = Ledger()
+router = APIRouter()
+
+
+@router.post("/transfer")
+@audited(lambda: ledger, action="funds.transfer")
+async def transfer(amount: str) -> dict:
+    return {"transferred": amount}
+
+
+ledger.close()
+```
+
+A route carrying both writes **two** entries — one describing the request, one describing the
+action. That is intentional, but know that it is happening. Pass a callable (as above) rather
+than a `Ledger` instance so the ledger is resolved per request, which is what lets the
+decorator work with a per-worker ledger.
+
+Streaming responses are audited when the status line is sent, because a fail-closed entry has
+to be written before the first byte leaves. A generator that raises *after* that point is
+therefore recorded at the status it started with; the module docstring explains the exact
+semantics.
+
+### Django
+
+```python
+# settings.py
+INSTALLED_APPS = [
+    ...,
+    "signledger.contrib.django",
+]
+
+MIDDLEWARE = [
+    ...,
+    "signledger.contrib.django.middleware.SignLedgerAuditMiddleware",
+]
+
+SIGNLEDGER = {
+    "LEDGER_FACTORY": "myapp.audit.build_ledger",   # required, no default
+    "USER_RESOLVER": "myapp.audit.acting_user",     # optional
+    "CAPTURE_BODY": True,
+    "AUDIT_FAILURE_POLICY": "fail_closed",
+    "TRUSTED_PROXY_COUNT": 0,
+}
+```
+
+```python
+# myapp/audit.py
+from signledger import Ledger
+from signledger.backends import SQLiteBackend
+
+
+def build_ledger():
+    return Ledger(SQLiteBackend("audit.db"), ledger_id="orders-service")
+
+
+def acting_user(request):
+    user = getattr(request, "user", None)
+    if user is None or not user.is_authenticated:
+        return None
+    return user.get_username()
+```
+
+`LEDGER_FACTORY` is **required and has no default**. It and `USER_RESOLVER` both accept a
+dotted path or a callable; a dotted path is usually better in `settings.py`, because a
+callable forces the import at settings-import time.
+
+Then run migrations — the app ships one, and you should never be asked to generate it:
+
+```bash
+python manage.py migrate
+python manage.py check     # fails if LEDGER_FACTORY is missing or unimportable
+```
+
+`manage.py check` validates the configuration at deploy time rather than letting the first
+request discover it. Take it seriously in CI.
+
+The app also creates an `AuditIndex` table. It is a **queryable mirror**, not the evidence —
+the ledger is the evidence. It exists so you can find a record with the ORM or the Django
+admin (a read-only `ModelAdmin` ships) without walking the chain. An index write that fails
+is logged and never fails the request; an entry that is in the ledger but missing from the
+index is a stale mirror, not a broken audit trail.
+
+If you repoint `LEDGER_FACTORY` at a fresh store while keeping the same `ledger_id`, the
+index rows from the old store are stale and are replaced as new entries arrive.
+
+## What gets redacted, and what does not
+
+Sensitive fields are replaced before anything is written — in the body, the headers **and**
+the query string, by one shared rule so the three can never disagree. Matching is by
+substring on the field *name*, and covers passwords, tokens, secrets, keys, one-time codes,
+crypto material, certificates and common PII identifiers.
 
 ```python
 from signledger.contrib.redaction import RedactionPolicy
@@ -300,6 +475,24 @@ from signledger.contrib.redaction import RedactionPolicy
 policy = RedactionPolicy()
 print(policy.payload({"user": "alice", "password": "hunter2"}))
 ```
+
+**Request bodies are not captured at all unless you ask.** `capture_body` defaults to
+`False`; headers and query strings are always redacted.
+
+Three limits worth understanding before you turn body capture on, because this data goes
+somewhere nobody can edit it afterwards:
+
+- **A name denylist can never be complete.** The rule was widened after fuzzing 146,000
+  generated field names found whole categories it missed. Yours may use a name nobody
+  anticipated. Add them with `RedactionPolicy(extra_sensitive_fields=("customer_email",))`.
+- **Free text is never scanned.** A field called `notes` containing *"the customer said
+  their password is hunter2"* is stored verbatim. Redaction reads field names, not values.
+- **It deliberately over-redacts.** Short stems are matched as whole words, so `shipping`,
+  `pinned`, `single`, `business`, `seeded` and `concert` survive. Longer ones are matched as
+  substrings, so `keyword`, `keyboard`, `author`, `discard` and `wildcard` **are** blanked.
+  For a store nobody can edit afterwards, that is the correct direction to be wrong in.
+
+If a payload must never be stored even redacted, do not send it through the audited path.
 
 ## Deployment
 

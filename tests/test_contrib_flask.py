@@ -17,7 +17,8 @@ import sys
 from typing import Any, Dict, Iterator, List
 
 import pytest
-from flask import Flask
+from flask import Flask, Response
+from werkzeug.test import EnvironBuilder
 
 from signledger.backends.memory import MemoryBackend
 from signledger.contrib import FAIL_OPEN, AuditWriteError
@@ -62,6 +63,75 @@ def make_app(ledger: Ledger, **kwargs: Any) -> Flask:
 
 def entries(ledger: Ledger) -> List[Any]:
     return list(ledger.iter_entries())
+
+
+def kinds(ledger: Ledger) -> List[Any]:
+    return [entry.data.get("kind") for entry in entries(ledger)]
+
+
+def streaming_app(ledger: Ledger, **kwargs: Any) -> Flask:
+    """Views whose body is produced *after* ``after_request`` has already run."""
+    app = Flask(__name__)
+    app.config["PROPAGATE_EXCEPTIONS"] = False
+    SignLedgerAudit(app, ledger=ledger, **kwargs)
+
+    @app.get("/stream")
+    def stream() -> Response:
+        def body() -> Iterator[bytes]:
+            yield b'{"row": 0}\n'
+            yield b'{"row": 1}\n'
+
+        return Response(body(), mimetype="application/x-ndjson")
+
+    @app.get("/broken-stream")
+    def broken_stream() -> Response:
+        def body() -> Iterator[bytes]:
+            yield b'{"row": 0}\n'
+            raise RuntimeError("settlement feed died mid-stream")
+
+        return Response(body(), mimetype="application/x-ndjson")
+
+    @app.get("/plain-iterator")
+    def plain_iterator() -> Response:
+        """An iterable with no ``close`` at all - a list iterator is one."""
+        return Response(iter([b'{"row": 0}\n']), mimetype="application/x-ndjson")
+
+    return app
+
+
+def run_wsgi(app: Flask, path: str) -> List[bytes]:
+    """Drive one request the way a conforming WSGI server does.
+
+    PEP 3333: "If the iterable returned by the application has a ``close()`` method, the
+    server or gateway **must** call that method upon completion of the current request,
+    whether the request was completed normally or terminated early due to an application
+    error." gunicorn, waitress and ``werkzeug.serving`` all do exactly this.
+
+    Werkzeug's *test client* does not: it pulls one chunk, hands back a response whose
+    body is consumed lazily when the test touches ``.data``, and abandons the iterator
+    outright if it raises. A streamed body that dies therefore cannot be observed through
+    it at all - which is also why the defect this drives at was invisible until the
+    consumer project ran under a real server.
+    """
+    iterable = wsgi_request(app, path)
+    chunks: List[bytes] = []
+    try:
+        for chunk in iterable:
+            chunks.append(chunk)
+    finally:
+        close = getattr(iterable, "close", None)
+        if close is not None:
+            close()
+    return chunks
+
+
+def wsgi_request(app: Flask, path: str) -> Any:
+    """The raw WSGI iterable for one request, not yet consumed."""
+
+    def start_response(status: str, headers: Any, exc_info: Any = None) -> Any:
+        return lambda chunk: None
+
+    return app(EnvironBuilder(path=path).get_environ(), start_response)
 
 
 # ======================================================================================
@@ -117,7 +187,7 @@ def test_a_query_parameter_carrying_a_token_is_redacted(ledger: Ledger) -> None:
     client = make_app(ledger).test_client()
     client.get("/items?page=2&access_token=abc123")
     query = entries(ledger)[0].data["query"]
-    assert (query["access_token"], query["page"]) == (REDACTED, ["2"])
+    assert (query["access_token"], query["page"]) == ([REDACTED], ["2"])
 
 
 # ======================================================================================
@@ -211,6 +281,211 @@ def test_a_user_resolver_returning_a_non_string_is_coerced(ledger: Ledger) -> No
     app = make_app(ledger, user_resolver=lambda request: 42)
     app.test_client().get("/items")
     assert entries(ledger)[0].data["user"] == "42"
+
+
+# ======================================================================================
+# A streamed response is not a settled one
+#
+# ``after_request`` runs when the response *object* is built, which for a streamed body
+# is before a single byte of it has been generated: Flask hands the iterable to the WSGI
+# server afterwards. So the status in the entry is a promise, exactly as it is under
+# ASGI, and a generator that raised on its second chunk was measurably in the ledger as
+# a plain 200.
+# ======================================================================================
+
+
+def test_a_streamed_response_is_recorded_as_provisional(ledger: Ledger) -> None:
+    streaming_app(ledger).test_client().get("/stream")
+    assert entries(ledger)[0].data["completion"] == "provisional"
+
+
+def test_a_buffered_response_is_recorded_as_final(ledger: Ledger) -> None:
+    """The whole body existed when the entry was written, so the status is settled."""
+    make_app(ledger).test_client().get("/items")
+    assert entries(ledger)[0].data["completion"] == "final"
+
+
+def test_a_buffered_response_writes_exactly_one_entry(ledger: Ledger) -> None:
+    make_app(ledger).test_client().get("/items")
+    assert ledger.count() == 1
+
+
+@pytest.mark.parametrize(
+    ("method", "status"),
+    [("HEAD", 200), ("GET", 204), ("GET", 304), ("GET", 100)],
+)
+def test_a_response_whose_body_is_never_sent_is_not_provisional(
+    ledger: Ledger, method: str, status: int
+) -> None:
+    """Werkzeug drops the body entirely for these, so the iterable is never consumed.
+
+    A provisional entry for one of them would wait forever for a settlement that cannot
+    come - which is worse than the overclaim it was meant to fix.
+    """
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+
+    @app.route("/x", methods=["GET", "HEAD"])
+    def view() -> Response:
+        return Response(iter([b"body"]), status=status)
+
+    app.test_client().open("/x", method=method)
+    assert (entries(ledger)[0].data["completion"], ledger.count()) == ("final", 1)
+
+
+def test_a_completed_stream_is_settled_by_a_second_entry(ledger: Ledger) -> None:
+    run_wsgi(streaming_app(ledger), "/stream")
+    assert kinds(ledger) == ["request", "response.completion"]
+
+
+def test_a_completed_stream_settles_as_complete(ledger: Ledger) -> None:
+    run_wsgi(streaming_app(ledger), "/stream")
+    assert entries(ledger)[1].data["outcome"] == "complete"
+
+
+def test_a_stream_that_dies_mid_body_is_not_left_recorded_as_a_success(
+    ledger: Ledger,
+) -> None:
+    """Measured: the generator raised on its second chunk, the client got a truncated
+    body, and the ledger said ``200`` and nothing else, permanently."""
+    with pytest.raises(RuntimeError):
+        run_wsgi(streaming_app(ledger), "/broken-stream")
+    assert entries(ledger)[1].data["outcome"] == "incomplete"
+
+
+def test_a_stream_that_dies_mid_body_records_the_exception_type(ledger: Ledger) -> None:
+    with pytest.raises(RuntimeError):
+        run_wsgi(streaming_app(ledger), "/broken-stream")
+    assert entries(ledger)[1].data["error"] == "RuntimeError"
+
+
+def test_the_promised_entry_is_never_rewritten_by_the_settlement(ledger: Ledger) -> None:
+    with pytest.raises(RuntimeError):
+        run_wsgi(streaming_app(ledger), "/broken-stream")
+    data = entries(ledger)[0].data
+    assert (data["status"], "error" not in data) == (200, True)
+
+
+def test_the_settlement_entry_carries_the_request_id_of_the_entry_it_settles(
+    ledger: Ledger,
+) -> None:
+    run_wsgi(streaming_app(ledger), "/stream")
+    request_entry, settlement = entries(ledger)
+    assert settlement.data["request_id"] == request_entry.data["request_id"]
+
+
+def test_the_settlement_entry_names_the_request_it_settles(ledger: Ledger) -> None:
+    run_wsgi(streaming_app(ledger), "/stream")
+    data = entries(ledger)[1].data
+    assert (data["method"], data["path"], data["status"]) == ("GET", "/stream", 200)
+
+
+def test_a_stream_the_server_abandons_early_is_recorded_as_incomplete(
+    ledger: Ledger,
+) -> None:
+    """A client that hangs up: the server closes the iterable without draining it.
+
+    Nothing raised, so no ``error`` is named - inventing one would be its own lie.
+    """
+    iterable = wsgi_request(streaming_app(ledger), "/stream")
+    next(iter(iterable))
+    iterable.close()
+    data = entries(ledger)[1].data
+    assert (data["outcome"], "error" not in data) == ("incomplete", True)
+
+
+def test_two_requests_do_not_share_a_request_id(ledger: Ledger) -> None:
+    client = make_app(ledger).test_client()
+    client.get("/items")
+    client.get("/items")
+    first, second = entries(ledger)
+    assert first.data["request_id"] != second.data["request_id"]
+
+
+def test_the_request_entry_says_what_kind_of_record_it_is(ledger: Ledger) -> None:
+    make_app(ledger).test_client().get("/items")
+    assert entries(ledger)[0].data["kind"] == "request"
+
+
+def test_the_underlying_iterator_is_still_closed(ledger: Ledger) -> None:
+    """Wrapping the body must not leak the file handle behind a ``send_file``."""
+    closed: List[bool] = []
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+
+    def body() -> Iterator[bytes]:
+        try:
+            yield b'{"row": 0}\n'
+        finally:
+            closed.append(True)
+
+    @app.get("/x")
+    def view() -> Response:
+        return Response(body(), mimetype="application/x-ndjson")
+
+    run_wsgi(app, "/x")
+    assert closed == [True]
+
+
+def test_an_iterable_with_no_close_method_is_still_settled(ledger: Ledger) -> None:
+    """``Response(iter([...]))`` is legal WSGI and has no ``close``."""
+    run_wsgi(streaming_app(ledger), "/plain-iterator")
+    assert entries(ledger)[1].data["outcome"] == "complete"
+
+
+def test_a_file_response_is_settled_too(ledger: Ledger, tmp_path: Any) -> None:
+    """``send_file`` returns a streamed ``direct_passthrough`` response, and werkzeug
+    skips a response's ``call_on_close`` callbacks entirely for those - it hands the
+    server the body iterable directly. Settling from the body itself is what reaches
+    this case at all."""
+    from flask import send_file
+
+    path = tmp_path / "statement.txt"
+    path.write_text("hello file body")
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+
+    @app.get("/file")
+    def view() -> Response:
+        return send_file(str(path), mimetype="text/plain")
+
+    assert run_wsgi(app, "/file") == [b"hello file body"]
+    assert kinds(ledger) == ["request", "response.completion"]
+
+
+def test_closing_a_response_twice_settles_it_once(ledger: Ledger) -> None:
+    """Servers and test clients both close a response more than once - werkzeug's own
+    ``ClosingIterator`` closes the body, and the ``Response`` object closes it again. A
+    second settlement entry would be a second claim about the same response."""
+    iterable = wsgi_request(streaming_app(ledger), "/stream")
+    list(iterable)
+    iterable.close()
+    iterable.close()
+    assert kinds(ledger) == ["request", "response.completion"]
+
+
+def test_a_settlement_that_cannot_be_written_is_counted_not_raised(
+    ledger: Ledger,
+) -> None:
+    """The client has had the response since the first chunk; there is no refusing it
+    now. The failure is counted on the recorder rather than raised into a WSGI server
+    that is already closing the response down."""
+    app = streaming_app(ledger)
+    audit = app.extensions["signledger"]
+
+    def close_the_backend() -> Iterator[bytes]:
+        yield b'{"row": 0}\n'
+        ledger.backend.close()
+
+    @app.get("/breaks-after-the-first-chunk")
+    def view() -> Response:
+        return Response(close_the_backend(), mimetype="application/x-ndjson")
+
+    assert run_wsgi(app, "/breaks-after-the-first-chunk") == [b'{"row": 0}\n']
+    assert (audit.recorder.audit_failures, audit.recorder.last_audit_error) == (
+        1,
+        "StorageError",
+    )
 
 
 # ======================================================================================

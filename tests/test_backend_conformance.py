@@ -10,6 +10,8 @@ that make its rows append-only, its connection registry, and the small helpers e
 backend is built from.
 """
 
+import hashlib
+import os
 import sqlite3
 import subprocess
 import sys
@@ -1494,3 +1496,230 @@ class TestTheSuiteRefusesToRunWithAssertionsDisabled:
 
         assert result.returncode == 0, result.stderr
         assert "ok" in result.stdout
+
+
+# --------------------------------------------------------------------------------------
+# opening a store without provisioning it
+# --------------------------------------------------------------------------------------
+
+
+def _file_digest(path):
+    """Every byte of the database file, so "unchanged" really means unchanged."""
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def _journal_mode(path):
+    """The journal mode recorded in the file's own header."""
+    raw = sqlite3.connect(str(path))
+    try:
+        return str(raw.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    finally:
+        raw.close()
+
+
+def _schema_objects(path):
+    """Every table, index and trigger the file holds, by name."""
+    raw = sqlite3.connect(str(path))
+    try:
+        return sorted(
+            row[0]
+            for row in raw.execute("SELECT name FROM sqlite_master WHERE name IS NOT NULL")
+        )
+    finally:
+        raw.close()
+
+
+class TestSQLiteOpensWithoutProvisioning:
+    """``create=False`` reads a store that exists and refuses to bring one into being.
+
+    Two separate defects live here. ``signledger verify`` on a mistyped path conjured a
+    32 KiB database, armed its append-only triggers and reported an empty ledger - which
+    an operator reads as "my audit log is gone", not as "I typed the wrong name". And
+    ``PRAGMA journal_mode = WAL`` is itself a write to the database header, so an
+    integrity check could not be run against a copy the process may not write at all.
+    """
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        """A real three-entry ledger, on disk, closed."""
+        path = str(tmp_path / "ledger.db")
+        backend = SQLiteBackend(path)
+        BackendConformanceSuite().append_many(backend, 3)
+        backend.close()
+        return path
+
+    def test_a_missing_file_is_refused_rather_than_created(self, tmp_path):
+        missing = tmp_path / "typo.db"
+
+        with pytest.raises(StorageError) as caught:
+            SQLiteBackend(str(missing), create=False)
+
+        assert not missing.exists()
+        assert "does not exist" in str(caught.value)
+
+    def test_the_refusal_names_the_path_it_was_pointed_at(self, tmp_path):
+        missing = tmp_path / "typo.db"
+
+        with pytest.raises(StorageError) as caught:
+            SQLiteBackend(str(missing), create=False)
+
+        assert str(missing) in str(caught.value)
+
+    def test_an_in_memory_database_is_refused(self):
+        """It is created empty every time it is opened, so there is nothing to read."""
+        with pytest.raises(StorageError) as caught:
+            SQLiteBackend(":memory:", create=False)
+
+        assert "in-memory" in str(caught.value)
+
+    def test_a_database_that_holds_no_entries_table_is_refused(self, tmp_path):
+        path = tmp_path / "unrelated.db"
+        sqlite3.connect(str(path)).close()
+
+        with pytest.raises(StorageError) as caught:
+            SQLiteBackend(str(path), create=False)
+
+        assert "ledger_entries" in str(caught.value)
+
+    def test_a_store_whose_checkpoints_table_is_absent_is_refused(self, store):
+        raw = sqlite3.connect(store)
+        raw.execute("DROP TABLE ledger_checkpoints")
+        raw.commit()
+        raw.close()
+
+        with pytest.raises(StorageError) as caught:
+            SQLiteBackend(store, create=False)
+
+        assert "ledger_checkpoints" in str(caught.value)
+
+    def test_a_mistyped_table_name_is_refused_rather_than_created(self, store):
+        with pytest.raises(StorageError) as caught:
+            SQLiteBackend(store, entries_table="ledger_entires", create=False)
+
+        assert "ledger_entires" in str(caught.value)
+        assert "ledger_entires" not in _schema_objects(store)
+
+    def test_the_file_is_byte_identical_after_a_read_only_open(self, store):
+        before = _file_digest(store)
+
+        backend = SQLiteBackend(store, create=False)
+        try:
+            assert [entry.sequence for entry in backend.iter_entries()] == [0, 1, 2]
+        finally:
+            backend.close()
+
+        assert _file_digest(store) == before
+
+    def test_the_journal_mode_recorded_in_the_file_is_left_alone(self, tmp_path):
+        """``PRAGMA journal_mode = WAL`` writes to the database header. Never here."""
+        path = str(tmp_path / "rollback.db")
+        backend = SQLiteBackend(path)
+        BackendConformanceSuite().append_many(backend, 1)
+        backend.close()
+        raw = sqlite3.connect(path)
+        raw.execute("PRAGMA journal_mode = DELETE").fetchall()
+        raw.close()
+
+        reader = SQLiteBackend(path, create=False)
+        try:
+            assert reader.count() == 1
+        finally:
+            reader.close()
+
+        assert _journal_mode(path) == "delete"
+
+    def test_no_schema_object_is_created_by_a_read_only_open(self, store):
+        before = _schema_objects(store)
+
+        SQLiteBackend(store, create=False).close()
+
+        assert _schema_objects(store) == before
+
+    def test_a_removed_append_only_trigger_is_not_re_armed(self, store):
+        """A missing trigger is evidence. Reading the store must not destroy it."""
+        raw = sqlite3.connect(store)
+        raw.execute("DROP TRIGGER ledger_entries_no_update")
+        raw.execute("DROP TRIGGER ledger_entries_no_delete")
+        raw.commit()
+        raw.close()
+
+        backend = SQLiteBackend(store, create=False)
+        try:
+            assert CAP_APPEND_ONLY_ENFORCED not in backend.capabilities()
+        finally:
+            backend.close()
+
+        assert "ledger_entries_no_update" not in _schema_objects(store)
+
+    def test_every_read_still_answers(self, store):
+        backend = SQLiteBackend(store, create=False)
+        try:
+            assert backend.count() == 3
+            assert backend.get_head().sequence == 2
+            assert backend.get_oldest().sequence == 0
+            assert backend.get_by_sequence(1).sequence == 1
+            assert backend.get_entry(backend.get_head().entry_id) is not None
+            assert backend.size_bytes() > 0
+            assert backend.get_latest_checkpoint() is None
+            assert list(backend.iter_checkpoints()) == []
+            assert CAP_APPEND_ONLY_ENFORCED in backend.capabilities()
+        finally:
+            backend.close()
+
+    def test_a_file_this_process_may_not_write_can_still_be_read(self, store):
+        """The whole point: an integrity check run against a copy nobody may write."""
+        os.chmod(store, 0o444)
+        try:
+            backend = SQLiteBackend(store, create=False)
+            try:
+                assert backend.count() == 3
+            finally:
+                backend.close()
+        finally:
+            os.chmod(store, 0o644)
+
+    def test_an_append_is_refused_rather_than_attempted(self, store):
+        backend = SQLiteBackend(store, create=False)
+        try:
+            with pytest.raises(StorageError) as caught:
+                BackendConformanceSuite().append(backend)
+        finally:
+            backend.close()
+
+        assert "create=False" in str(caught.value)
+
+    def test_a_refused_append_leaves_the_file_byte_identical(self, store):
+        before = _file_digest(store)
+        backend = SQLiteBackend(store, create=False)
+        try:
+            with pytest.raises(StorageError):
+                BackendConformanceSuite().append(backend)
+        finally:
+            backend.close()
+
+        assert _file_digest(store) == before
+
+    def test_saving_a_checkpoint_is_refused(self, store):
+        suite = BackendConformanceSuite()
+        backend = SQLiteBackend(store, create=False)
+        try:
+            with pytest.raises(StorageError) as caught:
+                backend.save_checkpoint(suite.checkpoint(2))
+        finally:
+            backend.close()
+
+        assert "create=False" in str(caught.value)
+
+    def test_the_default_still_provisions_a_new_store(self, tmp_path):
+        """Guards every refusal above: ordinary use is unchanged."""
+        path = tmp_path / "new.db"
+
+        backend = SQLiteBackend(str(path))
+        try:
+            assert backend.count() == 0
+            assert CAP_APPEND_ONLY_ENFORCED in backend.capabilities()
+        finally:
+            backend.close()
+
+        assert path.exists()

@@ -1,10 +1,12 @@
 """The audit index model.
 
 **This table is not the evidence.** It is a queryable mirror of what the ledger already
-holds, so an operator can use the ORM and the Django admin to find a record. The ledger
-is the tamper-evident store; this is an ordinary Django table that anyone with database
-access can rewrite. Nothing here is chained, hashed or signed, and
-:meth:`~signledger.core.ledger.Ledger.check_integrity` does not look at it.
+holds, so an operator can use the ORM and the Django admin to find a record - the admin
+half ships in :mod:`signledger.contrib.django.admin` and is read-only, because a row here
+mirrors an append-only log. The ledger is the tamper-evident store; this is an ordinary
+Django table that anyone with database access can rewrite. Nothing here is chained,
+hashed or signed, and :meth:`~signledger.core.ledger.Ledger.check_integrity` does not
+look at it.
 
 That is exactly why it holds **no payload columns**. Headers, bodies and query strings
 never reach this table: an index whose whole purpose is to be widely queried is the last

@@ -25,8 +25,14 @@ down by a test in ``tests/test_sqlite_concurrency.py``:
   for the cycle collector and a ``ResourceWarning`` for some unrelated test.
 * ``capabilities()`` probes for the append-only triggers instead of asserting them, and
   the schema is never re-created around an entries table that already exists.
+
+``create=False`` opens a store that already exists and provisions nothing: no
+``CREATE TABLE``, no triggers, and - the one that surprises people - no
+``PRAGMA journal_mode = WAL``, which is itself a write to the database header. See
+:meth:`SQLiteBackend._configure`.
 """
 
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -107,7 +113,15 @@ _APPEND_ONLY_TRIGGER_SUFFIXES = ("_no_update", "_no_delete")
 
 
 class SQLiteBackend:
-    """A durable, append-only ledger store in a single SQLite database."""
+    """A durable, append-only ledger store in a single SQLite database.
+
+    ``create`` defaults to True, which is the behaviour every writer wants: the schema is
+    provisioned on open. Pass ``create=False`` to read a store that already exists,
+    provisioning nothing and issuing no write at all - what ``signledger verify`` does,
+    because an integrity check that provisions the thing it is checking cannot be run
+    against a copy this process may not write, and a mistyped path was answered with
+    "your ledger is empty" rather than with "that is not a ledger".
+    """
 
     def __init__(
         self,
@@ -117,8 +131,10 @@ class SQLiteBackend:
         checkpoints_table: str = DEFAULT_CHECKPOINTS_TABLE,
         timeout: float = 5.0,
         check_same_thread: bool = True,
+        create: bool = True,
     ) -> None:
         self.path = path
+        self.create = bool(create)
         self.entries_table = validate_identifier(entries_table, kind="entries table name")
         self.checkpoints_table = validate_identifier(
             checkpoints_table, kind="checkpoints table name"
@@ -149,11 +165,20 @@ class SQLiteBackend:
         else:
             self._access_lock = _NullLock()
 
+        if not self.create:
+            # Before the first connect, because ``sqlite3.connect`` on a path that is not
+            # there *creates* it: a mistyped path used to leave a 32 KiB database behind
+            # and then report that the ledger it had just invented was empty.
+            self._require_existing_file()
+
         first = self._open_connection()
         try:
             with self._registry_lock:
                 self._connections[_SHARED_KEY if self._shared else threading.get_ident()] = first
-            self._create_schema(first)
+            if self.create:
+                self._create_schema(first)
+            else:
+                self._require_existing_tables(first)
         except BaseException:
             # The caller never receives this instance, so nothing else can ever close
             # ``first``. Left alone it holds an fd until the cycle collector runs and
@@ -195,14 +220,37 @@ class SQLiteBackend:
         return connection
 
     def _configure(self, connection: sqlite3.Connection) -> None:
+        """Set this connection up. Under ``create=False`` it may not write to the file.
+
+        ``PRAGMA journal_mode = WAL`` is not a session setting - it rewrites the database
+        header - so a read-only open must not issue it, and does not. The mode the file
+        is already in is the mode we read it in; a rollback-journal ledger stays one.
+
+        ``PRAGMA query_only`` then makes SQLite itself refuse every write on this
+        connection, which is the difference between a backend that intends not to write
+        and one that cannot. ``synchronous`` and ``foreign_keys`` are per-connection
+        settings that touch no file, so they are applied either way - keeping
+        :meth:`capabilities` answering the same thing about a store however it was opened.
+
+        What this does *not* claim, because it would not be true: SQLite's own housekeeping
+        is still SQLite's. Reading a WAL database whose ``-shm`` wal-index is absent
+        materialises one, and closing the last connection to a WAL database checkpoints
+        whatever an earlier *writer* left in the ``-wal``. Neither is a statement this
+        backend issues - ``query_only`` refuses every one of those - and neither alters a
+        stored row; but a directory that cannot be written at all still cannot host a
+        WAL-mode read, which is a SQLite requirement rather than a signledger one.
+        """
         connection.row_factory = sqlite3.Row
         _pragma(connection, "PRAGMA foreign_keys = ON")
         _pragma(connection, f"PRAGMA busy_timeout = {int(self.timeout * 1000)}")
         if not self._in_memory:
-            self._enable_wal(connection)
+            if self.create:
+                self._enable_wal(connection)
             # WAL defaults to synchronous=NORMAL, which does not fsync on commit. The
             # backend advertises durable_fsync, so it must actually be durable.
             _pragma(connection, "PRAGMA synchronous = FULL")
+        if not self.create:
+            _pragma(connection, "PRAGMA query_only = ON")
 
     def _enable_wal(self, connection: sqlite3.Connection) -> None:
         """Put the file into WAL mode, tolerating another process doing it right now.
@@ -258,6 +306,57 @@ class SQLiteBackend:
             connection.close()
 
     # -- schema ------------------------------------------------------------------------
+
+    def _require_existing_file(self) -> None:
+        """Refuse to conjure the store a read-only open was pointed at.
+
+        A ``StorageError`` and never an integrity verdict: "that store does not exist" and
+        "this ledger does not verify" are different answers to different questions, and
+        the caller above turns them into different exit codes.
+        """
+        if self._in_memory:
+            raise StorageError(
+                "open failed: an in-memory sqlite database is created empty every time it "
+                "is opened, so there is nothing in it to read; name a file instead"
+            )
+        if not os.path.exists(self.path):
+            raise StorageError(
+                f"open failed: the sqlite database {self.path} does not exist, and this "
+                f"backend was opened with create=False, which never creates a store"
+            )
+
+    def _require_existing_tables(self, connection: sqlite3.Connection) -> None:
+        """Refuse a database that holds no ledger, naming the table that is absent.
+
+        A file that exists but holds no entries table is a different fault from an empty
+        ledger, and much the likelier one: a mistyped ``--entries-table``, or a path that
+        names somebody else's database.
+        """
+        with _translating("open"):
+            missing = [
+                name
+                for name in (self.entries_table, self.checkpoints_table)
+                if not _object_exists(connection, "table", name)
+            ]
+        if missing:
+            raise StorageError(
+                f"open failed: this store does not exist - the sqlite database "
+                f"{self.path} holds no table called {', '.join(missing)}, and this "
+                f"backend was opened with create=False, which never creates one"
+            )
+
+    def _refuse_write(self, operation: str) -> None:
+        """A store opened for reading is not written to, and says so in one message.
+
+        Without this the refusal arrives from SQLite as ``attempt to write a readonly
+        database``, which reads like a permissions problem on the operator's file rather
+        than the deliberate choice it is.
+        """
+        if not self.create:
+            raise StorageError(
+                f"{operation} failed: this backend was opened with create=False, which "
+                f"reads an existing store and never writes to it"
+            )
 
     def _create_schema(self, connection: sqlite3.Connection) -> None:
         with _translating("create_schema"):
@@ -361,6 +460,7 @@ class SQLiteBackend:
 
     def append_atomic(self, build: Callable[[Optional[Entry]], Entry]) -> Entry:
         """Read the tip and insert its successor inside one ``BEGIN IMMEDIATE``."""
+        self._refuse_write("append")
         with _translating("append"):
             return retry_on_conflict(self._append_once(build), _is_conflict)
 
@@ -511,6 +611,7 @@ class SQLiteBackend:
     # -- checkpoints -------------------------------------------------------------------
 
     def save_checkpoint(self, cp: Checkpoint) -> None:
+        self._refuse_write("save_checkpoint")
         row = checkpoint_to_row(cp)
         columns = ", ".join(_CHECKPOINT_COLUMNS)
         placeholders = ", ".join("?" for _ in _CHECKPOINT_COLUMNS)

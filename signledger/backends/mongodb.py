@@ -18,6 +18,11 @@ Every decision below is a v1 defect that had to stop being possible.
   and arbitrated by unique indexes. v1 did read-modify-write under a process-local lock,
   which forks the chain the moment a second worker exists.
 * **``sort("sequence")``**, never ``sort("timestamp")``.
+* **``create=False`` provisions nothing at all** - no collection, no validator, no index,
+  no counter document. Creating them is what stopped ``signledger verify`` from being
+  runnable by a read-only user or against a secondary, and re-applying a validator or an
+  index on open silently repairs the evidence that somebody removed it. See
+  :meth:`MongoBackend._require_existing_schema`.
 """
 
 import contextlib
@@ -161,7 +166,15 @@ CHECKPOINT_SCHEMA: Dict[str, Any] = {
 
 
 class MongoBackend:
-    """A ledger store in MongoDB."""
+    """A ledger store in MongoDB.
+
+    ``create`` defaults to True, which is what every writer wants: the collections, their
+    validators and their indexes are provisioned on open. Pass ``create=False`` to read a
+    store that already exists without creating anything - what ``signledger verify`` does,
+    so that an integrity check can be run by a user holding ``find`` and nothing else, and
+    so that a mistyped database name is answered with "that store does not exist" rather
+    than with a verdict about an audit log that was never there.
+    """
 
     def __init__(
         self,
@@ -174,7 +187,9 @@ class MongoBackend:
         journal: bool = True,
         append_lease_ms: int = 30_000,
         append_lock_timeout: float = 30.0,
+        create: bool = True,
     ) -> None:
+        self.create = bool(create)
         self.database_name = validate_identifier(database, kind="database name")
         self.entries_collection = validate_identifier(
             entries_collection, kind="entries collection name"
@@ -202,7 +217,10 @@ class MongoBackend:
                 # A lazily-connecting client would surface a bad URI on the first query,
                 # halfway through an append. Fail at construction instead.
                 self._client.admin.command("ping")
-            self._create_schema()
+            if self.create:
+                self._create_schema()
+            else:
+                self._require_existing_schema()
         except BaseException:
             self._client.close()
             self._client = None
@@ -238,6 +256,40 @@ class MongoBackend:
             client.close()
 
     # -- schema ------------------------------------------------------------------------
+
+    def _require_existing_schema(self) -> None:
+        """Check both collections are there, and create neither.
+
+        One ``listCollections`` and nothing else. MongoDB brings a collection - and its
+        database - into being on first use, so there is no such thing as an accidental
+        read here: the check has to be explicit, or a mistyped database name is answered
+        with an empty ledger, which is the same words an operator would use for "somebody
+        deleted my audit log".
+
+        A missing collection is a :class:`StorageError`, never an integrity verdict; the
+        caller above turns the two into different exit codes.
+        """
+        wanted = [self.entries_collection, self.checkpoints_collection]
+        with _translating("open"):
+            present = set(self._db.list_collection_names(filter={"name": {"$in": wanted}}))
+        missing = [name for name in wanted if name not in present]
+        if missing:
+            # Collection and database names only. A MongoDB URI carries a password
+            # (contract section 10), and this is the message an operator sees when the URI
+            # is what was wrong.
+            raise StorageError(
+                f"open failed: this store does not exist - database "
+                f"{self.database_name} holds no collection called {', '.join(missing)}, "
+                f"and this backend was opened with create=False, which never creates one"
+            )
+
+    def _refuse_write(self, operation: str) -> None:
+        """A store opened for reading is not written to, and says so in one message."""
+        if not self.create:
+            raise StorageError(
+                f"{operation} failed: this backend was opened with create=False, which "
+                f"reads an existing store and never writes to it"
+            )
 
     def _create_schema(self) -> None:
         # MongoDB creates a collection on first write, which would leave ``$collStats``
@@ -299,6 +351,7 @@ class MongoBackend:
 
     def append_atomic(self, build: Callable[[Optional[Entry]], Entry]) -> Entry:
         """Claim the next sequence with ``findAndModify``, then insert under it."""
+        self._refuse_write("append")
         with _translating("append"):
             return retry_on_conflict(self._append_once(build), _is_conflict)
 
@@ -474,6 +527,7 @@ class MongoBackend:
     # -- checkpoints -------------------------------------------------------------------
 
     def save_checkpoint(self, cp: Checkpoint) -> None:
+        self._refuse_write("save_checkpoint")
         with _translating("save_checkpoint"):
             self._checkpoints.insert_one(checkpoint_to_document(cp))
 

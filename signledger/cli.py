@@ -13,6 +13,25 @@ Exit codes are the contract with a shell script:
 * ``0`` - the ledger (or bundle) verified.
 * ``1`` - it did not. Tampering, truncation, a broken link, or nothing to verify.
 * ``2`` - the command could not run: a bad URI, a missing driver, an unreadable file.
+
+Two properties every command here has, because four consumer projects found out what
+happens without them:
+
+* **A command names the store the library named.** The database is the mongodb URI's own
+  path component, and the table (the *collection*, on MongoDB) is ``--entries-table`` /
+  ``--checkpoints-table``. Without both, ``signledger verify`` answered from whatever the
+  backend defaults happened to be - which is a success report about a store nobody asked
+  about, and there is no worse answer this tool can give.
+* **A command that reads does not write.** ``verify``, ``stats``, ``inspect``, ``export``
+  and ``anchor`` open the store with ``create=False``, and every backend honours it: no
+  ``CREATE TABLE``, no trigger, no index, no validator, and on SQLite not even
+  ``PRAGMA journal_mode = WAL``, which is itself a write to the database header. An
+  integrity check that provisions the thing it is checking cannot be run from a read-only
+  role or against a hot standby, which is exactly where a careful operator runs it - and
+  a mistyped DSN answered "your ledger is empty" (exit 1, a verdict about integrity)
+  where the truth was "that store does not exist" (exit 2, an operational error). Being
+  told your audit log is gone when you only mistyped its name is the second-worst answer
+  this tool can give.
 """
 
 import argparse
@@ -21,9 +40,10 @@ import os
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
-from urllib.parse import urlsplit
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, cast
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
+from signledger import __version__
 from signledger.core.exceptions import ConfigurationError
 
 EXIT_OK = 0
@@ -119,10 +139,48 @@ class Result:
 # --------------------------------------------------------------------------------------
 
 
-def open_backend(uri: str) -> Any:
+@dataclass(frozen=True)
+class _Store:
+    """What the operator asked for beyond the URI itself.
+
+    ``entries`` and ``checkpoints`` are the table names - collection names, on MongoDB.
+    ``create`` is False for a command that only reads.
+    """
+
+    entries: Optional[str] = None
+    checkpoints: Optional[str] = None
+    create: bool = True
+
+
+#: Option names that belong to signledger rather than to a driver. Written into a URI
+#: query string they reach the driver instead: libpq refuses the whole DSN (which the
+#: backend reports as ``connect failed: ProgrammingError``, naming neither the option nor
+#: the fix), and pymongo warns, drops it, and reads the default collection anyway.
+_STORE_OPTION_KEYS = frozenset(
+    {"entries_table", "entries_collection", "checkpoints_table", "checkpoints_collection"}
+)
+
+
+def open_backend(
+    uri: str,
+    *,
+    entries_table: Optional[str] = None,
+    checkpoints_table: Optional[str] = None,
+    create: bool = True,
+) -> Any:
     """Open the storage backend named by ``uri``.
 
-    ``memory://``, ``sqlite://<path>``, ``postgresql://…``, ``mongodb://…``.
+    ``memory://``, ``sqlite:<path>``, ``postgresql://…``, ``mongodb://…/<database>``.
+
+    ``entries_table`` and ``checkpoints_table`` name the table the ledger lives in - the
+    *collection*, on MongoDB. Both are constructor arguments of every real backend, and a
+    deployment that used them had no CLI at all until they were plumbed through here.
+
+    ``create=False`` opens a store that already exists and refuses to bring one into
+    being. Every read-only command passes it, and all three real backends honour it in
+    their constructors - the only place that could, since that is where each of them used
+    to provision. A store that is not there raises ``StorageError`` naming what is
+    missing, which reaches the shell as exit 2 rather than as a verdict about a ledger.
 
     No error raised here ever quotes the URI: a DSN routinely carries a password, and
     contract section 10 forbids a credential reaching a message (or a CI log).
@@ -130,7 +188,7 @@ def open_backend(uri: str) -> Any:
     scheme = urlsplit(uri).scheme
     if not scheme:
         raise ConfigurationError(
-            "a backend URI needs a scheme: memory://, sqlite://<path>, "
+            "a backend URI needs a scheme: memory://, sqlite:<path>, "
             "postgresql://… or mongodb://…"
         )
     opener = _OPENERS.get(scheme)
@@ -139,19 +197,70 @@ def open_backend(uri: str) -> Any:
             f"unsupported backend scheme '{scheme}'; expected one of: "
             + ", ".join(sorted(_OPENERS))
         )
-    return opener(uri)
+    _refuse_store_options_in_uri(uri)
+    return opener(uri, _Store(entries_table, checkpoints_table, create))
 
 
-def _open_memory(uri: str) -> Any:
+def _refuse_store_options_in_uri(uri: str) -> None:
+    """Refuse a table name written into the URI's query string, by name.
+
+    Only the option *name* reaches the message; the URI itself never does.
+    """
+    named = sorted(
+        {
+            key
+            for key, _value in parse_qsl(urlsplit(uri).query, keep_blank_values=True)
+            if key.strip().lower().replace("-", "_") in _STORE_OPTION_KEYS
+        }
+    )
+    if named:
+        raise ConfigurationError(
+            "the backend URI carries a signledger option in its query string ("
+            + ", ".join(named)
+            + "), where only the driver will see it; name a non-default store with "
+            "--entries-table / --checkpoints-table (--entries-collection / "
+            "--checkpoints-collection reads better on MongoDB, and means the same thing)"
+        )
+
+
+def _named_tables(store: _Store, entries: str, checkpoints: str) -> Dict[str, Any]:
+    """The constructor keywords for whichever names were given.
+
+    Passed only when the operator actually named one, so each backend keeps its own
+    documented default rather than having it restated here.
+    """
+    named: Dict[str, Any] = {}
+    if store.entries is not None:
+        named[entries] = store.entries
+    if store.checkpoints is not None:
+        named[checkpoints] = store.checkpoints
+    return named
+
+
+def _open_memory(uri: str, store: _Store) -> Any:
+    if store.entries is not None or store.checkpoints is not None:
+        # Accepting the flag here would silently ignore it, which is how an operator
+        # comes to believe they are looking at a store they are not looking at.
+        raise ConfigurationError(
+            "the memory backend holds no tables to name, so --entries-table and "
+            "--checkpoints-table do not apply to memory://"
+        )
     from signledger.backends.memory import MemoryBackend
 
     return MemoryBackend()
 
 
-def _open_sqlite(uri: str) -> Any:
+def _open_sqlite(uri: str, store: _Store) -> Any:
     from signledger.backends.sqlite import SQLiteBackend
 
-    return SQLiteBackend(_sqlite_path(uri))
+    # The backend owns the refusal, because the backend is what would otherwise create
+    # the file: ``sqlite3.connect`` on a path that is not there conjures a database, and
+    # ``PRAGMA journal_mode = WAL`` rewrites the header of one that is.
+    return SQLiteBackend(
+        _sqlite_path(uri),
+        create=store.create,
+        **_named_tables(store, "entries_table", "checkpoints_table"),
+    )
 
 
 def _sqlite_path(uri: str) -> str:
@@ -174,7 +283,7 @@ def _sqlite_path(uri: str) -> str:
     return path
 
 
-def _open_postgres(uri: str) -> Any:
+def _open_postgres(uri: str, store: _Store) -> Any:
     try:
         from signledger.backends.postgresql import PostgresBackend
     except ImportError as err:
@@ -182,21 +291,77 @@ def _open_postgres(uri: str) -> Any:
             "the postgresql backend needs psycopg: pip install 'signledger[postgresql]'"
         ) from err
 
-    return PostgresBackend(uri)
+    _refuse_unknown_connection_options(uri)
+    # ``create=False`` runs no DDL and takes no advisory lock, so a read-only command
+    # works from a role holding SELECT and nothing else - and a database that holds no
+    # ledger is reported as absent instead of being provisioned and called empty.
+    return PostgresBackend(
+        uri,
+        create=store.create,
+        **_named_tables(store, "entries_table", "checkpoints_table"),
+    )
 
 
-def _open_mongo(uri: str) -> Any:
+def _refuse_unknown_connection_options(uri: str) -> None:
+    """Name the query parameter libpq will not accept, rather than let it die opaque.
+
+    A rejected DSN reaches the operator as ``StorageError: connect failed:
+    ProgrammingError`` - which names neither the option nor the fix, and a mistyped
+    connection option is one of the likeliest things to be wrong about a DSN.
+
+    Every key is probed on a URI built here, so nothing from the operator's own DSN but
+    the parameter *name* can reach the message (contract section 10).
+    """
+    from psycopg import ProgrammingError
+    from psycopg.conninfo import conninfo_to_dict
+
+    refused = []
+    for key, _value in parse_qsl(urlsplit(uri).query, keep_blank_values=True):
+        try:
+            conninfo_to_dict("postgresql:///?" + quote(key, safe="") + "=probe")
+        except ProgrammingError:
+            refused.append(key)
+    if refused:
+        raise ConfigurationError(
+            "the backend URI carries connection options PostgreSQL does not accept: "
+            + ", ".join(sorted(set(refused)))
+            + "; a non-default table is named with --entries-table / --checkpoints-table"
+        )
+
+
+def _open_mongo(uri: str, store: _Store) -> Any:
     try:
-        from signledger.backends.mongodb import MongoBackend
+        from signledger.backends.mongodb import DEFAULT_DATABASE, MongoBackend
     except ImportError as err:
         raise ConfigurationError(
             "the mongodb backend needs pymongo: pip install 'signledger[mongodb]'"
         ) from err
 
-    return MongoBackend(uri)
+    named = _named_tables(store, "entries_collection", "checkpoints_collection")
+    # Always explicit: the database is the one the URI names, and the backend's own
+    # default only when the URI names none. Leaving it to the default unconditionally is
+    # what discarded the URI's database in the first place.
+    named["database"] = _mongo_database(uri) or DEFAULT_DATABASE
+    # ``create=False`` creates no collection, validator or index. MongoDB brings a
+    # collection into being on first use, so without it a mistyped database name is
+    # answered with an empty ledger rather than with "that store does not exist".
+    named["create"] = store.create
+    return MongoBackend(uri, **named)
 
 
-_OPENERS = {
+def _mongo_database(uri: str) -> Optional[str]:
+    """The database a mongodb URI names, or ``None`` when it names none.
+
+    It is the path component, exactly as every other MongoDB tool reads it. Dropping it
+    is how ``verify -b mongodb://host/ledgers`` came to print VERIFIED and exit 0 about
+    the contents of ``signledger`` - the backend default, and a store the operator never
+    asked about. A verification tool reporting success about the wrong store is the worst
+    failure this project has.
+    """
+    return unquote(urlsplit(uri).path.lstrip("/")) or None
+
+
+_OPENERS: Dict[str, Callable[[str, _Store], Any]] = {
     "memory": _open_memory,
     "sqlite": _open_sqlite,
     "postgres": _open_postgres,
@@ -204,6 +369,16 @@ _OPENERS = {
     "mongodb": _open_mongo,
     "mongodb+srv": _open_mongo,
 }
+
+
+def _open_store(args: argparse.Namespace, *, create: bool) -> Any:
+    """Open the store ``--backend`` names, under the table names the command line gave."""
+    return open_backend(
+        args.backend,
+        entries_table=args.entries_table,
+        checkpoints_table=args.checkpoints_table,
+        create=create,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -382,14 +557,18 @@ def _report_lines(
     ok: Optional[bool] = None,
 ) -> List[str]:
     """The human rendering of a verification report."""
-    span = (
-        f"{report.entries_verified} verified"
-        if report.first_sequence is None
-        else f"{report.entries_verified} verified "
-        f"(sequence {report.first_sequence}..{report.last_sequence})"
-    )
     level = report.assurance.value if assurance is None else assurance
     verified = report.ok if ok is None else ok
+    # "entries 3 verified" printed two lines above "result FAILED" reads as reassurance
+    # next to a failure. Entries that were read and found wrong were checked, not
+    # verified, and only the passing report gets to use the word.
+    counted = "verified" if verified else "checked"
+    span = (
+        f"{report.entries_verified} {counted}"
+        if report.first_sequence is None
+        else f"{report.entries_verified} {counted} "
+        f"(sequence {report.first_sequence}..{report.last_sequence})"
+    )
     lines = [
         f"ledger       {'(none)' if ledger_id is None else ledger_id}",
         f"entries      {span}",
@@ -547,7 +726,7 @@ def _listed(group: List[Any]) -> str:
 
 
 def _cmd_verify(args: argparse.Namespace) -> Result:
-    backend = open_backend(args.backend)
+    backend = _open_store(args, create=False)
     try:
         report, anchored = _verify(
             backend,
@@ -602,7 +781,8 @@ def _cmd_checkpoint(args: argparse.Namespace) -> Result:
     from signledger.core.exceptions import ValidationError
     from signledger.core.ledger import Ledger
 
-    backend = open_backend(args.backend)
+    # The one command whose whole purpose is to write to the store, so it may create it.
+    backend = _open_store(args, create=True)
     closed = False
     try:
         if backend.count() == 0:
@@ -664,7 +844,8 @@ def _cmd_checkpoint(args: argparse.Namespace) -> Result:
 def _cmd_anchor(args: argparse.Namespace) -> Result:
     from signledger.core.exceptions import ValidationError
 
-    backend = open_backend(args.backend)
+    # Reads the store and writes only to the sink, whether it is publishing or showing.
+    backend = _open_store(args, create=False)
     try:
         sink = _anchor_sink(args.anchor)
         ledger_id = _ledger_id_of(backend)
@@ -738,13 +919,35 @@ def _cmd_export(args: argparse.Namespace) -> Result:
     from signledger.core.exceptions import ValidationError
     from signledger.crypto.merkle import MerkleTree
 
-    backend = open_backend(args.backend)
+    backend = _open_store(args, create=False)
     try:
         entries = list(backend.iter_entries())
         if not entries:
             raise ValidationError(
                 "cannot export an empty ledger; a bundle of nothing is not evidence"
             )
+        if not args.force:
+            report, _ = _verify(backend, algorithm=args.hash_algorithm)
+            if not report.ok:
+                # A bundle is the artefact handed to someone who cannot see the store, so
+                # exporting a chain that does not verify and exiting 0 tells an operator
+                # scripting an archive step that the archive is sound. `checkpoint` has
+                # always refused this; `export` printed a merkle root and exited 0, and
+                # the only thing that caught it was whoever verified the bundle later.
+                lines = ["refusing to export a ledger that does not verify"]
+                lines.extend(_report_lines(report, ledger_id=entries[0].ledger_id))
+                lines.append("pass --force to export it anyway")
+                return Result(
+                    code=EXIT_INVALID,
+                    payload={
+                        "command": "export",
+                        "ok": False,
+                        "exit_code": EXIT_INVALID,
+                        "error": "the ledger does not verify; refusing to export it",
+                        "failures": _failure_payload(report),
+                    },
+                    lines=tuple(lines),
+                )
         checkpoint = backend.get_latest_checkpoint()
         bundle = {
             "format": BUNDLE_FORMAT,
@@ -1041,7 +1244,8 @@ def migration_signing_payload(record: Dict[str, Any]) -> bytes:
 def _cmd_migrate(args: argparse.Namespace) -> Result:
     from signledger.core.exceptions import ValidationError
 
-    source = open_backend(args.backend)
+    # The source is only ever read; the target is the store this command exists to fill.
+    source = _open_store(args, create=False)
     target = None
     try:
         if source.count() == 0:
@@ -1077,7 +1281,12 @@ def _cmd_migrate(args: argparse.Namespace) -> Result:
             else _signer_from_pem(args.signing_key, args.password_env)
         )
 
-        target = open_backend(args.target)
+        target = open_backend(
+            args.target,
+            entries_table=args.target_entries_table,
+            checkpoints_table=args.target_checkpoints_table,
+            create=True,
+        )
         if target.count() != 0:
             raise ConfigurationError(
                 "the migration target must be empty; refusing to splice one chain into "
@@ -1163,7 +1372,7 @@ def _migration_record(
 def _cmd_stats(args: argparse.Namespace) -> Result:
     from signledger.observability import LedgerHealth
 
-    backend = open_backend(args.backend)
+    backend = _open_store(args, create=False)
     try:
         report, anchored = _verify(
             backend,
@@ -1210,7 +1419,7 @@ def _cmd_stats(args: argparse.Namespace) -> Result:
 
 
 def _cmd_inspect(args: argparse.Namespace) -> Result:
-    backend = open_backend(args.backend)
+    backend = _open_store(args, create=False)
     try:
         ledger_id = _ledger_id_of(backend)
         oldest = backend.get_oldest()
@@ -1285,6 +1494,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Inspect, verify and anchor a tamper-evident SignLedger log.",
     )
     parser.set_defaults(command=None)
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"signledger {__version__}",
+        help="print the version and exit",
+    )
 
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument(
@@ -1297,7 +1512,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--backend",
         required=True,
         metavar="URI",
-        help="memory://, sqlite://<path>, postgresql://… or mongodb://…",
+        help=(
+            "memory://, sqlite:<path>, postgresql://… or mongodb://…/<database> "
+            "(the mongodb database is the URI's path)"
+        ),
+    )
+    store.add_argument(
+        "--entries-table",
+        "--entries-collection",
+        dest="entries_table",
+        metavar="NAME",
+        help="the table the entries are in - the collection, on MongoDB "
+        "(default: ledger_entries)",
+    )
+    store.add_argument(
+        "--checkpoints-table",
+        "--checkpoints-collection",
+        dest="checkpoints_table",
+        metavar="NAME",
+        help="the table the checkpoints are in (default: ledger_checkpoints)",
     )
     store.add_argument(
         "--hash-algorithm",
@@ -1392,6 +1625,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="public key PEM(s) to embed alongside the entries",
     )
+    export.add_argument(
+        "--force",
+        action="store_true",
+        help="export even if the ledger does not verify (refused by default)",
+    )
     export.set_defaults(handler=_cmd_export)
 
     verify_bundle = subcommands.add_parser(
@@ -1423,6 +1661,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--target", required=True, metavar="URI", help="the store to migrate into"
     )
     migrate.add_argument(
+        "--target-entries-table",
+        "--target-entries-collection",
+        dest="target_entries_table",
+        metavar="NAME",
+        help="the entries table (collection) to create in the target",
+    )
+    migrate.add_argument(
+        "--target-checkpoints-table",
+        "--target-checkpoints-collection",
+        dest="target_checkpoints_table",
+        metavar="NAME",
+        help="the checkpoints table (collection) to create in the target",
+    )
+    migrate.add_argument(
         "--record", metavar="PATH", help="write a migration record to this file"
     )
     migrate.add_argument(
@@ -1440,6 +1692,34 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _error_result(command: Optional[str], err: BaseException) -> Result:
     message = f"{type(err).__name__}: {err}"
+    return Result(
+        code=EXIT_ERROR,
+        payload={
+            "command": command,
+            "ok": False,
+            "exit_code": EXIT_ERROR,
+            "error": message,
+        },
+        lines=(f"error: {message}",),
+    )
+
+
+def _unreadable_result(command: Optional[str], err: BaseException) -> Result:
+    """A fault from below the ledger's own vocabulary, reported without its message.
+
+    Only the exception *type* is quoted. A driver or a validator routinely puts the
+    offending value in its message, and the offending value here is a row of the ledger -
+    contract section 10 - which is why this cannot go through :func:`_error_result`.
+
+    Before this existed, a store holding a column of the wrong type escaped ``main`` as a
+    raw ``TypeError`` traceback and a process exit of 1: the code that means "the ledger
+    did not verify", for a store nothing could read.
+    """
+    message = (
+        f"the store could not be read: {type(err).__name__}. A stored row holds a value "
+        f"this build cannot interpret - a column of the wrong type is the usual cause. "
+        f"The underlying message is withheld: it can quote the row itself."
+    )
     return Result(
         code=EXIT_ERROR,
         payload={
@@ -1482,5 +1762,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         # open, an optional extra that is not installed. Distinct from exit 1, which
         # means the ledger itself did not verify.
         result = _error_result(args.command, err)
+    except Exception as err:
+        # Anything else is a store this build cannot read. It is still an operational
+        # failure and it is still exit 2 - what it must never be is a traceback.
+        result = _unreadable_result(args.command, err)
     _render(result, json_mode=json_mode)
     return result.code

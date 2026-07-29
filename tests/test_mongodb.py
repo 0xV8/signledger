@@ -970,3 +970,307 @@ class TestAppendOnlyRole:
             raw_db.command({"dropRole": role})
 
         assert granted == {"find", "insert"}
+
+
+# --------------------------------------------------------------------------------------
+# opening a store without provisioning it
+# --------------------------------------------------------------------------------------
+
+
+def _collections(uri: str, database: str) -> dict:
+    """Every collection in ``database``, each with the names of its indexes.
+
+    The reproduction of the defect is this snapshot taken twice: it was empty before
+    ``signledger verify`` and held three collections and five indexes after it.
+    """
+    with pymongo.MongoClient(uri) as client:
+        db = client[database]
+        return {
+            name: sorted(db[name].index_information())
+            for name in sorted(db.list_collection_names())
+        }
+
+
+@pytest.fixture
+def ro_prefix() -> str:
+    return "slro_" + uuid.uuid4().hex[:10]
+
+
+@pytest.fixture
+def ro_store(mongo_uri: str, database_name: str, ro_prefix: str) -> str:
+    """A live three-entry MongoDB ledger in a throwaway database, provisioned and closed.
+
+    Written through the real :class:`Ledger`, not through ``append_many``, because these
+    tests run ``signledger verify`` against it and a verdict of VERIFIED is part of what
+    they assert.
+    """
+    from signledger.backends.mongodb import MongoBackend
+    from signledger.core.ledger import Ledger
+
+    ledger = Ledger(
+        MongoBackend(
+            mongo_uri,
+            database=database_name,
+            entries_collection=f"{ro_prefix}_entries",
+            checkpoints_collection=f"{ro_prefix}_checkpoints",
+        )
+    )
+    try:
+        for index in range(3):
+            ledger.append({"event": "created", "index": index})
+    finally:
+        ledger.close()
+    return ro_prefix
+
+
+def _open_read_only(uri: str, database: str, prefix: str):
+    from signledger.backends.mongodb import MongoBackend
+
+    return MongoBackend(
+        uri,
+        database=database,
+        entries_collection=f"{prefix}_entries",
+        checkpoints_collection=f"{prefix}_checkpoints",
+        create=False,
+    )
+
+
+class TestOpeningWithoutProvisioning:
+    """``create=False`` reads a store that exists and refuses to bring one into being.
+
+    A verification tool that creates collections, validators and indexes cannot be run
+    against a secondary or by a read-only user - which is exactly where an operator wants
+    to run it - and a mistyped database name was answered with "your ledger is empty"
+    rather than "that store does not exist".
+    """
+
+    def test_a_missing_entries_collection_is_refused_rather_than_created(
+        self, mongo_uri: str, database_name: str, ro_prefix: str
+    ) -> None:
+        from signledger.core.exceptions import StorageError
+
+        with pytest.raises(StorageError) as caught:
+            _open_read_only(mongo_uri, database_name, ro_prefix)
+
+        assert "does not exist" in str(caught.value)
+        assert _collections(mongo_uri, database_name) == {}
+
+    def test_the_refusal_names_the_collection_and_the_database(
+        self, mongo_uri: str, database_name: str, ro_prefix: str
+    ) -> None:
+        with pytest.raises(Exception) as caught:
+            _open_read_only(mongo_uri, database_name, ro_prefix)
+
+        assert f"{ro_prefix}_entries" in str(caught.value)
+        assert database_name in str(caught.value)
+
+    def test_the_refusal_never_quotes_the_uri(
+        self, mongo_uri: str, database_name: str, ro_prefix: str
+    ) -> None:
+        """Contract section 10: a URI routinely carries a password."""
+        with pytest.raises(Exception) as caught:
+            _open_read_only(mongo_uri, database_name, ro_prefix)
+
+        assert mongo_uri not in str(caught.value)
+
+    def test_a_missing_checkpoints_collection_is_refused(
+        self, mongo_uri: str, database_name: str, ro_prefix: str, ro_store: str
+    ) -> None:
+        from signledger.core.exceptions import StorageError
+
+        with pymongo.MongoClient(mongo_uri) as client:
+            client[database_name].drop_collection(f"{ro_prefix}_checkpoints")
+
+        with pytest.raises(StorageError) as caught:
+            _open_read_only(mongo_uri, database_name, ro_prefix)
+
+        assert f"{ro_prefix}_checkpoints" in str(caught.value)
+
+    def test_a_read_only_open_creates_nothing_at_all(
+        self, mongo_uri: str, database_name: str, ro_store: str
+    ) -> None:
+        before = _collections(mongo_uri, database_name)
+
+        backend = _open_read_only(mongo_uri, database_name, ro_store)
+        try:
+            assert backend.count() == 3
+        finally:
+            backend.close()
+
+        assert _collections(mongo_uri, database_name) == before
+
+    def test_a_dropped_index_is_not_silently_restored(
+        self, mongo_uri: str, database_name: str, ro_store: str
+    ) -> None:
+        """Somebody dropped a uniqueness constraint. That is evidence, not a to-do list.
+
+        The same argument as the SQLite triggers and the PostgreSQL guard: a read-only
+        open that puts the constraint back destroys the only trace of its removal.
+        """
+        with pymongo.MongoClient(mongo_uri) as client:
+            client[database_name][f"{ro_store}_entries"].drop_index("hash_unique")
+
+        backend = _open_read_only(mongo_uri, database_name, ro_store)
+        try:
+            assert backend.count() == 3
+        finally:
+            backend.close()
+
+        assert "hash_unique" not in _collections(mongo_uri, database_name)[
+            f"{ro_store}_entries"
+        ]
+
+    def test_the_append_counter_collection_is_not_recreated(
+        self, mongo_uri: str, database_name: str, ro_store: str
+    ) -> None:
+        with pymongo.MongoClient(mongo_uri) as client:
+            client[database_name].drop_collection(f"{ro_store}_entries_state")
+
+        backend = _open_read_only(mongo_uri, database_name, ro_store)
+        try:
+            assert backend.count() == 3
+        finally:
+            backend.close()
+
+        assert f"{ro_store}_entries_state" not in _collections(mongo_uri, database_name)
+
+    def test_every_read_still_answers(
+        self, mongo_uri: str, database_name: str, ro_store: str
+    ) -> None:
+        backend = _open_read_only(mongo_uri, database_name, ro_store)
+        try:
+            assert [entry.sequence for entry in backend.iter_entries()] == [0, 1, 2]
+            assert backend.get_head().sequence == 2
+            assert backend.get_oldest().sequence == 0
+            assert backend.get_by_sequence(1).sequence == 1
+            assert backend.get_entry(backend.get_head().entry_id) is not None
+            assert backend.size_bytes() > 0
+            assert backend.get_latest_checkpoint() is None
+            assert list(backend.iter_checkpoints()) == []
+            assert CAP_ATOMIC_APPEND in backend.capabilities()
+        finally:
+            backend.close()
+
+    def test_an_append_is_refused_rather_than_attempted(
+        self, mongo_uri: str, database_name: str, ro_store: str
+    ) -> None:
+        from signledger.core.exceptions import StorageError
+
+        backend = _open_read_only(mongo_uri, database_name, ro_store)
+        try:
+            with pytest.raises(StorageError) as caught:
+                append(backend)
+            assert backend.count() == 3
+        finally:
+            backend.close()
+
+        assert "create=False" in str(caught.value)
+
+    def test_saving_a_checkpoint_is_refused(
+        self, mongo_uri: str, database_name: str, ro_store: str
+    ) -> None:
+        from signledger.anchor.checkpoint import Checkpoint
+        from signledger.core.exceptions import StorageError
+
+        backend = _open_read_only(mongo_uri, database_name, ro_store)
+        try:
+            with pytest.raises(StorageError) as caught:
+                backend.save_checkpoint(
+                    Checkpoint(
+                        ledger_id=LEDGER_ID,
+                        sequence=2,
+                        head_hash="a" * 64,
+                        entry_count=3,
+                        merkle_root="b" * 64,
+                        timestamp=BASE_TIMESTAMP,
+                    )
+                )
+            assert list(backend.iter_checkpoints()) == []
+        finally:
+            backend.close()
+
+        assert "create=False" in str(caught.value)
+
+    def test_the_default_still_provisions_the_collections(
+        self, mongo_uri: str, database_name: str, ro_prefix: str
+    ) -> None:
+        """Guards every refusal above: ordinary use is unchanged."""
+        from signledger.backends.mongodb import MongoBackend
+
+        backend = MongoBackend(
+            mongo_uri,
+            database=database_name,
+            entries_collection=f"{ro_prefix}_entries",
+            checkpoints_collection=f"{ro_prefix}_checkpoints",
+        )
+        try:
+            assert backend.count() == 0
+        finally:
+            backend.close()
+
+        assert sorted(_collections(mongo_uri, database_name)) == [
+            f"{ro_prefix}_checkpoints",
+            f"{ro_prefix}_entries",
+            f"{ro_prefix}_entries_state",
+        ]
+
+
+class TestTheCommandLineWritesNothingToTheStoreItVerifies:
+    """The defect end to end: the collection list before and after ``signledger verify``."""
+
+    def _argv(self, command: str, uri: str, database: str, prefix: str) -> list:
+        return [
+            command,
+            "-b",
+            f"{uri}/{database}",
+            "--entries-collection",
+            f"{prefix}_entries",
+            "--checkpoints-collection",
+            f"{prefix}_checkpoints",
+        ]
+
+    @pytest.mark.parametrize(
+        "command", ["verify", "stats", "inspect"], ids=["verify", "stats", "inspect"]
+    )
+    def test_a_read_only_command_creates_no_collection_or_index(
+        self, command: str, mongo_uri: str, database_name: str, ro_store: str, capsys
+    ) -> None:
+        from signledger.cli import EXIT_OK, main
+
+        before = _collections(mongo_uri, database_name)
+
+        code = main(self._argv(command, mongo_uri, database_name, ro_store))
+        capsys.readouterr()
+
+        assert code == EXIT_OK
+        assert _collections(mongo_uri, database_name) == before
+
+    def test_verify_against_a_store_that_does_not_exist_is_an_operational_error(
+        self, mongo_uri: str, database_name: str, ro_prefix: str, capsys
+    ) -> None:
+        """Exit 2, never exit 1: "I typed the URI wrong" is not "the log was tampered
+        with", and a shell script running `signledger verify || alert` has to tell them
+        apart."""
+        from signledger.cli import EXIT_ERROR, main
+
+        code = main(self._argv("verify", mongo_uri, database_name, ro_prefix))
+        err = capsys.readouterr().err
+
+        assert code == EXIT_ERROR
+        assert "does not exist" in err
+        assert _collections(mongo_uri, database_name) == {}
+
+    def test_checkpoint_still_provisions_the_store_it_writes_to(
+        self, mongo_uri: str, database_name: str, ro_prefix: str, capsys
+    ) -> None:
+        """Guards the refusals above: a command that writes may create what it writes to."""
+        from signledger.cli import main
+
+        main(self._argv("checkpoint", mongo_uri, database_name, ro_prefix))
+        capsys.readouterr()
+
+        assert sorted(_collections(mongo_uri, database_name)) == [
+            f"{ro_prefix}_checkpoints",
+            f"{ro_prefix}_entries",
+            f"{ro_prefix}_entries_state",
+        ]

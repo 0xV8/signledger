@@ -16,11 +16,13 @@ import json
 import subprocess
 import sys
 import threading
-from typing import Any, Dict, Iterator, List
+from typing import Any, AsyncIterator, Dict, Iterator, List
 
 import pytest
 from fastapi import FastAPI, WebSocket
+from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
+from starlette.responses import Response
 
 from signledger.backends.memory import MemoryBackend
 from signledger.contrib import FAIL_OPEN
@@ -82,6 +84,38 @@ def entries(ledger: Ledger) -> List[Any]:
     return list(ledger.iter_entries())
 
 
+def kinds(ledger: Ledger) -> List[Any]:
+    return [entry.data.get("kind") for entry in entries(ledger)]
+
+
+def streaming_app(ledger: Ledger, **kwargs: Any) -> FastAPI:
+    """An application whose response body is produced *after* the status is sent."""
+    app = FastAPI()
+    app.add_middleware(SignLedgerAuditMiddleware, ledger=ledger, **kwargs)
+
+    @app.get("/stream")
+    async def stream() -> StreamingResponse:
+        async def body() -> AsyncIterator[bytes]:
+            yield b'{"row": 0}\n'
+            yield b'{"row": 1}\n'
+
+        return StreamingResponse(body(), media_type="application/x-ndjson")
+
+    @app.get("/broken-stream")
+    async def broken_stream() -> StreamingResponse:
+        async def body() -> AsyncIterator[bytes]:
+            yield b'{"row": 0}\n'
+            raise RuntimeError("settlement feed died mid-stream")
+
+        return StreamingResponse(body(), media_type="application/x-ndjson")
+
+    @app.get("/nothing")
+    async def nothing() -> Response:
+        return Response(status_code=204)
+
+    return app
+
+
 # ======================================================================================
 # The headline requirement: credentials must not reach the ledger
 # ======================================================================================
@@ -120,7 +154,7 @@ def test_a_cookie_is_never_recorded(ledger: Ledger) -> None:
 def test_a_query_parameter_carrying_an_api_key_is_redacted(ledger: Ledger) -> None:
     with TestClient(make_app(ledger)) as client:
         client.get("/items?page=2&api_key=sk-live-1")
-    assert entries(ledger)[0].data["query"]["api_key"] == REDACTED
+    assert entries(ledger)[0].data["query"]["api_key"] == [REDACTED]
 
 
 # ======================================================================================
@@ -240,6 +274,99 @@ def test_a_decorated_endpoint_that_raises_still_writes_an_entry(
 
 
 # ======================================================================================
+# The ledger may be supplied as a factory, resolved at call time
+#
+# The module docstring tells users to construct the ``Ledger`` inside an application
+# factory, so that nothing holding a socket exists before a pre-forking server forks.
+# Decorators run at *import* time, before any factory has run. A decorator that can only
+# capture a live instance cannot be used from such an application at all.
+# ======================================================================================
+
+
+def test_the_decorator_accepts_a_ledger_that_does_not_exist_yet(ledger: Ledger) -> None:
+    """The ledger is built after the module is imported, as an app factory would."""
+    holder: Dict[str, Any] = {}
+    app = FastAPI()
+
+    @app.get("/x")
+    @audited(lambda: holder["ledger"], action="read-x")
+    async def endpoint() -> Dict[str, Any]:
+        return {"value": 7}
+
+    holder["ledger"] = ledger
+    with TestClient(app) as client:
+        assert client.get("/x").status_code == 200
+
+
+def test_a_factory_supplied_ledger_receives_the_entry(ledger: Ledger) -> None:
+    app = FastAPI()
+
+    @app.get("/x")
+    @audited(lambda: ledger, action="read-x")
+    async def endpoint() -> Dict[str, Any]:
+        return {"value": 7}
+
+    with TestClient(app) as client:
+        client.get("/x")
+    assert entries(ledger)[0].data["action"] == "read-x"
+
+
+def test_the_ledger_factory_runs_per_call_and_not_at_decoration_time(
+    ledger: Ledger,
+) -> None:
+    """Resolving it eagerly would put the connection back on the wrong side of the fork.
+
+    Resolving it once and caching it would be just as wrong for a factory that hands out
+    a per-thread handle - a SQLite connection may not cross threads at all.
+    """
+    calls: List[int] = []
+
+    def factory() -> Ledger:
+        calls.append(1)
+        return ledger
+
+    app = FastAPI()
+
+    @app.get("/x")
+    @audited(factory)
+    async def endpoint() -> Dict[str, Any]:
+        return {"ok": True}
+
+    at_decoration = len(calls)
+    with TestClient(app) as client:
+        client.get("/x")
+        client.get("/x")
+    assert (at_decoration, len(calls)) == (0, 2)
+
+
+def test_the_factory_form_works_on_a_synchronous_endpoint(ledger: Ledger) -> None:
+    def endpoint() -> Dict[str, Any]:
+        return {"value": 9}
+
+    audited(lambda: ledger, action="sync-call")(endpoint)()
+    assert entries(ledger)[0].data["action"] == "sync-call"
+
+
+def test_the_factory_form_still_records_an_endpoint_that_raised(ledger: Ledger) -> None:
+    async def endpoint() -> Dict[str, Any]:
+        raise RuntimeError("no")
+
+    import anyio
+
+    with pytest.raises(RuntimeError):
+        anyio.run(audited(lambda: ledger)(endpoint))
+    assert entries(ledger)[0].data["error"] == "RuntimeError"
+
+
+def test_a_bad_failure_policy_is_rejected_at_decoration_time_with_a_factory(
+    ledger: Ledger,
+) -> None:
+    """Deferring the check to the first request means the typo is found in production."""
+    with pytest.raises(ConfigurationError):
+        audited(lambda: ledger, audit_failure_policy="maybe")
+
+
+# ======================================================================================
 # The event loop must not be blocked
 # ======================================================================================
 
@@ -342,6 +469,254 @@ def test_a_websocket_connection_is_passed_through_untouched(ledger: Ledger) -> N
 
     with TestClient(app) as client, client.websocket_connect("/ws") as connection:
         assert connection.receive_text() == "hello"
+
+
+# ======================================================================================
+# A streamed response is not a settled one
+#
+# ``fail_closed`` forces the audit write to happen before ``http.response.start`` is
+# forwarded - that is the only moment at which a request can still be refused. For a
+# streamed body the outcome is not known then, and the entry is append-only, so the
+# status it carries is a *promise*. Every one of these tests exists because a stream that
+# died was, measurably, in the ledger as a plain ``200``.
+# ======================================================================================
+
+
+def test_a_streamed_response_is_recorded_as_provisional(ledger: Ledger) -> None:
+    with TestClient(streaming_app(ledger)) as client:
+        client.get("/stream")
+    assert entries(ledger)[0].data["completion"] == "provisional"
+
+
+def test_a_buffered_response_is_recorded_as_final(ledger: Ledger) -> None:
+    """The whole body was in hand when the entry was written, so the status is settled."""
+    with TestClient(make_app(ledger)) as client:
+        client.get("/items")
+    assert entries(ledger)[0].data["completion"] == "final"
+
+
+def test_a_buffered_response_writes_exactly_one_entry(ledger: Ledger) -> None:
+    """Settlement entries are for streams. Doubling every ledger would be a defect."""
+    with TestClient(make_app(ledger)) as client:
+        client.get("/items")
+    assert ledger.count() == 1
+
+
+def test_a_bodyless_status_is_not_mistaken_for_a_stream(ledger: Ledger) -> None:
+    """A 204 declares no ``content-length`` either, and has nothing left to send."""
+    with TestClient(streaming_app(ledger)) as client:
+        assert client.get("/nothing").status_code == 204
+    assert (entries(ledger)[0].data["completion"], ledger.count()) == ("final", 1)
+
+
+def test_a_completed_stream_is_settled_by_a_second_entry(ledger: Ledger) -> None:
+    with TestClient(streaming_app(ledger)) as client:
+        client.get("/stream")
+    assert kinds(ledger) == ["request", "response.completion"]
+
+
+def test_a_completed_stream_settles_as_complete(ledger: Ledger) -> None:
+    with TestClient(streaming_app(ledger)) as client:
+        client.get("/stream")
+    assert entries(ledger)[1].data["outcome"] == "complete"
+
+
+def test_a_stream_that_dies_mid_body_is_not_left_recorded_as_a_success(
+    ledger: Ledger,
+) -> None:
+    """The measured defect: one chunk out, then ``RuntimeError``, and the client saw a
+    ``RemoteProtocolError`` - while the ledger said ``200`` and nothing else, forever."""
+    with TestClient(streaming_app(ledger), raise_server_exceptions=False) as client:
+        client.get("/broken-stream")
+    assert entries(ledger)[1].data["outcome"] == "incomplete"
+
+
+def test_a_stream_that_dies_mid_body_records_the_exception_type(ledger: Ledger) -> None:
+    with TestClient(streaming_app(ledger), raise_server_exceptions=False) as client:
+        client.get("/broken-stream")
+    assert entries(ledger)[1].data["error"] == "RuntimeError"
+
+
+def test_the_settlement_entry_carries_the_status_that_was_promised(
+    ledger: Ledger,
+) -> None:
+    """So an auditor reading the settlement alone knows which claim it settles."""
+    with TestClient(streaming_app(ledger), raise_server_exceptions=False) as client:
+        client.get("/broken-stream")
+    assert entries(ledger)[1].data["status"] == 200
+
+
+def test_the_settlement_entry_carries_the_request_id_of_the_entry_it_settles(
+    ledger: Ledger,
+) -> None:
+    with TestClient(streaming_app(ledger)) as client:
+        client.get("/stream")
+    request_entry, settlement = entries(ledger)
+    assert settlement.data["request_id"] == request_entry.data["request_id"]
+
+
+def test_the_settlement_entry_names_the_request_it_settles(ledger: Ledger) -> None:
+    with TestClient(streaming_app(ledger)) as client:
+        client.get("/stream")
+    data = entries(ledger)[1].data
+    assert (data["method"], data["path"]) == ("GET", "/stream")
+
+
+def test_the_promised_entry_is_never_rewritten_by_the_settlement(ledger: Ledger) -> None:
+    """Append-only means append-only: the first entry still says what it said."""
+    with TestClient(streaming_app(ledger), raise_server_exceptions=False) as client:
+        client.get("/broken-stream")
+    data = entries(ledger)[0].data
+    assert (data["status"], "error" not in data) == (200, True)
+
+
+def test_a_client_that_disappears_mid_stream_is_recorded_as_incomplete(
+    ledger: Ledger,
+) -> None:
+    """Starlette cancels the body task on disconnect and returns without a final chunk.
+
+    Driven as raw ASGI because that is the only way to produce a disconnect faithfully:
+    a test client always reads to the end.
+    """
+
+    async def abandoned_stream(scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"row-0", "more_body": True})
+
+    middleware = SignLedgerAuditMiddleware(abandoned_stream, ledger=ledger)
+    call_asgi(middleware, http_scope(), [])
+    assert entries(ledger)[1].data["outcome"] == "incomplete"
+
+
+def test_a_client_that_disappears_mid_stream_records_no_exception_type(
+    ledger: Ledger,
+) -> None:
+    """Nothing raised. Naming an error that did not happen is a different lie."""
+
+    async def abandoned_stream(scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"row-0", "more_body": True})
+
+    middleware = SignLedgerAuditMiddleware(abandoned_stream, ledger=ledger)
+    call_asgi(middleware, http_scope(), [])
+    assert "error" not in entries(ledger)[1].data
+
+
+def test_a_settlement_that_cannot_be_written_is_counted_not_raised(
+    ledger: Ledger,
+) -> None:
+    """The client already has the response; there is no closing that door again.
+
+    So the failure is counted on the recorder - where ``fail_open`` failures are already
+    counted - rather than thrown into a server that can no longer act on it.
+    """
+
+    async def stream_then_break(scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        ledger.backend.close()
+        await send({"type": "http.response.body", "body": b"x", "more_body": False})
+
+    middleware = SignLedgerAuditMiddleware(stream_then_break, ledger=ledger)
+    call_asgi(middleware, http_scope(), [])
+    assert (middleware.recorder.audit_failures, middleware.recorder.last_audit_error) == (
+        1,
+        "StorageError",
+    )
+
+
+def test_a_stream_that_could_not_be_audited_at_all_is_not_settled(
+    ledger: Ledger,
+) -> None:
+    """Refused at ``http.response.start``: nothing was promised, so nothing is settled.
+
+    A settlement here would only count the same broken ledger a second time.
+    """
+
+    async def streaming_asgi(scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"x", "more_body": False})
+
+    middleware = SignLedgerAuditMiddleware(streaming_asgi, ledger=ledger)
+    ledger.backend.close()
+    sent = call_asgi(middleware, http_scope(), [])
+    assert (sent[0]["status"], middleware.recorder.audit_failures) == (500, 1)
+
+
+# ======================================================================================
+# The middleware entry and the decorator entry are two halves of one request
+# ======================================================================================
+
+
+def doubly_audited_app(ledger: Ledger) -> FastAPI:
+    """A route covered by both the middleware and the decorator - a real deployment."""
+    app = FastAPI()
+    app.add_middleware(SignLedgerAuditMiddleware, ledger=ledger)
+
+    @app.get("/items/{item_id}")
+    @audited(ledger, action="item.read")
+    async def read_item(item_id: int) -> Dict[str, Any]:
+        return {"item_id": item_id}
+
+    return app
+
+
+def test_the_middleware_entry_says_what_kind_of_record_it_is(ledger: Ledger) -> None:
+    with TestClient(make_app(ledger)) as client:
+        client.get("/items")
+    assert entries(ledger)[0].data["kind"] == "request"
+
+
+def test_a_doubly_audited_request_writes_two_entries_that_name_themselves(
+    ledger: Ledger,
+) -> None:
+    """Not deduplicated: both are real records. Labelled, so neither is mistaken for the
+    other by an auditor counting requests."""
+    with TestClient(doubly_audited_app(ledger)) as client:
+        client.get("/items/42")
+    assert kinds(ledger) == ["endpoint", "request"]
+
+
+def test_the_decorator_entry_carries_the_path_and_method_of_the_request(
+    ledger: Ledger,
+) -> None:
+    """Measured: the two entries shared only ``integration``, so an auditor querying on
+    ``path`` saw half the requests and one querying on ``action`` saw the other half."""
+    with TestClient(doubly_audited_app(ledger)) as client:
+        client.get("/items/42")
+    data = entries(ledger)[0].data
+    assert (data["method"], data["path"]) == ("GET", "/items/42")
+
+
+def test_the_two_entries_for_one_request_share_a_request_id(ledger: Ledger) -> None:
+    """Path and method do not identify a request; two concurrent GETs share both."""
+    with TestClient(doubly_audited_app(ledger)) as client:
+        client.get("/items/42")
+    endpoint_entry, request_entry = entries(ledger)
+    assert endpoint_entry.data["request_id"] == request_entry.data["request_id"]
+
+
+def test_two_requests_do_not_share_a_request_id(ledger: Ledger) -> None:
+    with TestClient(make_app(ledger)) as client:
+        client.get("/items")
+        client.get("/items")
+    first, second = entries(ledger)
+    assert first.data["request_id"] != second.data["request_id"]
+
+
+def test_a_decorated_call_outside_a_request_claims_no_request_context(
+    ledger: Ledger,
+) -> None:
+    """Invented correlation is worse than none: the decorator is also used on plain
+    calls, and there is no request there to belong to."""
+
+    async def endpoint() -> Dict[str, Any]:
+        return {"ok": True}
+
+    import anyio
+
+    anyio.run(audited(ledger)(endpoint))
+    data = entries(ledger)[0].data
+    assert [key for key in ("request_id", "path", "method") if key in data] == []
 
 
 # ======================================================================================
@@ -797,11 +1172,12 @@ def test_a_scope_with_no_peer_records_no_client_ip(ledger: Ledger) -> None:
     assert entries(ledger)[0].data["client_ip"] is None
 
 
-def test_an_exception_raised_after_the_response_started_is_not_audited_twice(
+def test_an_exception_raised_after_the_response_started_writes_no_second_request_entry(
     ledger: Ledger,
 ) -> None:
-    """The entry was already written when the status was known; a later failure must
-    not append a second, contradictory record for the same request."""
+    """The request entry was written when the status was known and is not rewritten,
+    contradicted, or repeated. What follows it is a settlement, which is a different
+    kind of record and says so."""
 
     async def failing_app(scope: Dict[str, Any], receive: Any, send: Any) -> None:
         await send({"type": "http.response.start", "status": 200, "headers": []})
@@ -810,7 +1186,7 @@ def test_an_exception_raised_after_the_response_started_is_not_audited_twice(
     middleware = SignLedgerAuditMiddleware(failing_app, ledger=ledger)
     with pytest.raises(RuntimeError):
         call_asgi(middleware, http_scope(), [])
-    assert ledger.count() == 1
+    assert kinds(ledger) == ["request", "response.completion"]
 
 
 def test_the_entry_written_before_a_mid_stream_failure_records_the_real_status(

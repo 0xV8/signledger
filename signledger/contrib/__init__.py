@@ -16,7 +16,7 @@ nothing was executed by a test - which is why every line below is reached by one
 
 from typing import Any, Dict, Mapping, Optional
 
-from signledger.contrib.redaction import RedactionPolicy
+from signledger.contrib.redaction import RedactionPolicy, redact_payload
 from signledger.core.exceptions import ConfigurationError, SignLedgerError
 
 __all__ = [
@@ -124,13 +124,28 @@ def build_audit_record(
     """Assemble the audit payload every integration writes.
 
     One shape for all three frameworks, so a query an auditor writes against a Flask
-    service still works against the Django one. Values arriving here are expected to have
-    been through :class:`~signledger.contrib.redaction.RedactionPolicy` already.
+    service still works against the Django one.
+
+    ``headers``, ``query``, ``body`` and ``client_ip`` arrive already redacted. The
+    remaining free-text fields do **not**: ``user`` is whatever a deployment's
+    ``USER_RESOLVER`` returned, and real resolvers read it straight out of the request, so
+    it is client-controlled text on its way into an append-only store. ``path`` reaches
+    here the same way. That is the last open half of the unpaired-surrogate denial of
+    service: ``json.loads`` accepts ``"\\ud800"``, CPython holds it, UTF-8 cannot encode
+    it, and SLCS/1 refuses the entry - so under ``fail_closed`` a single anonymous request
+    500s every audited endpoint, and under ``fail_open`` the attacker deletes its own
+    audit record. Sanitising every path *into* the record is one choke point instead of
+    three ``_user()`` implementations that must each remember.
+
+    :func:`~signledger.contrib.redaction.redact_payload` is the same function the bodies
+    go through, so the two can never disagree about what is encodable. On a string it only
+    ever substitutes the ``[UNENCODABLE]`` marker; it never redacts a value for its own
+    sake, because these fields are names of things, not values of them.
     """
     record: Dict[str, Any] = {
-        "integration": integration,
-        "method": method,
-        "path": path,
+        "integration": redact_payload(integration),
+        "method": redact_payload(method),
+        "path": redact_payload(path),
         "status": status,
         "client_ip": client_ip,
         "headers": dict(headers),
@@ -138,10 +153,10 @@ def build_audit_record(
         # Either the captured body or a marker naming the rule that refused it. An
         # absent field would be indistinguishable from a middleware nobody installed.
         "body": body if body_reason == "captured" else f"[OMITTED:{body_reason}]",
-        "user": user,
+        "user": None if user is None else redact_payload(user),
     }
     if error is not None:
         # Present only when there was one. A field that is always there and always null
         # teaches people to stop reading it.
-        record["error"] = error
+        record["error"] = redact_payload(error)
     return record

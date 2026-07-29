@@ -21,16 +21,36 @@ Every decision below is a v1 defect that had to stop being possible.
   returned connections still carrying a failed transaction, so the next borrower inherited
   ``current transaction is aborted`` and the ledger wedged.
 * **Schema creation holds the same advisory lock the append path holds**, and the
-  append-only guard is only created when it is absent. ``IF NOT EXISTS`` is a check, not a
-  lock: eight processes starting together raced on ``pg_type`` with the tables missing and
-  deadlocked on ``pg_proc`` with them present, and both escaped as *raw psycopg
+  append-only guard is created exactly once, with the table. ``IF NOT EXISTS`` is a check,
+  not a lock: eight processes starting together raced on ``pg_type`` with the tables
+  missing and deadlocked on ``pg_proc`` with them present, and both escaped as *raw psycopg
   exceptions* rather than ``StorageError``.
+* **A pre-existing table whose guard is missing is reported, never repaired.** That table
+  is the single most informative piece of evidence a ledger can carry - somebody with DDL
+  rights removed the guard - and re-arming it on the next start erases the evidence while
+  restoring the WORM claim. ``capabilities()`` simply stops saying
+  ``append_only_enforced``. Opening still succeeds, because refusing would make a tampered
+  ledger unreadable by the one tool that can describe the damage.
+* **Catalog lookups resolve the table the way the connection does.** ``pg_class.relname``
+  with no join to ``pg_namespace`` is schema-blind: once any schema held a
+  ``ledger_entries`` trigger, a backend opened on ``search_path=elsewhere`` skipped
+  creating its own guard *and* reported ``append_only_enforced`` for a table with zero
+  triggers, so ``assurance_level()`` said WORM about a table anyone could ``UPDATE``.
+  ``to_regclass`` on the *quoted* identifier answers about this backend's table and no
+  other - quoted because every statement here goes through ``Identifier``, so a mixed-case
+  name is case-sensitive and the bare name would fold to a table that does not exist.
 * **The pool knows which process opened its sockets.** ``os.fork()`` duplicates
   descriptors, so ``gunicorn --preload`` gave four workers one set of TCP connections and
   they interleaved the wire protocol: hung requests, rows delivered to the wrong query, and
   a ledger holding more entries than there were acknowledged appends. A child disowns what
   it inherited - without closing it, which would kill the parent's session too.
 * **``ORDER BY sequence``**, never ``ORDER BY timestamp``.
+* **``create=False`` provisions nothing at all.** Not even ``CREATE TABLE IF NOT EXISTS``,
+  which PostgreSQL refuses in a read-only transaction *even when the table already
+  exists*: it is the whole statement that is rejected, not the creation it would skip. So
+  the DDL in this constructor was what made ``signledger verify`` impossible to run from a
+  read-only role or against a hot standby - the one place a careful operator most wants to
+  run an integrity check. See :meth:`PostgresBackend._require_existing_schema`.
 """
 
 import hashlib
@@ -257,7 +277,15 @@ class _ConnectionPool:
 
 
 class PostgresBackend:
-    """A durable, append-only ledger store in PostgreSQL."""
+    """A durable, append-only ledger store in PostgreSQL.
+
+    ``create`` defaults to True, which is what every writer wants: the schema is
+    provisioned on open. Pass ``create=False`` to read a store that already exists,
+    running no DDL and taking no locks - what ``signledger verify`` does, so that an
+    integrity check can be run by a role with SELECT and nothing else, and so that a
+    mistyped DSN is answered with "that store does not exist" rather than with a verdict
+    about an audit log that was never there.
+    """
 
     def __init__(
         self,
@@ -268,7 +296,9 @@ class PostgresBackend:
         minconn: int = 1,
         maxconn: int = 8,
         connect_timeout: int = 10,
+        create: bool = True,
     ) -> None:
+        self.create = bool(create)
         self.entries_table = validate_identifier(entries_table, kind="entries table name")
         self.checkpoints_table = validate_identifier(
             checkpoints_table, kind="checkpoints table name"
@@ -276,6 +306,11 @@ class PostgresBackend:
         self.timestamp_index = _derived_identifier(self.entries_table, "_ts_us_idx")
         self.append_only_function = _derived_identifier(self.entries_table, "_append_only")
         self.append_only_trigger = _derived_identifier(self.entries_table, "_no_write")
+        #: The two table names as ``to_regclass`` has to receive them: quoted exactly as
+        #: ``Identifier`` quotes them everywhere else, so the catalog resolves the same
+        #: relation the reads and writes do - same schema, same letter case.
+        self._entries_regclass = _regclass_literal(self.entries_table)
+        self._checkpoints_regclass = _regclass_literal(self.checkpoints_table)
         self._closed = False
         self._session_timezone: Optional[str] = None
         #: Derived from the table name, so two *processes* writing the same ledger contend
@@ -286,8 +321,12 @@ class PostgresBackend:
                 dsn, minconn=minconn, maxconn=maxconn, connect_timeout=connect_timeout
             )
         try:
-            with _translating("create_schema"):
-                self._create_schema()
+            if self.create:
+                with _translating("create_schema"):
+                    self._create_schema()
+            else:
+                with _translating("open"):
+                    self._require_existing_schema()
         except BaseException:
             self._pool.closeall()
             raise
@@ -358,6 +397,51 @@ class PostgresBackend:
 
     # -- schema ------------------------------------------------------------------------
 
+    def _require_existing_schema(self) -> None:
+        """Check both relations are there, and create neither.
+
+        Two catalog lookups on one connection: no advisory lock, no ``CREATE``, no
+        ``COMMIT``. ``to_regclass`` resolves each name exactly as every read and write in
+        this module does - through the same quoting, against the same ``search_path`` -
+        so this answers about the relation the backend would actually read, in the schema
+        the DSN selected, and answers NULL rather than raising when it is absent.
+
+        A missing table is a :class:`StorageError`, never an integrity verdict. The caller
+        above turns the two into different exit codes, and an operator scripting
+        ``signledger verify || alert`` has to be able to tell "the log was tampered with"
+        from "I typed the DSN wrong".
+        """
+        with self._borrow() as connection, connection.cursor() as cur:
+            cur.execute(
+                "SELECT to_regclass(%s), to_regclass(%s)",
+                (self._entries_regclass, self._checkpoints_regclass),
+            )
+            resolved = _one_row(cur)
+        missing = [
+            name
+            for name, found in (
+                (self.entries_table, resolved[0]),
+                (self.checkpoints_table, resolved[1]),
+            )
+            if found is None
+        ]
+        if missing:
+            # The table name only. A DSN carries a password (contract section 10), and
+            # this message is the one an operator sees when the DSN is what was wrong.
+            raise StorageError(
+                f"open failed: this store does not exist - the database holds no table "
+                f"called {', '.join(missing)}, and this backend was opened with "
+                f"create=False, which never creates one"
+            )
+
+    def _refuse_write(self, operation: str) -> None:
+        """A store opened for reading is not written to, and says so in one message."""
+        if not self.create:
+            raise StorageError(
+                f"{operation} failed: this backend was opened with create=False, which "
+                f"reads an existing store and never writes to it"
+            )
+
     def _create_schema(self) -> None:
         """Create the two tables, the index and the append-only guard, once.
 
@@ -366,6 +450,14 @@ class PostgresBackend:
         both insert into ``pg_type``, and the loser gets ``UniqueViolation`` on
         ``pg_type_typname_nsp_index``. The DDL path was the one place ``_lock_key`` was
         not used, and two workers starting together failed 15 constructions out of 20.
+
+        The guard is armed if and only if *this* statement made the table. That is decided
+        by comparing the relation OID the connection resolves before and after the
+        ``CREATE``, which is the only question with a single answer: ``IF NOT EXISTS``
+        checks the *creation* schema - the head of ``search_path`` - while name resolution
+        scans the whole path, so ``search_path=tenant,public`` over an existing
+        ``public.ledger_entries`` really does create a second, empty ``tenant`` table. A
+        bare "does a table by this name exist" test would leave that one unguarded.
         """
         entries = sql.Identifier(self.entries_table)
         checkpoints = sql.Identifier(self.checkpoints_table)
@@ -373,6 +465,7 @@ class PostgresBackend:
             # Transaction-scoped: COMMIT and ROLLBACK both release it, so a construction
             # that raises cannot leave the lock held on a connection the pool reuses.
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (self._lock_key,))
+            existing = self._entries_oid(cur)
             cur.execute(
                 sql.SQL(
                     """
@@ -398,6 +491,7 @@ class PostgresBackend:
                     """
                 ).format(entries=entries)
             )
+            created = self._entries_oid(cur) != existing
             # sequence, entry_id, hash and previous_hash are already indexed by their
             # UNIQUE constraints. timestamp_us is the only other queried column, and it
             # is what every time filter compares on.
@@ -425,7 +519,8 @@ class PostgresBackend:
                     """
                 ).format(checkpoints=checkpoints)
             )
-            self._create_append_only_guard(cur, entries)
+            if created:
+                self._create_append_only_guard(cur, entries)
             connection.commit()
 
     def _create_append_only_guard(self, cur: psycopg.Cursor, entries: sql.Identifier) -> None:
@@ -436,16 +531,24 @@ class PostgresBackend:
         success. A ``BEFORE`` trigger that raises is the same prohibition that also tells
         the truth, so that is what ships.
 
-        Idempotent, and that is load-bearing. ``DROP TRIGGER`` takes ACCESS EXCLUSIVE on
-        the entries table, so re-running it on every construction made a *new* worker's
-        start-up wait on any in-flight append, and two workers starting together deadlock
-        against each other on ``pg_proc``. A guard that is already attached is left exactly
-        where it is - the trigger keeps its OID and no exclusive lock is ever requested.
+        Called only when the caller has just created the table, and that is load-bearing
+        twice over.
+
+        *It never re-arms.* A table that exists without its guard is evidence that somebody
+        with DDL rights removed it, and quietly putting it back destroys the evidence and
+        restores a WORM claim the deployment no longer earns. SQLite behaves the same way;
+        the two backends used to disagree.
+
+        *It never takes an exclusive lock on a live table.* ``DROP TRIGGER`` needs ACCESS
+        EXCLUSIVE, so re-running the guard on every construction made a new worker's
+        start-up wait on any in-flight append, and two workers starting together deadlocked
+        on ``pg_proc``. Here the table was made moments ago in this very transaction, so
+        the lock is already held and uncontended, and no trigger of this name can exist on
+        it - trigger names are per-table in PostgreSQL.
+
         The consequence to know about: changing the guard's body in a future release will
-        need an explicit migration, because an existing trigger is never replaced here.
+        need an explicit migration, because an existing table is never revisited here.
         """
-        if self._append_only_trigger_exists(cur):
-            return
         cur.execute(
             sql.SQL(
                 """
@@ -456,11 +559,6 @@ class PostgresBackend:
                 $guard$ LANGUAGE plpgsql
                 """
             ).format(function=sql.Identifier(self.append_only_function))
-        )
-        cur.execute(
-            sql.SQL("DROP TRIGGER IF EXISTS {trigger} ON {entries}").format(
-                trigger=sql.Identifier(self.append_only_trigger), entries=entries
-            )
         )
         cur.execute(
             sql.SQL(
@@ -477,6 +575,7 @@ class PostgresBackend:
 
     def append_atomic(self, build: Callable[[Optional[Entry]], Entry]) -> Entry:
         """Read the tip and insert its successor inside one transaction."""
+        self._refuse_write("append")
         with _translating("append"):
             return retry_on_conflict(self._append_once(build), _is_conflict)
 
@@ -594,12 +693,17 @@ class PostgresBackend:
         return iter([entry_from_row(dict(row)) for row in rows])
 
     def size_bytes(self) -> int:
-        """Bytes the entries and checkpoints relations occupy, indexes included."""
+        """Bytes the entries and checkpoints relations occupy, indexes included.
+
+        The *quoted* names are handed to ``to_regclass``, for the same reason the trigger
+        probe uses them: the bare name is case-folded, so a ledger on a mixed-case table
+        resolved to nothing and reported a size of zero while holding rows.
+        """
         with _translating("size_bytes"), self._borrow() as connection, connection.cursor() as cur:
             cur.execute(
                 "SELECT COALESCE(pg_total_relation_size(to_regclass(%s)), 0) "
                 "+ COALESCE(pg_total_relation_size(to_regclass(%s)), 0)",
-                (self.entries_table, self.checkpoints_table),
+                (self._entries_regclass, self._checkpoints_regclass),
             )
             return int(_one_row(cur)[0])
 
@@ -625,13 +729,30 @@ class PostgresBackend:
         return frozenset(tokens)
 
     def _append_only_trigger_exists(self, cur: psycopg.Cursor) -> bool:
-        """True when the append-only trigger is still attached to the entries table."""
+        """True when the append-only trigger is attached to **this backend's** entries
+        table - the relation this connection resolves the name to, and no other.
+
+        Matching ``pg_class.relname`` alone was schema-blind, and that is how the one
+        number this library exists to compute honestly came out wrong in the dangerous
+        direction: with ``public.ledger_entries`` guarded, a backend on
+        ``search_path=tenant`` reported ``append_only_enforced`` for
+        ``tenant.ledger_entries``, which had no trigger at all. Comparing ``tgrelid``
+        against a resolved OID cannot borrow a neighbour's guard, and answers ``False``
+        rather than raising when the table is absent, because ``to_regclass`` yields NULL
+        and ``tgrelid = NULL`` matches nothing.
+        """
         cur.execute(
-            "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
-            "WHERE c.relname = %s AND t.tgname = %s AND NOT t.tgisinternal",
-            (self.entries_table, self.append_only_trigger),
+            "SELECT COUNT(*) FROM pg_trigger t "
+            "WHERE t.tgrelid = to_regclass(%s)::oid AND t.tgname = %s AND NOT t.tgisinternal",
+            (self._entries_regclass, self.append_only_trigger),
         )
         return int(_one_row(cur)[0]) > 0
+
+    def _entries_oid(self, cur: psycopg.Cursor) -> Optional[int]:
+        """The OID this connection resolves the entries table to, or ``None`` if absent."""
+        cur.execute("SELECT to_regclass(%s)::oid", (self._entries_regclass,))
+        row = _one_row(cur)
+        return None if row[0] is None else int(row[0])
 
     def _fsync_settings(self, cur: psycopg.Cursor) -> Tuple[str, str]:
         """``(fsync, synchronous_commit)`` as the *server* currently has them."""
@@ -642,6 +763,7 @@ class PostgresBackend:
     # -- checkpoints -------------------------------------------------------------------
 
     def save_checkpoint(self, cp: Checkpoint) -> None:
+        self._refuse_write("save_checkpoint")
         row = checkpoint_to_row(cp)
         row["timestamp"] = cp.timestamp
         with _translating("save_checkpoint"), self._borrow() as connection:
@@ -862,6 +984,21 @@ def _derived_identifier(base: str, suffix: str) -> str:
     return validate_identifier(
         base[: MAX_IDENTIFIER_LENGTH - len(suffix)] + suffix, kind="derived identifier"
     )
+
+
+def _regclass_literal(table: str) -> str:
+    """``table`` quoted the way every statement in this module quotes it.
+
+    ``to_regclass`` takes *text* and parses it as an identifier, so the bare name is
+    case-folded: ``to_regclass('LedgerEntries')`` looks for ``ledgerentries``, which the
+    backend never created, and answers NULL. The reads and writes reach SQL through
+    ``sql.Identifier``, so the catalog has to be asked in the same spelling.
+
+    Schema qualification is deliberately *not* added. Resolution against the live
+    ``search_path`` is what makes the answer describe the table this backend actually
+    writes to, whatever schema the DSN selected.
+    """
+    return sql.Identifier(table).as_string(None)
 
 
 def _advisory_key(table: str) -> int:

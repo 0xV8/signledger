@@ -79,11 +79,72 @@ correct way round: a worker that cannot audit must not answer ``200``.
 
 The same applies to any pre-fork work: ``uwsgi`` without ``--lazy-apps``, and
 ``os.fork()`` in a custom supervisor.
+
+:func:`audited` is the one place that rule cannot be obeyed by moving code: a decorator
+runs at *import* time, before any factory has been called. So it takes either a ledger or
+a **zero-argument callable returning one**, resolved on every call::
+
+    @router.get("/payments/{payment_id}")
+    @audited(lambda: app.state.ledger, action="payment.read")
+    async def read_payment(payment_id: str) -> dict: ...
+
+The callable is invoked per request, not memoised: a factory that hands out a per-thread
+handle - which a SQLite connection must be - would otherwise leak one thread's connection
+into another.
+
+What an entry means
+-------------------
+
+Every entry carries a ``kind`` and a ``request_id``.
+
+``kind="request"``
+    Written by the middleware, one per audited request.
+
+``kind="endpoint"``
+    Written by :func:`audited`, one per decorated call. A route covered by both the
+    middleware and the decorator therefore produces **two** entries per request, and they
+    are not deduplicated - both are true, and each records something the other does not.
+    They share a ``request_id``, and the decorator entry repeats ``method`` and ``path``,
+    so the pair can be reassembled. A decorated function called outside a request carries
+    no request context at all rather than an invented one.
+
+``kind="response.completion"``
+    Written when a **streamed** response finishes, and only then.
+
+``completion``: ``"final"`` or ``"provisional"``
+-------------------------------------------------
+
+``fail_closed`` requires the audit write to happen before ``http.response.start`` is
+forwarded - once the client has the status line, nothing later can take it back. For a
+response whose body is already in hand (any response declaring a ``content-length``) that
+status is settled, and the entry says ``completion="final"``.
+
+For a streamed body it is not. The status is a *promise*: the endpoint may still raise on
+its third chunk, or the client may vanish. Measured against v2.0.0: a route that emitted
+one chunk and then raised was permanently in the ledger as ``status: 200`` with no error
+field, and so was a mid-stream disconnect.
+
+Entries are append-only and are not rewritten to fix this. Instead a streamed response is
+recorded as ``completion="provisional"``, and a second entry - ``kind`` of
+``"response.completion"``, same ``request_id`` - records how it actually ended:
+
+* ``outcome="complete"`` - the final body chunk went out;
+* ``outcome="incomplete"`` - it did not, plus ``error`` naming the exception if there was
+  one. No ``error`` field means nobody raised: the client went away.
+
+So ``status: 200`` on a ``provisional`` entry means *200 was sent*, not *200 was
+delivered*. An auditor counting successful responses wants ``completion="final"`` plus
+the settled provisional ones. A settlement that cannot be written is counted on
+``middleware.recorder.audit_failures`` rather than raised: the response has already gone,
+and there is no failing closed after that.
 """
 
+import contextlib
+import contextvars
 import functools
 import inspect
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+import uuid
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -98,15 +159,49 @@ from signledger.contrib import (
 from signledger.contrib.redaction import RedactionPolicy
 from signledger.core.exceptions import ConfigurationError
 
-__all__ = ["INTEGRATION", "SignLedgerAuditMiddleware", "audit_router", "audited"]
+__all__ = [
+    "COMPLETION_FINAL",
+    "COMPLETION_PROVISIONAL",
+    "INTEGRATION",
+    "KIND_COMPLETION",
+    "KIND_ENDPOINT",
+    "KIND_REQUEST",
+    "SignLedgerAuditMiddleware",
+    "audit_router",
+    "audited",
+]
 
 #: Name recorded in every entry this integration writes.
 INTEGRATION = "fastapi"
+
+#: ``kind`` of the entry the middleware writes for one request.
+KIND_REQUEST = "request"
+
+#: ``kind`` of the entry :func:`audited` writes for one decorated call.
+KIND_ENDPOINT = "endpoint"
+
+#: ``kind`` of the entry that settles a provisional one.
+KIND_COMPLETION = "response.completion"
+
+#: The response was complete when its entry was written.
+COMPLETION_FINAL = "final"
+
+#: The status was promised before the body existed; a settlement entry follows.
+COMPLETION_PROVISIONAL = "provisional"
 
 #: Default ceiling on how many entries one inspection request may return.
 DEFAULT_MAX_PAGE_SIZE = 100
 
 _AUDIT_FAILED_BODY = b'{"detail":"audit write failed"}'
+
+#: Statuses that carry no body, so a missing ``content-length`` says nothing is coming.
+_BODYLESS_STATUSES: FrozenSet[int] = frozenset({204, 304})
+
+#: The request the current task is serving, for :func:`audited` to correlate against.
+#: Set by the middleware; ``None`` in a decorated call that no request reached.
+_REQUEST: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = contextvars.ContextVar(
+    "signledger_fastapi_request", default=None
+)
 
 
 class SignLedgerAuditMiddleware:
@@ -157,6 +252,15 @@ class SignLedgerAuditMiddleware:
             "refused": False,
             "buffered": 0,
             "overflow": False,
+            # Set once the status is promised for a body that does not exist yet.
+            "provisional": False,
+            "status": None,
+            "finished": False,
+        }
+        context: Dict[str, Any] = {
+            "request_id": uuid.uuid4().hex,
+            "method": scope.get("method", ""),
+            "path": path,
         }
 
         async def observing_receive() -> Dict[str, Any]:
@@ -185,22 +289,31 @@ class SignLedgerAuditMiddleware:
         async def auditing_send(message: Dict[str, Any]) -> None:
             if message["type"] == "http.response.start" and not state["recorded"]:
                 state["recorded"] = True
+                state["status"] = message["status"]
+                state["provisional"] = _is_streamed(message)
                 try:
                     await self._record(
                         scope, headers, decision, chunks, message["status"], None,
-                        overflow=state["overflow"],
+                        overflow=state["overflow"], context=context,
+                        provisional=state["provisional"],
                     )
                 except AuditWriteError:
                     # fail_closed, and the client has not been told anything yet. This is
-                    # the only moment at which refusing is still possible.
+                    # the only moment at which refusing is still possible. Nothing was
+                    # promised, so there will be nothing to settle either.
                     state["refused"] = True
+                    state["provisional"] = False
                     await _send_audit_failure(send)
                     return
             if state["refused"]:
                 # The endpoint's own body must not follow our 500 down the wire.
                 return
             await send(message)
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                # Sent, not merely produced: the last chunk is on the wire.
+                state["finished"] = True
 
+        token = _REQUEST.set(context)
         try:
             await self.app(scope, observing_receive, auditing_send)
         except Exception as err:
@@ -209,9 +322,17 @@ class SignLedgerAuditMiddleware:
                 # The failed requests are the ones an audit trail exists for.
                 await self._record(
                     scope, headers, decision, chunks, 500, type(err).__name__,
-                    overflow=state["overflow"],
+                    overflow=state["overflow"], context=context, provisional=False,
                 )
+            else:
+                # The status went out before this happened and cannot be withdrawn. It
+                # can be settled, which is the whole point of the second entry.
+                await self._settle(context, state, type(err).__name__)
             raise
+        else:
+            await self._settle(context, state, None)
+        finally:
+            _REQUEST.reset(token)
 
     # -- internals ---------------------------------------------------------------------
 
@@ -227,6 +348,8 @@ class SignLedgerAuditMiddleware:
         status: int,
         error: Optional[str],
         *,
+        context: Dict[str, Any],
+        provisional: bool,
         overflow: bool = False,
     ) -> None:
         policy = self.recorder.redaction
@@ -246,8 +369,42 @@ class SignLedgerAuditMiddleware:
             user=self._user(scope),
             error=error,
         )
+        record["kind"] = KIND_REQUEST
+        record["request_id"] = context["request_id"]
+        # Says whether the status above is a fact or a promise. Never absent: an auditor
+        # must not have to know which version of this middleware wrote the entry.
+        record["completion"] = COMPLETION_PROVISIONAL if provisional else COMPLETION_FINAL
         # The append is synchronous and may fsync. Off the event loop it goes.
         await run_in_threadpool(self.recorder.record, record, {"integration": INTEGRATION})
+
+    async def _settle(
+        self, context: Dict[str, Any], state: Dict[str, Any], error: Optional[str]
+    ) -> None:
+        """Record how a promised response actually ended.
+
+        Only for provisional entries: settling a response that was already complete when
+        it was recorded would double the size of every ledger and say nothing.
+        """
+        if not state["provisional"]:
+            return
+        record: Dict[str, Any] = {
+            "integration": INTEGRATION,
+            "kind": KIND_COMPLETION,
+            "request_id": context["request_id"],
+            "method": context["method"],
+            "path": context["path"],
+            "status": state["status"],
+            "outcome": "complete" if state["finished"] else "incomplete",
+        }
+        if error is not None:
+            record["error"] = error
+        # There is no failing closed here: the client has had the response since the
+        # first chunk. The recorder has already counted the failure and named it, so this
+        # is not a swallowed error - it is one that has nowhere left to go.
+        with contextlib.suppress(AuditWriteError):
+            await run_in_threadpool(
+                self.recorder.record, record, {"integration": INTEGRATION}
+            )
 
     def _body(self, decision: Any, chunks: List[bytes], overflow: bool) -> Tuple[Any, str]:
         if not decision.capture:
@@ -278,6 +435,12 @@ def audited(
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorate one endpoint so that calling it writes a ledger entry.
 
+    ``ledger`` is either a :class:`~signledger.core.ledger.Ledger` or a **zero-argument
+    callable returning one**, called on each audited call. The callable form is what
+    makes this decorator usable at all from an application factory: decorators run at
+    import time, and the ledger must not be constructed until after the fork. Binding an
+    instance here and building it in the factory are mutually exclusive instructions.
+
     An **async** endpoint gets an async wrapper, so the decorated object is still a
     coroutine function and FastAPI still awaits it. v1's version returned ``None``, which
     registered the route against nothing and destroyed the endpoint outright.
@@ -289,9 +452,22 @@ def audited(
     ``functools.wraps`` is what keeps FastAPI's dependency injection working: it sets
     ``__wrapped__``, so ``inspect.signature`` still sees the endpoint's real parameters.
     """
-    recorder = AuditRecorder(
-        ledger, redaction=redaction, audit_failure_policy=audit_failure_policy
-    )
+    policy = RedactionPolicy() if redaction is None else redaction
+    # Built and thrown away purely to validate ``audit_failure_policy`` now. Deferring
+    # that to the first request means a typo is found by a user, in production.
+    AuditRecorder(None, redaction=policy, audit_failure_policy=audit_failure_policy)
+
+    def resolve() -> AuditRecorder:
+        """The recorder for one call, against the ledger that exists at this moment.
+
+        Deliberately not memoised. A factory may legitimately hand out a per-thread
+        handle - a SQLite connection must be one - and caching the first would use it
+        from every thread afterwards.
+        """
+        resolved = ledger() if callable(ledger) else ledger
+        return AuditRecorder(
+            resolved, redaction=policy, audit_failure_policy=audit_failure_policy
+        )
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         label = func.__name__ if action is None else action
@@ -304,10 +480,10 @@ def audited(
                     result = await func(*args, **kwargs)
                 except Exception as err:
                     await run_in_threadpool(
-                        recorder.record, _call_record(label, func, type(err).__name__)
+                        resolve().record, _call_record(label, func, type(err).__name__)
                     )
                     raise
-                await run_in_threadpool(recorder.record, _call_record(label, func, None))
+                await run_in_threadpool(resolve().record, _call_record(label, func, None))
                 return result
 
             # Returned, not discarded. This one line is the whole v1 defect.
@@ -318,9 +494,9 @@ def audited(
             try:
                 result = func(*args, **kwargs)
             except Exception as err:
-                recorder.record(_call_record(label, func, type(err).__name__))
+                resolve().record(_call_record(label, func, type(err).__name__))
                 raise
-            recorder.record(_call_record(label, func, None))
+            resolve().record(_call_record(label, func, None))
             return result
 
         return sync_wrapper
@@ -334,16 +510,40 @@ def _call_record(label: str, func: Callable[..., Any], error: Optional[str]) -> 
     Deliberately records *no* arguments. A decorator sees the endpoint's real parameters,
     which is exactly where the passwords are, and there is no request context here to
     redact against.
+
+    It does carry the identity of the request it happened inside, when there is one. A
+    route covered by both the middleware and this decorator writes two entries, and
+    without a shared ``request_id`` they had exactly one field in common - ``integration``
+    - so no auditor could tell they described the same request. Outside a request the
+    fields are absent rather than null: there is nothing to correlate with, and a field
+    that is always there and always empty teaches people to stop reading it.
     """
     record: Dict[str, Any] = {
         "integration": INTEGRATION,
-        "kind": "endpoint",
+        "kind": KIND_ENDPOINT,
         "action": label,
         "endpoint": func.__name__,
     }
+    context = _REQUEST.get()
+    if context is not None:
+        record["request_id"] = context["request_id"]
+        record["method"] = context["method"]
+        record["path"] = context["path"]
     if error is not None:
         record["error"] = error
     return record
+
+
+def _is_streamed(message: Dict[str, Any]) -> bool:
+    """Whether a body is still to come that the status has already been promised for.
+
+    A response declaring a ``content-length`` was fully built before its status went out;
+    one that does not is being generated as it is sent, and may yet fail. Statuses that
+    carry no body at all declare no length either, and are not waiting on anything.
+    """
+    if message["status"] in _BODYLESS_STATUSES:
+        return False
+    return not any(name.lower() == b"content-length" for name, _ in message.get("headers", []))
 
 
 def audit_router(

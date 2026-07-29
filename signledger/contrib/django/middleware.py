@@ -5,10 +5,13 @@ searched with the ORM and the admin. The ledger is the evidence; the index is a
 convenience, and it is never allowed to be the reason a request fails.
 """
 
-from typing import Any, Dict, Optional, Tuple
+import logging
+from typing import Any, Callable, Dict, Optional, Tuple
+
+from django.db import IntegrityError, transaction
 
 from signledger.contrib import FAIL_CLOSED, AuditRecorder, build_audit_record
-from signledger.contrib.django import get_ledger, get_settings
+from signledger.contrib.django import _resolve, get_ledger, get_settings
 from signledger.contrib.django.models import AuditIndex
 from signledger.contrib.redaction import RedactionPolicy
 
@@ -16,6 +19,9 @@ __all__ = ["INTEGRATION", "SignLedgerAuditMiddleware"]
 
 #: Name recorded in every entry this integration writes.
 INTEGRATION = "django"
+
+#: A child of the ``signledger`` logger, so one logging config covers the whole library.
+logger = logging.getLogger("signledger.contrib.django")
 
 
 class SignLedgerAuditMiddleware:
@@ -44,7 +50,14 @@ class SignLedgerAuditMiddleware:
         )
         self.skip_paths: Tuple[str, ...] = tuple(config["SKIP_PATHS"])
         self.index_entries = bool(config["INDEX_ENTRIES"])
-        self.user_resolver = config["USER_RESOLVER"]
+        # Resolved once, here, and through the same function ``LEDGER_FACTORY`` uses, so
+        # a dotted path works in both. It used to be stored verbatim, which meant a
+        # perfectly ordinary settings value raised ``TypeError: 'str' object is not
+        # callable`` on every request while ``manage.py check`` reported nothing.
+        resolver = config["USER_RESOLVER"]
+        self.user_resolver: Optional[Callable[[Any], Any]] = (
+            None if resolver is None else _resolve(resolver, "USER_RESOLVER")
+        )
 
     def __call__(self, request: Any) -> Any:
         if any(request.path.startswith(prefix) for prefix in self.skip_paths):
@@ -94,7 +107,7 @@ class SignLedgerAuditMiddleware:
         return self.redaction.decode_body(request.body), "captured"
 
     def _user(self, request: Any) -> Optional[str]:
-        """The acting identity.
+        """The acting identity, from ``USER_RESOLVER`` if a deployment named one.
 
         Falls back to ``request.user`` when ``django.contrib.auth`` is installed, and
         records the **primary key** rather than the username: a pk is stable across a
@@ -111,28 +124,79 @@ class SignLedgerAuditMiddleware:
     def _index(self, entry: Any, record: Dict[str, Any]) -> None:
         """Mirror the entry into the ORM index.
 
-        Wrapped so that an index failure follows the same policy as a ledger failure.
-        Under ``fail_open`` it is counted and the request proceeds: the evidence is
-        already safely in the ledger, and a convenience table must never be the reason
-        a request 500s.
+        This runs *after* the ledger entry has been written, and the ledger is immutable,
+        so this method must never raise. An exception here would hand the client an
+        outcome the tamper-evident log has already recorded, permanently, as a different
+        one - a 500 the log insists was a 200. For a library whose entire product is
+        "this record is trustworthy", that is the worst thing it can produce, and it is
+        why the failure policy governs the ledger write and nothing else.
+
+        The failure is counted on the recorder, named in the log, and the request is
+        served. That is the promise in this module's docstring: the index is a
+        convenience, and it is never allowed to be the reason a request fails.
         """
+        row = {
+            "ledger_id": entry.ledger_id,
+            "sequence": entry.sequence,
+            "entry_id": entry.entry_id,
+            "entry_hash": entry.hash,
+            "timestamp": entry.timestamp,
+            "method": record["method"],
+            "path": record["path"][:512],
+            "status": record["status"],
+            "actor": record["user"],
+        }
         try:
-            AuditIndex.objects.create(
-                ledger_id=entry.ledger_id,
-                sequence=entry.sequence,
-                entry_id=entry.entry_id,
-                entry_hash=entry.hash,
-                timestamp=entry.timestamp,
-                method=record["method"],
-                path=record["path"][:512],
-                status=record["status"],
-                actor=record["user"],
-            )
-        except Exception as err:  # noqa: BLE001 - re-raised or counted, never swallowed
+            self._write_index_row(row)
+        except Exception as err:  # noqa: BLE001 - counted and logged, never swallowed
             self.recorder.audit_failures += 1
             self.recorder.last_audit_error = type(err).__name__
-            if self.recorder.fail_closed:
-                raise
+            # The exception *type* only. A database driver quotes the row it refused,
+            # and that row names an actor and a path: contract section 10.
+            logger.warning(
+                "the audit index row could not be written (%s). The ledger entry is "
+                "unaffected - AuditIndex is a queryable mirror and never the evidence - "
+                "so the request was served as it was answered.",
+                type(err).__name__,
+            )
+
+    def _write_index_row(self, row: Dict[str, Any]) -> None:
+        """Insert the row, replacing one left behind by a store that no longer exists.
+
+        ``UNIQUE (ledger_id, sequence)`` is what makes this table an index rather than a
+        pile of rows, and it is also what a deployment collides with the moment
+        ``LEDGER_FACTORY`` is repointed at a fresh store - a new file, a restored backup,
+        a wiped staging database - while ``ledger_id`` keeps the one stable value the
+        README asks every worker to share. The new chain restarts at sequence 0 on top of
+        rows mirroring the old one. Those rows are a stale mirror of a store that no
+        longer exists; the entry being written now is the one that holds that position.
+        Replacing it is recovery, not loss: the ledger holds every entry either way.
+
+        The insert runs inside ``atomic()`` so a rejected one is rolled back to a
+        savepoint rather than left in the connection's lap. Anything that wraps a request
+        in a transaction - a consumer's own ``TestCase``, a transaction middleware ahead
+        of this one - would otherwise have that transaction poisoned by the very
+        collision this method exists to survive, and on PostgreSQL every later statement
+        in it fails outright.
+        """
+        try:
+            with transaction.atomic():
+                AuditIndex.objects.create(**row)
+        except IntegrityError:
+            with transaction.atomic():
+                AuditIndex.objects.filter(
+                    ledger_id=row["ledger_id"], sequence=row["sequence"]
+                ).delete()
+                AuditIndex.objects.create(**row)
+            logger.warning(
+                "replaced a stale audit index row at %s#%s: it mirrored an entry from a "
+                "store that no longer holds that position. Repointing LEDGER_FACTORY at "
+                "a fresh store while keeping the same ledger_id does exactly this. The "
+                "ledger is unaffected. Delete the AuditIndex rows for this ledger_id to "
+                "clear the rest of the stale mirror, or give the new store its own id.",
+                row["ledger_id"],
+                row["sequence"],
+            )
 
 
 def _content_length(request: Any) -> Optional[int]:

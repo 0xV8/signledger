@@ -58,26 +58,89 @@ one is never used::
 
 The same applies to any pre-fork work: ``uwsgi`` without ``--lazy-apps``, and
 ``os.fork()`` in a custom supervisor.
+
+What an entry means
+-------------------
+
+Every entry carries a ``kind`` and a ``request_id``. ``kind="request"`` is the one this
+extension writes per request; ``kind="response.completion"`` settles a streamed one.
+
+``completion``: ``"final"`` or ``"provisional"``
+-------------------------------------------------
+
+``after_request`` runs when the response *object* is finished, which for a streamed body
+is before a single byte of it exists: Flask hands the iterable to the WSGI server
+afterwards, and the server consumes it long after this extension has stopped looking.
+The status recorded for a streamed response is therefore a *promise*, and a generator
+that raised on its second chunk was permanently in the ledger as a plain ``200``.
+
+Entries are append-only and are not rewritten to fix that. A streamed response is instead
+recorded as ``completion="provisional"``, and a second entry - ``kind`` of
+``"response.completion"``, same ``request_id`` - records how it ended, when the WSGI
+server closes the body:
+
+* ``outcome="complete"`` - the iterable ran to the end;
+* ``outcome="incomplete"`` - it did not, plus ``error`` naming the exception if one was
+  raised. No ``error`` field means nobody raised: the client hung up.
+
+A response whose body is already built - the ordinary case - is ``completion="final"``
+and gets no second entry. So is a response whose body a WSGI server will never send at
+all (``HEAD``, ``204``, ``304``, ``1xx``), because nothing would ever settle it.
+
+A settlement that cannot be written is counted on ``recorder.audit_failures`` rather than
+raised: the client has had the response since the first chunk, and there is no failing
+closed after that.
 """
 
-from typing import Any, Callable, Dict, Iterable, Optional, Tuple
+import contextlib
+import functools
+import uuid
+from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, Optional, Tuple
 
 from flask import Blueprint, Flask, Response, g, jsonify, request
 
-from signledger.contrib import FAIL_CLOSED, AuditRecorder, build_audit_record
+from signledger.contrib import (
+    FAIL_CLOSED,
+    AuditRecorder,
+    AuditWriteError,
+    build_audit_record,
+)
 from signledger.contrib.redaction import RedactionPolicy
 from signledger.core.exceptions import ConfigurationError
 
-__all__ = ["INTEGRATION", "SignLedgerAudit", "audit_blueprint"]
+__all__ = [
+    "COMPLETION_FINAL",
+    "COMPLETION_PROVISIONAL",
+    "INTEGRATION",
+    "KIND_COMPLETION",
+    "KIND_REQUEST",
+    "SignLedgerAudit",
+    "audit_blueprint",
+]
 
 #: Name recorded in every entry this integration writes.
 INTEGRATION = "flask"
+
+#: ``kind`` of the entry written for one request.
+KIND_REQUEST = "request"
+
+#: ``kind`` of the entry that settles a provisional one.
+KIND_COMPLETION = "response.completion"
+
+#: The response was complete when its entry was written.
+COMPLETION_FINAL = "final"
+
+#: The status was recorded before the body existed; a settlement entry follows.
+COMPLETION_PROVISIONAL = "provisional"
 
 #: Key under which the extension registers itself in ``app.extensions``.
 EXTENSION_KEY = "signledger"
 
 #: Default ceiling on how many entries one inspection request may return.
 DEFAULT_MAX_PAGE_SIZE = 100
+
+#: Statuses whose body a WSGI server discards. Werkzeug's ``Response.get_app_iter``.
+_BODYLESS_STATUSES: FrozenSet[int] = frozenset({204, 304})
 
 _BODY_KEY = "_signledger_body"
 _REASON_KEY = "_signledger_body_reason"
@@ -147,10 +210,25 @@ class SignLedgerAudit:
         setattr(g, _REASON_KEY, decision.reason)
 
     def _after_request(self, response: Response) -> Response:
-        """Write the audit entry once the real status code is known."""
+        """Write the audit entry once the real status code is known.
+
+        For a streamed response that is *all* that is known: the body has not been
+        generated yet and will not be until the WSGI server pulls it, after this
+        extension has stopped looking. Such an entry says so, and is settled by a second
+        one when the server closes the body.
+        """
         if self._skip(request.path):
             return response
         policy = self.recorder.redaction
+        context: Dict[str, Any] = {
+            "request_id": uuid.uuid4().hex,
+            "method": request.method,
+            "path": request.path,
+            "status": response.status_code,
+        }
+        streamed = response.is_streamed and _sends_a_body(
+            request.method, response.status_code
+        )
         record = build_audit_record(
             integration=INTEGRATION,
             method=request.method,
@@ -166,10 +244,40 @@ class SignLedgerAudit:
             body_reason=getattr(g, _REASON_KEY, "disabled"),
             user=self._user(),
         )
+        record["kind"] = KIND_REQUEST
+        record["request_id"] = context["request_id"]
+        # Says whether the status above is a fact or a promise. Never absent: an auditor
+        # must not have to know which version of this extension wrote the entry.
+        record["completion"] = COMPLETION_PROVISIONAL if streamed else COMPLETION_FINAL
         # Raises AuditWriteError under fail_closed, which Flask turns into a 500. An
         # unaudited request must not be able to answer 200.
         self.recorder.record(record, {"integration": INTEGRATION})
+        if streamed:
+            response.response = _SettlingBody(
+                response.response, functools.partial(self._settle, context)
+            )
         return response
+
+    def _settle(
+        self, context: Dict[str, Any], complete: bool, error: Optional[str]
+    ) -> None:
+        """Record how a promised response actually ended."""
+        record: Dict[str, Any] = {
+            "integration": INTEGRATION,
+            "kind": KIND_COMPLETION,
+            "request_id": context["request_id"],
+            "method": context["method"],
+            "path": context["path"],
+            "status": context["status"],
+            "outcome": "complete" if complete else "incomplete",
+        }
+        if error is not None:
+            record["error"] = error
+        # No failing closed here: the client has had the response since the first chunk.
+        # The recorder has counted the failure and named it, so this is not a swallowed
+        # error - it is one with nowhere left to go.
+        with contextlib.suppress(AuditWriteError):
+            self.recorder.record(record, {"integration": INTEGRATION})
 
     def _user(self) -> Optional[str]:
         """The acting identity, as a string.
@@ -181,6 +289,70 @@ class SignLedgerAudit:
             return None
         resolved = self.user_resolver(request)
         return None if resolved is None else str(resolved)
+
+
+class _SettlingBody:
+    """A streamed response body that reports how it ended.
+
+    PEP 3333 requires a server to call ``close()`` on the response iterable "upon
+    completion of the current request, whether the request was completed normally or
+    terminated early due to an application error". That call is the only moment at which
+    the outcome of a streamed response is knowable, and it happens after Flask has torn
+    the request context down - so everything the settlement needs is captured in the
+    closure, and nothing here touches ``request`` or ``g``.
+
+    Wrapping the body rather than using ``Response.call_on_close`` is deliberate twice
+    over: a close callback cannot tell a body that finished from one that died, and
+    werkzeug skips the callbacks entirely for a ``direct_passthrough`` response - which
+    is what ``send_file`` returns.
+    """
+
+    def __init__(
+        self,
+        body: Iterable[Any],
+        settle: Callable[[bool, Optional[str]], None],
+    ) -> None:
+        # ``Iterable[Any]`` rather than ``Iterable[bytes]``: werkzeug allows a body to
+        # yield ``str`` and encodes it later, and every chunk passes through here
+        # untouched, so its type is genuinely none of this class's business.
+        self._body = body
+        self._settle = settle
+        self._complete = False
+        self._error: Optional[str] = None
+        self._settled = False
+
+    def __iter__(self) -> Iterator[Any]:
+        try:
+            yield from self._body
+        except Exception as err:
+            # Named, not swallowed: it is re-raised into the server unchanged, and the
+            # audit record is the only place it would otherwise leave no trace.
+            self._error = type(err).__name__
+            raise
+        self._complete = True
+
+    def close(self) -> None:
+        if self._settled:
+            # Servers and test clients both close responses more than once. A second
+            # settlement entry for one response would be a second claim, not a repeat.
+            return
+        self._settled = True
+        close = getattr(self._body, "close", None)
+        if close is not None:
+            # A generator holds a file handle open until it is closed. Wrapping a body
+            # must not be what leaks it.
+            close()
+        self._settle(self._complete, self._error)
+
+
+def _sends_a_body(method: str, status: int) -> bool:
+    """Whether a WSGI server will consume the response body at all.
+
+    Werkzeug's own rule, in ``Response.get_app_iter``. For these the iterable is never
+    iterated *or closed*, so a provisional entry would wait forever for a settlement that
+    cannot come - which is a worse record than the overclaim it was meant to replace.
+    """
+    return method != "HEAD" and status >= 200 and status not in _BODYLESS_STATUSES
 
 
 def audit_blueprint(

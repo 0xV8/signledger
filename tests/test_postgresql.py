@@ -118,6 +118,25 @@ def _sweep_stray_tables(request, pg_dsn: str):
     _drop_test_tables(pg_dsn, "sl_")
 
 
+@pytest.fixture
+def pg_schema(pg_dsn: str):
+    """A throwaway PostgreSQL schema, dropped with everything inside it.
+
+    A second schema is the only way to hold two *different* tables under one name, which
+    is what a schema-blind catalog probe cannot tell apart.
+    """
+    name = "slpg_" + uuid.uuid4().hex[:12]
+    with _raw(pg_dsn) as conn, conn.cursor() as cur:
+        cur.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(name)))
+    try:
+        yield name
+    finally:
+        with _raw(pg_dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                psycopg.sql.SQL("DROP SCHEMA {} CASCADE").format(psycopg.sql.Identifier(name))
+            )
+
+
 class TestPostgresConformance(BackendConformanceSuite):
     """Every shared backend behaviour, executed against a real PostgreSQL server."""
 
@@ -1402,13 +1421,17 @@ class TestSchemaCreationIsConcurrencySafe:
             reader.close()
             first.close()
 
-    def test_a_guard_that_has_been_dropped_is_recreated(
+    def test_a_missing_guard_on_a_pre_existing_table_is_reported_not_repaired(
         self, pg_dsn: str, table_prefix: str
     ) -> None:
-        """Skipping recreation must not mean *never* creating it.
+        """A table that exists *without* its guard is evidence, not a chore.
 
-        An operator who dropped the trigger gets it back on the next start, and
-        ``capabilities()`` reads it out of the catalog rather than asserting it.
+        SQLite stopped re-arming its triggers on open for exactly this reason: silently
+        putting the guard back destroys the single most informative thing a store can tell
+        an auditor, which is that somebody with DDL rights removed it. PostgreSQL used to
+        repair, so the two backends contradicted each other and the README - which
+        promises that ``anchored`` where ``worm`` was expected means the triggers are gone
+        and is worth an alert.
         """
         from signledger.backends.postgresql import PostgresBackend
 
@@ -1417,6 +1440,7 @@ class TestSchemaCreationIsConcurrencySafe:
             pg_dsn, entries_table=entries, checkpoints_table=f"{table_prefix}_checkpoints"
         )
         try:
+            append(first)
             with _raw(pg_dsn) as conn, conn.cursor() as cur:
                 cur.execute(
                     psycopg.sql.SQL("DROP TRIGGER {} ON {}").format(
@@ -1430,11 +1454,222 @@ class TestSchemaCreationIsConcurrencySafe:
                 pg_dsn, entries_table=entries, checkpoints_table=f"{table_prefix}_checkpoints"
             )
             try:
-                assert CAP_APPEND_ONLY_ENFORCED in second.capabilities()
+                assert CAP_APPEND_ONLY_ENFORCED not in second.capabilities()
+                assert _trigger_identity(pg_dsn, entries, second.append_only_trigger) is None
             finally:
                 second.close()
         finally:
             first.close()
+
+    def test_a_store_whose_guard_was_removed_is_still_readable(
+        self, pg_dsn: str, table_prefix: str
+    ) -> None:
+        """Refusing to open would make a tampered ledger unreadable by the only tool that
+        can describe the damage. ``signledger verify`` on exactly such a store is the flow
+        this library exists for."""
+        from signledger.backends.postgresql import PostgresBackend
+
+        entries = f"{table_prefix}_entries"
+        first = PostgresBackend(
+            pg_dsn, entries_table=entries, checkpoints_table=f"{table_prefix}_checkpoints"
+        )
+        try:
+            append(first, {"event": "written-while-guarded"})
+            with _raw(pg_dsn) as conn, conn.cursor() as cur:
+                cur.execute(
+                    psycopg.sql.SQL("DROP TRIGGER {} ON {}").format(
+                        psycopg.sql.Identifier(first.append_only_trigger),
+                        psycopg.sql.Identifier(entries),
+                    )
+                )
+
+            second = PostgresBackend(
+                pg_dsn, entries_table=entries, checkpoints_table=f"{table_prefix}_checkpoints"
+            )
+            try:
+                assert second.count() == 1
+                assert second.get_by_sequence(0).data == {"event": "written-while-guarded"}
+                assert append(second, {"event": "still-appendable"}).sequence == 1
+            finally:
+                second.close()
+        finally:
+            first.close()
+
+
+# --------------------------------------------------------------------------------------
+# schema qualification
+# --------------------------------------------------------------------------------------
+
+
+def _schema_conninfo(dsn: str, schema: str) -> str:
+    """``dsn`` with the server-side ``search_path`` pinned to one schema.
+
+    This is how the Django consumer isolates its ledger: the default table names in a
+    dedicated schema, so the ``signledger`` CLI - which hands the DSN straight to psycopg -
+    can address the store too.
+    """
+    return psycopg.conninfo.make_conninfo(dsn, options=f"-c search_path={schema}")
+
+
+def _guard_count(dsn: str, schema: str, table: str, trigger: str) -> int:
+    """Non-internal triggers named ``trigger`` on ``schema.table`` and nowhere else."""
+    with _raw(dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM pg_trigger t "
+            "JOIN pg_class c ON c.oid = t.tgrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s AND t.tgname = %s "
+            "AND NOT t.tgisinternal",
+            (schema, table, trigger),
+        )
+        return int(cur.fetchone()[0])
+
+
+class TestTheGuardIsSchemaQualified:
+    """Two schemas can hold two different tables under one name.
+
+    Measured before the fix, with ``public.<entries>`` guarded and a second backend opened
+    on ``search_path=<other>``: the catalog probe matched ``pg_class.relname`` with no join
+    to ``pg_namespace``, so the *public* schema's trigger answered for the other schema's
+    table. The second backend therefore (a) skipped creating its own guard, because the
+    same probe gates creation, and (b) reported ``append_only_enforced`` while
+    ``pg_trigger`` held zero non-internal triggers for that table. With signatures and an
+    anchor configured, ``assurance_level()`` said WORM about a table anyone could UPDATE.
+    """
+
+    def test_a_table_in_a_second_schema_gets_its_own_guard(
+        self, pg_dsn: str, table_prefix: str, pg_schema: str
+    ) -> None:
+        from signledger.backends.postgresql import PostgresBackend
+
+        entries = f"{table_prefix}_entries"
+        checkpoints = f"{table_prefix}_checkpoints"
+        public = PostgresBackend(pg_dsn, entries_table=entries, checkpoints_table=checkpoints)
+        try:
+            scoped = PostgresBackend(
+                _schema_conninfo(pg_dsn, pg_schema),
+                entries_table=entries,
+                checkpoints_table=checkpoints,
+            )
+            try:
+                assert _guard_count(pg_dsn, pg_schema, entries, scoped.append_only_trigger) == 1
+            finally:
+                scoped.close()
+        finally:
+            public.close()
+
+    def test_a_table_created_beside_a_visible_one_further_down_the_path_is_guarded(
+        self, pg_dsn: str, table_prefix: str, pg_schema: str
+    ) -> None:
+        """``search_path=tenant,public`` with ``public.<entries>`` already there.
+
+        ``CREATE TABLE IF NOT EXISTS`` checks the *creation* schema - the head of the path -
+        while name resolution scans the whole path, so this really does make a second,
+        empty table in ``tenant``. Deciding "is this fresh?" by asking whether a table of
+        that name is visible answers *yes, it exists* and leaves the new one unguarded,
+        which is the same silent hole in a different disguise. Comparing the resolved OID
+        before and after the ``CREATE`` is the only question with one answer.
+        """
+        from signledger.backends.postgresql import PostgresBackend
+
+        entries = f"{table_prefix}_entries"
+        checkpoints = f"{table_prefix}_checkpoints"
+        public = PostgresBackend(pg_dsn, entries_table=entries, checkpoints_table=checkpoints)
+        try:
+            scoped = PostgresBackend(
+                _schema_conninfo(pg_dsn, f"{pg_schema},public"),
+                entries_table=entries,
+                checkpoints_table=checkpoints,
+            )
+            try:
+                assert _guard_count(pg_dsn, pg_schema, entries, scoped.append_only_trigger) == 1
+                assert CAP_APPEND_ONLY_ENFORCED in scoped.capabilities()
+            finally:
+                scoped.close()
+        finally:
+            public.close()
+
+    def test_the_second_schemas_guard_actually_refuses_an_update(
+        self, pg_dsn: str, table_prefix: str, pg_schema: str
+    ) -> None:
+        """The catalog row is not the point; the refusal is."""
+        from signledger.backends.postgresql import PostgresBackend
+
+        entries = f"{table_prefix}_entries"
+        checkpoints = f"{table_prefix}_checkpoints"
+        public = PostgresBackend(pg_dsn, entries_table=entries, checkpoints_table=checkpoints)
+        try:
+            scoped_dsn = _schema_conninfo(pg_dsn, pg_schema)
+            scoped = PostgresBackend(
+                scoped_dsn, entries_table=entries, checkpoints_table=checkpoints
+            )
+            try:
+                append(scoped, {"event": "scoped"})
+
+                with _raw(scoped_dsn) as conn, conn.cursor() as cur, _refused():
+                    cur.execute(
+                        psycopg.sql.SQL("UPDATE {} SET data = %s WHERE sequence = 0").format(
+                            psycopg.sql.Identifier(entries)
+                        ),
+                        ('{"event": "rewritten"}',),
+                    )
+            finally:
+                scoped.close()
+        finally:
+            public.close()
+
+    def test_capabilities_does_not_borrow_another_schemas_trigger(
+        self, pg_dsn: str, table_prefix: str, pg_schema: str
+    ) -> None:
+        """The other half: once this schema's guard is dropped, an identically named
+        trigger next door must not keep the claim alive."""
+        from signledger.backends.postgresql import PostgresBackend
+
+        entries = f"{table_prefix}_entries"
+        checkpoints = f"{table_prefix}_checkpoints"
+        public = PostgresBackend(pg_dsn, entries_table=entries, checkpoints_table=checkpoints)
+        try:
+            scoped_dsn = _schema_conninfo(pg_dsn, pg_schema)
+            scoped = PostgresBackend(
+                scoped_dsn, entries_table=entries, checkpoints_table=checkpoints
+            )
+            try:
+                with _raw(scoped_dsn) as conn, conn.cursor() as cur:
+                    cur.execute(
+                        psycopg.sql.SQL("DROP TRIGGER {} ON {}").format(
+                            psycopg.sql.Identifier(scoped.append_only_trigger),
+                            psycopg.sql.Identifier(entries),
+                        )
+                    )
+
+                assert CAP_APPEND_ONLY_ENFORCED not in scoped.capabilities()
+                assert CAP_APPEND_ONLY_ENFORCED in public.capabilities()
+            finally:
+                scoped.close()
+        finally:
+            public.close()
+
+    def test_a_mixed_case_table_name_is_resolved_the_way_the_connection_resolves_it(
+        self, pg_dsn: str
+    ) -> None:
+        """Every statement in the backend reaches SQL through ``sql.Identifier``, so a
+        mixed-case name is quoted and case-sensitive. A catalog lookup that passes the
+        bare name to ``to_regclass`` case-folds it and answers about a table that does not
+        exist - reporting no guard on a guarded store, and a size of zero for a ledger
+        holding rows."""
+        from signledger.backends.postgresql import PostgresBackend
+
+        entries = "sl_" + uuid.uuid4().hex[:8] + "Entries"
+        backend = PostgresBackend(
+            pg_dsn, entries_table=entries, checkpoints_table=entries + "Cp"
+        )
+        try:
+            append(backend, {"event": "mixed-case"})
+
+            assert CAP_APPEND_ONLY_ENFORCED in backend.capabilities()
+            assert backend.size_bytes() > 0
+        finally:
+            backend.close()
 
 
 # --------------------------------------------------------------------------------------
@@ -1719,3 +1954,317 @@ class TestStartupStress:
         assert acknowledged == 40
         assert pg_backend.count() == 40
         assert [entry.sequence for entry in pg_backend.iter_entries()] == list(range(40))
+
+
+# --------------------------------------------------------------------------------------
+# opening a store without provisioning it
+# --------------------------------------------------------------------------------------
+
+
+def _catalog(dsn: str, prefix: str) -> dict:
+    """Every relation, index, trigger and function whose name starts with ``prefix``.
+
+    The reproduction of the defect is exactly this snapshot taken twice: it was empty
+    before ``signledger verify`` and held two tables, an index and the append-only guard
+    after it.
+    """
+    pattern = prefix.replace("_", r"\_") + "%"
+    with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
+            "AND tablename LIKE %s",
+            (pattern,),
+        )
+        tables = sorted(name for (name,) in cur.fetchall())
+        cur.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' "
+            "AND indexname LIKE %s",
+            (pattern,),
+        )
+        indexes = sorted(name for (name,) in cur.fetchall())
+        cur.execute(
+            "SELECT tgname FROM pg_trigger WHERE NOT tgisinternal AND tgname LIKE %s",
+            (pattern,),
+        )
+        triggers = sorted(name for (name,) in cur.fetchall())
+        cur.execute("SELECT proname FROM pg_proc WHERE proname LIKE %s", (pattern,))
+        functions = sorted(name for (name,) in cur.fetchall())
+    return {
+        "tables": tables,
+        "indexes": indexes,
+        "triggers": triggers,
+        "functions": functions,
+    }
+
+
+@pytest.fixture
+def ro_prefix() -> str:
+    """A table prefix of this section's own, swept by ``_sweep_stray_tables``."""
+    return "slro_" + uuid.uuid4().hex[:10]
+
+
+@pytest.fixture
+def ro_store(pg_dsn: str, ro_prefix: str):
+    """A live three-entry PostgreSQL ledger, provisioned and closed.
+
+    Written through the real :class:`Ledger`, not through ``append_many``, because these
+    tests run ``signledger verify`` against it and a verdict of VERIFIED is part of what
+    they assert.
+    """
+    from signledger.backends.postgresql import PostgresBackend
+    from signledger.core.ledger import Ledger
+
+    ledger = Ledger(
+        PostgresBackend(
+            pg_dsn,
+            entries_table=f"{ro_prefix}_entries",
+            checkpoints_table=f"{ro_prefix}_checkpoints",
+        )
+    )
+    try:
+        for index in range(3):
+            ledger.append({"event": "created", "index": index})
+    finally:
+        ledger.close()
+    return ro_prefix
+
+
+def _open_read_only(dsn: str, prefix: str):
+    from signledger.backends.postgresql import PostgresBackend
+
+    return PostgresBackend(
+        dsn,
+        entries_table=f"{prefix}_entries",
+        checkpoints_table=f"{prefix}_checkpoints",
+        create=False,
+    )
+
+
+class TestOpeningWithoutProvisioning:
+    """``create=False`` reads a store that exists and refuses to bring one into being.
+
+    An integrity check that runs DDL cannot be run from a read-only role or against a hot
+    standby - which is exactly where a careful operator wants to run one. Worse, a
+    mistyped DSN was answered with "your ledger is empty" (an integrity verdict) instead
+    of "that store does not exist" (an operational error).
+    """
+
+    def test_a_missing_entries_table_is_refused_rather_than_created(
+        self, pg_dsn: str, ro_prefix: str
+    ) -> None:
+        from signledger.core.exceptions import StorageError
+
+        with pytest.raises(StorageError) as caught:
+            _open_read_only(pg_dsn, ro_prefix)
+
+        assert "does not exist" in str(caught.value)
+        assert _catalog(pg_dsn, ro_prefix)["tables"] == []
+
+    def test_the_refusal_names_the_table_that_is_missing(
+        self, pg_dsn: str, ro_prefix: str
+    ) -> None:
+        with pytest.raises(Exception) as caught:
+            _open_read_only(pg_dsn, ro_prefix)
+
+        assert f"{ro_prefix}_entries" in str(caught.value)
+
+    def test_the_refusal_never_quotes_the_dsn(self, pg_dsn: str, ro_prefix: str) -> None:
+        """Contract section 10: a DSN routinely carries a password."""
+        parts = urlsplit(pg_dsn)
+        with_password = (
+            f"postgresql://{parts.username or 'postgres'}:hunter2@"
+            f"{parts.hostname}:{parts.port or 5432}{parts.path}"
+        )
+
+        with pytest.raises(Exception) as caught:
+            _open_read_only(with_password, ro_prefix)
+
+        assert "hunter2" not in str(caught.value)
+
+    def test_a_missing_checkpoints_table_is_refused(
+        self, pg_dsn: str, ro_prefix: str, ro_store: str
+    ) -> None:
+        from signledger.core.exceptions import StorageError
+
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE "{ro_prefix}_checkpoints"')  # noqa: S608
+
+        with pytest.raises(StorageError) as caught:
+            _open_read_only(pg_dsn, ro_prefix)
+
+        assert f"{ro_prefix}_checkpoints" in str(caught.value)
+
+    def test_a_read_only_open_creates_nothing_at_all(
+        self, pg_dsn: str, ro_store: str
+    ) -> None:
+        before = _catalog(pg_dsn, ro_store)
+
+        backend = _open_read_only(pg_dsn, ro_store)
+        try:
+            assert backend.count() == 3
+        finally:
+            backend.close()
+
+        assert _catalog(pg_dsn, ro_store) == before
+
+    def test_every_read_still_answers(self, pg_dsn: str, ro_store: str) -> None:
+        backend = _open_read_only(pg_dsn, ro_store)
+        try:
+            assert [entry.sequence for entry in backend.iter_entries()] == [0, 1, 2]
+            assert backend.get_head().sequence == 2
+            assert backend.get_oldest().sequence == 0
+            assert backend.get_by_sequence(1).sequence == 1
+            assert backend.get_entry(backend.get_head().entry_id) is not None
+            assert backend.size_bytes() > 0
+            assert backend.get_latest_checkpoint() is None
+            assert list(backend.iter_checkpoints()) == []
+            assert CAP_APPEND_ONLY_ENFORCED in backend.capabilities()
+        finally:
+            backend.close()
+
+    def test_an_append_is_refused_rather_than_attempted(
+        self, pg_dsn: str, ro_store: str
+    ) -> None:
+        from signledger.core.exceptions import StorageError
+
+        backend = _open_read_only(pg_dsn, ro_store)
+        try:
+            with pytest.raises(StorageError) as caught:
+                append(backend)
+            assert backend.count() == 3
+        finally:
+            backend.close()
+
+        assert "create=False" in str(caught.value)
+
+    def test_saving_a_checkpoint_is_refused(self, pg_dsn: str, ro_store: str) -> None:
+        from signledger.anchor.checkpoint import Checkpoint
+        from signledger.core.exceptions import StorageError
+
+        backend = _open_read_only(pg_dsn, ro_store)
+        try:
+            with pytest.raises(StorageError) as caught:
+                backend.save_checkpoint(
+                    Checkpoint(
+                        ledger_id=LEDGER_ID,
+                        sequence=2,
+                        head_hash="a" * 64,
+                        entry_count=3,
+                        merkle_root="b" * 64,
+                        timestamp=BASE_TIMESTAMP,
+                    )
+                )
+            assert list(backend.iter_checkpoints()) == []
+        finally:
+            backend.close()
+
+        assert "create=False" in str(caught.value)
+
+    def test_the_default_still_provisions_the_schema(
+        self, pg_dsn: str, ro_prefix: str
+    ) -> None:
+        """Guards every refusal above: ordinary use is unchanged."""
+        from signledger.backends.postgresql import PostgresBackend
+
+        backend = PostgresBackend(
+            pg_dsn,
+            entries_table=f"{ro_prefix}_entries",
+            checkpoints_table=f"{ro_prefix}_checkpoints",
+        )
+        try:
+            assert backend.count() == 0
+            assert CAP_APPEND_ONLY_ENFORCED in backend.capabilities()
+        finally:
+            backend.close()
+
+        assert _catalog(pg_dsn, ro_prefix)["tables"] == [
+            f"{ro_prefix}_checkpoints",
+            f"{ro_prefix}_entries",
+        ]
+
+
+class TestTheCommandLineWritesNothingToTheStoreItVerifies:
+    """The defect end to end: ``pg_tables`` before and after a real ``signledger verify``."""
+
+    def _argv(self, command: str, dsn: str, prefix: str) -> list:
+        return [
+            command,
+            "-b",
+            dsn,
+            "--entries-table",
+            f"{prefix}_entries",
+            "--checkpoints-table",
+            f"{prefix}_checkpoints",
+        ]
+
+    @pytest.mark.parametrize(
+        "command", ["verify", "stats", "inspect"], ids=["verify", "stats", "inspect"]
+    )
+    def test_a_read_only_command_leaves_the_catalog_untouched(
+        self, command: str, pg_dsn: str, ro_store: str, capsys
+    ) -> None:
+        from signledger.cli import EXIT_OK, main
+
+        before = _catalog(pg_dsn, ro_store)
+
+        code = main(self._argv(command, pg_dsn, ro_store))
+        capsys.readouterr()
+
+        assert code == EXIT_OK
+        assert _catalog(pg_dsn, ro_store) == before
+
+    def test_verify_against_a_store_that_does_not_exist_is_an_operational_error(
+        self, pg_dsn: str, ro_prefix: str, capsys
+    ) -> None:
+        """Exit 2, never exit 1: "I typed the DSN wrong" is not "the log was tampered
+        with", and a shell script running `signledger verify || alert` has to tell them
+        apart."""
+        from signledger.cli import EXIT_ERROR, main
+
+        code = main(self._argv("verify", pg_dsn, ro_prefix))
+        err = capsys.readouterr().err
+
+        assert code == EXIT_ERROR
+        assert "does not exist" in err
+        assert _catalog(pg_dsn, ro_prefix) == {
+            "tables": [],
+            "indexes": [],
+            "triggers": [],
+            "functions": [],
+        }
+
+    def test_verify_runs_in_a_session_that_may_not_write(
+        self, pg_dsn: str, ro_store: str, capsys
+    ) -> None:
+        """The operator's actual case: a read-only role, or a hot standby.
+
+        ``options=-c default_transaction_read_only=on`` makes the server refuse every
+        write for the whole session, exactly as a standby does - including a
+        ``CREATE TABLE IF NOT EXISTS`` whose table is already there. The DDL in the
+        constructor therefore made ``signledger verify`` impossible to run in the one
+        place a careful operator most wants to run it.
+        """
+        from signledger.cli import EXIT_OK, main
+
+        joiner = "&" if urlsplit(pg_dsn).query else "?"
+        read_only = pg_dsn + joiner + "options=-c%20default_transaction_read_only%3Don"
+
+        code = main(self._argv("verify", read_only, ro_store))
+        out, err = capsys.readouterr()
+
+        assert code == EXIT_OK, err
+        assert "VERIFIED" in out
+
+    def test_checkpoint_still_provisions_the_store_it_writes_to(
+        self, pg_dsn: str, ro_prefix: str, capsys
+    ) -> None:
+        """Guards the refusals above: a command that writes may create what it writes to."""
+        from signledger.cli import main
+
+        main(self._argv("checkpoint", pg_dsn, ro_prefix))
+        capsys.readouterr()
+
+        assert _catalog(pg_dsn, ro_prefix)["tables"] == [
+            f"{ro_prefix}_checkpoints",
+            f"{ro_prefix}_entries",
+        ]
