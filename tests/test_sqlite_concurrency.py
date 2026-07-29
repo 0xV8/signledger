@@ -21,6 +21,7 @@ one genuinely multi-process test is marked ``slow``. A flaky test is worse than 
 import multiprocessing
 import sqlite3
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable, List, Optional, Set
 
 import pytest
@@ -494,3 +495,95 @@ def test_four_processes_opening_one_fresh_file_all_come_up(tmp_path: Any) -> Non
             assert CAP_APPEND_ONLY_ENFORCED in reader.capabilities()
         finally:
             reader.close()
+
+
+class TestAReadOnlyOpenWorksOnReadOnlyMedia:
+    """``create=False`` exists so an auditor can read an evidence snapshot.
+
+    That snapshot is very often on media the auditor cannot write: a file copied off with
+    its permissions intact, a mounted image, a directory the audit team owns and the
+    reader does not. ``sqlite3.connect(path)`` opens read-write even when every statement
+    afterwards is read-only, so SQLite tries to create the ``-wal``/``-shm`` sidecars and
+    the open fails outright on a 0444 file in a 0555 directory - failing precisely the
+    case the mode was built for. Opening through a ``file:...?mode=ro`` URI asks SQLite
+    for a read-only connection and lets it use the immutable path instead.
+    """
+
+    def snapshot(self, directory: Any) -> Any:
+        return sorted(p.name for p in directory.iterdir())
+
+    def handed_to_an_auditor(self, tmp_path: Any) -> Any:
+        """Build a store, then copy ONLY the .db into a fresh directory.
+
+        That is what an auditor is actually given: the database file, not the ``-wal`` and
+        ``-shm`` sidecars, which are transient. With them present SQLite can open a WAL
+        database read-only without writing anything, so a test that leaves them in place
+        proves nothing about read-only media.
+        """
+        import shutil
+
+        source = self.build_store(tmp_path / "live")
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir()
+        target = snapshot_dir / "evidence.db"
+        shutil.copy2(source, target)
+        return snapshot_dir, target
+
+    def build_store(self, tmp_path: Any) -> Any:
+        from signledger.backends.sqlite import SQLiteBackend
+
+        tmp_path.mkdir(parents=True, exist_ok=True)
+
+        path = tmp_path / "evidence.db"
+        from signledger.backends.base import build_next_entry
+
+        backend = SQLiteBackend(str(path))
+        try:
+            for index in range(3):
+                backend.append_atomic(
+                    lambda tip, i=index: build_next_entry(
+                        tip,
+                        ledger_id="evidence-ledger",
+                        created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                        data={"index": i},
+                        timestamp=datetime(2024, 6, 1, 12, 0, i, tzinfo=timezone.utc),
+                    )
+                )
+        finally:
+            backend.close()
+        return path
+
+    def test_a_read_only_open_of_a_read_only_file_reads_every_entry(
+        self, tmp_path: Any
+    ) -> None:
+        from signledger.backends.sqlite import SQLiteBackend
+
+        directory, path = self.handed_to_an_auditor(tmp_path)
+        path.chmod(0o444)
+        directory.chmod(0o555)
+        try:
+            backend = SQLiteBackend(str(path), create=False)
+            try:
+                assert backend.count() == 3
+            finally:
+                backend.close()
+        finally:
+            directory.chmod(0o755)
+            path.chmod(0o644)
+
+    def test_a_read_only_open_leaves_no_sidecar_behind(self, tmp_path: Any) -> None:
+        """A writable directory is the subtler case: the open succeeds, and litters."""
+        from signledger.backends.sqlite import SQLiteBackend
+
+        directory, path = self.handed_to_an_auditor(tmp_path)
+        path.chmod(0o444)
+        before = self.snapshot(directory)
+        try:
+            backend = SQLiteBackend(str(path), create=False)
+            try:
+                assert backend.count() == 3
+            finally:
+                backend.close()
+            assert self.snapshot(directory) == before
+        finally:
+            path.chmod(0o644)

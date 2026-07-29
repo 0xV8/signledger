@@ -276,10 +276,57 @@ signledger export -b sqlite:audit.db -o bundle.json
 signledger verify-bundle bundle.json
 ```
 
-`verify` exits non-zero when the log does not verify **and** when the store is empty, so it
-works as a health check. Commands that make an integrity claim refuse to run on a ledger
-that does not verify: publishing a checkpoint over a rewritten chain would launder the
-damage into the one record an auditor is meant to trust.
+Commands that make an integrity claim refuse to run on a ledger that does not verify:
+publishing a checkpoint over a rewritten chain would launder the damage into the one record
+an auditor is meant to trust.
+
+### Exit codes
+
+The contract with `signledger verify || alert`. The distinction between 1 and 2 is the
+whole point — an operator must be able to tell *"the log was tampered with"* from *"I typed
+the DSN wrong"*, and until 2.0.0 they could not.
+
+| Code | Meaning |
+|---|---|
+| `0` | it verified |
+| `1` | **an integrity verdict**: tampering, truncation, a broken link — or an empty store, because a verifier that reports success having checked nothing is worse than no verifier |
+| `2` | **operational**: the store does not exist, a bad URI, a missing driver, an unreadable key |
+
+A store that does not exist is `2`, never `1`. It used to be answered by provisioning an
+empty ledger and reporting that it held nothing — telling an operator their audit log was
+gone when they had mistyped a name.
+
+### Reading a store you must not write to
+
+Every read-only command (`verify`, `stats`, `inspect`, `export`, `anchor --show`) opens the
+store with `create=False`, which provisions nothing at all: no tables, no triggers, no
+indexes, and on SQLite not even `PRAGMA journal_mode = WAL`, which is itself a write to the
+database header. So an integrity check can run as a read-only database role, against a hot
+standby, or against a copy on read-only media — which is what an auditor is usually handed.
+
+The same argument is available directly:
+
+```python
+import os, tempfile
+from signledger import Ledger
+from signledger.backends import SQLiteBackend
+
+path = os.path.join(tempfile.mkdtemp(), "audit.db")
+with Ledger(SQLiteBackend(path)) as writer:
+    writer.append({"event": "recorded"})
+
+reader = SQLiteBackend(path, create=False)
+with Ledger(reader) as auditor:
+    print(auditor.check_integrity().ok)  # True
+```
+
+A `create=False` backend refuses `append()`, and refuses to open a store that is not there
+rather than bringing one into being. `memory://` has nothing to read, so it is refused
+outright.
+
+If you point the CLI at a non-default table, name **both** — `--entries-table` alone now
+fails rather than silently provisioning a default-named `ledger_checkpoints` beside it and
+reporting success.
 
 ## Web framework integration
 
@@ -493,6 +540,12 @@ somewhere nobody can edit it afterwards:
   For a store nobody can edit afterwards, that is the correct direction to be wrong in.
 
 If a payload must never be stored even redacted, do not send it through the audited path.
+
+**Upgrading an existing ledger:** the rule got wider in 2.0.0, and old entries are not
+rewritten — they cannot be. A ledger that spans the upgrade holds the plaintext spelling of
+a name like `otp` or `account_number` before the boundary and `[REDACTED]` after it,
+permanently. If the earlier entries contain something that should not be there, the fix is
+to retire that ledger and start a new one, not to edit it.
 
 ## Deployment
 

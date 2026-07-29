@@ -32,7 +32,24 @@ __all__ = ["MemoryBackend"]
 class MemoryBackend:
     """Keeps one ledger's chain in process memory."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, create: bool = True) -> None:
+        """``create=False`` is refused, because there is never anything here to read.
+
+        Every other backend takes ``create=False`` to mean "open a store that already
+        exists and never bring one into being" - that is how a read-only ``verify`` avoids
+        provisioning the database it is checking. A ``MemoryBackend`` is empty the instant
+        it is constructed, so honouring the request would hand back a fresh empty ledger
+        and let the caller report "no entries were verified": an integrity verdict about a
+        store that never existed. ``SQLiteBackend(":memory:", create=False)`` already
+        refuses for the same reason, and the two in-memory stores must not disagree.
+        """
+        if not create:
+            raise StorageError(
+                "open failed: an in-memory ledger is created empty every time it is "
+                "opened, so there is nothing in it to read; name a durable store instead "
+                "(sqlite:<path>, postgresql://… or mongodb://…)"
+            )
+        self.create = create
         # Re-entrant: ``append_atomic`` calls the build callback while holding the lock,
         # and a callback that reads the backend should be slow, not deadlocked.
         self._lock = threading.RLock()

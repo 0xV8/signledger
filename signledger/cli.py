@@ -247,7 +247,11 @@ def _open_memory(uri: str, store: _Store) -> Any:
         )
     from signledger.backends.memory import MemoryBackend
 
-    return MemoryBackend()
+    # The backend owns the refusal, exactly as it does for ``sqlite::memory:``. A
+    # read-only command against memory:// used to report "no entries were verified"
+    # (exit 1, a verdict about integrity) for a store that had just been created empty;
+    # it is now an operational error (exit 2), which is what naming nothing deserves.
+    return MemoryBackend(create=store.create)
 
 
 def _open_sqlite(uri: str, store: _Store) -> Any:

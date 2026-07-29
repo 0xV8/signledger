@@ -35,6 +35,7 @@ down by a test in ``tests/test_sqlite_concurrency.py``:
 import os
 import sqlite3
 import threading
+import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime
 from typing import (
@@ -200,8 +201,50 @@ class SQLiteBackend:
             return self._connect()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.path,
+        connection = self._raw_connect()
+        try:
+            self._configure(connection)
+        except BaseException:
+            # Nothing holds this handle yet, so a pragma that raises would strand it.
+            connection.close()
+            raise
+        return connection
+
+    def _raw_connect(self) -> sqlite3.Connection:
+        """Open the file. Read-only opens go through a URI so they can touch nothing.
+
+        ``sqlite3.connect(path)`` always opens read-write, whatever statements follow. For
+        a WAL database that means SQLite wants the ``-shm`` wal-index, so a ``create=False``
+        open of an evidence snapshot both littered a writable directory with ``-wal`` and
+        ``-shm``, and *failed outright* on read-only media - the exact case this mode
+        exists for. An auditor is handed the ``.db``; the sidecars are transient and do not
+        come with it.
+
+        ``mode=ro`` is tried first because it stays correct against a store another process
+        is still appending to, which is what ``signledger verify`` does in production. Only
+        if SQLite cannot proceed - which on a WAL database means it could not create the
+        wal-index, i.e. nobody can be writing through this directory either - does it fall
+        back to ``immutable=1``, which needs no sidecar at all. Getting that order wrong
+        would read a live ledger as though it were frozen.
+        """
+        if self.create:
+            return self._open(self.path, uri=False)
+
+        # ``quote`` leaves ``/`` alone and escapes ``?``, ``#`` and spaces, which SQLite
+        # would otherwise read as the start of its own query string.
+        uri = "file:" + urllib.parse.quote(os.path.abspath(self.path))
+        try:
+            connection = self._open(uri + "?mode=ro", uri=True)
+            # Force SQLite to reach the wal-index now rather than on the first read, so
+            # the fallback below is chosen here or not at all.
+            connection.execute("SELECT count(*) FROM sqlite_master").close()
+            return connection
+        except sqlite3.OperationalError:
+            return self._open(uri + "?mode=ro&immutable=1", uri=True)
+
+    def _open(self, target: str, *, uri: bool) -> sqlite3.Connection:
+        return sqlite3.connect(
+            target,
             timeout=self.timeout,
             # The registry is the guarantee, not this flag: a connection is either owned
             # by exactly one thread or serialised by ``_access_lock``. The driver's own
@@ -210,14 +253,8 @@ class SQLiteBackend:
             # thread that ever touched the ledger leaks a file handle.
             check_same_thread=False,
             isolation_level=None,  # we issue BEGIN IMMEDIATE / COMMIT ourselves
+            uri=uri,
         )
-        try:
-            self._configure(connection)
-        except BaseException:
-            # Nothing holds this handle yet, so a pragma that raises would strand it.
-            connection.close()
-            raise
-        return connection
 
     def _configure(self, connection: sqlite3.Connection) -> None:
         """Set this connection up. Under ``create=False`` it may not write to the file.

@@ -1723,3 +1723,37 @@ class TestSQLiteOpensWithoutProvisioning:
             backend.close()
 
         assert path.exists()
+
+
+class TestTheMemoryBackendRefusesAReadOnlyOpen:
+    """``create=False`` means "read a store that already exists", which memory never is.
+
+    A fresh ``MemoryBackend`` is empty by construction, so opening one for reading and
+    then reporting "no entries were verified" is an integrity verdict about a store that
+    never existed. ``SQLiteBackend(":memory:", create=False)`` already refuses for exactly
+    this reason; the two in-memory stores answered differently, and the CLI turned that
+    into exit 1 (the log is damaged) where it should be exit 2 (you named nothing).
+    """
+
+    def test_a_read_only_open_is_refused(self) -> None:
+        from signledger.backends.memory import MemoryBackend
+
+        with pytest.raises(StorageError, match="every time it is opened"):
+            MemoryBackend(create=False)
+
+    def test_the_refusal_says_what_to_do_instead(self) -> None:
+        from signledger.backends.memory import MemoryBackend
+
+        with pytest.raises(StorageError) as caught:
+            MemoryBackend(create=False)
+
+        assert "sqlite:" in str(caught.value) or "file" in str(caught.value)
+
+    def test_the_ordinary_open_is_unchanged(self) -> None:
+        from signledger.backends.memory import MemoryBackend
+
+        backend = MemoryBackend()
+        try:
+            assert backend.count() == 0
+        finally:
+            backend.close()
