@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Release branches run the full matrix before anything reaches main. Everything in
+    # this project's history argues for finding out on a runner rather than from a user.
+    branches: [main, "rebuild/**"]
   pull_request:
   workflow_dispatch:
 
