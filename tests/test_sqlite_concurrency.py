@@ -23,10 +23,10 @@ import multiprocessing
 import shutil
 import sqlite3
 import time
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import datetime, timezone
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Set, Tuple
 
 import pytest
 
@@ -122,6 +122,10 @@ class Probe:
         self.journal_mode_answer: Optional[str] = None
         #: Keep every pragma cursor alive, the way a non-refcounting interpreter does.
         self.hoard_pragma_cursors = False
+        #: When True, the first probe read a read-only open performs raises
+        #: ``OperationalError``, which is how SQLite reports that it could not reach the
+        #: wal-index. That is the branch that falls back to ``immutable=1``.
+        self.fail_first_readonly_probe = False
 
     def leaked_connections(self) -> List[sqlite3.Connection]:
         return [c for c in self.connections if not is_closed(c)]
@@ -141,8 +145,20 @@ def is_closed(connection: sqlite3.Connection) -> bool:
 
 
 @pytest.fixture
-def probe(monkeypatch: Any) -> Probe:
-    """Hand every ``sqlite3.connect`` in this test a watched connection subclass."""
+def probe(monkeypatch: Any) -> Iterator[Probe]:
+    """Hand every ``sqlite3.connect`` in this test a watched connection subclass.
+
+    The teardown is not optional. This fixture deliberately keeps a reference to every
+    connection it hands out - that is how ``leaked_connections()`` can answer at all - and
+    several tests here open connections the library is *supposed* to abandon. Without a
+    teardown those stay reachable until the ``Probe`` itself becomes garbage, and are then
+    finalised at whatever arbitrary later moment the collector runs, emitting
+    ``ResourceWarning: unclosed database`` from inside an unrelated test.
+
+    Under ``filterwarnings = ["error"]`` that is a hard failure attributed to the wrong
+    test. It was invisible on CPython 3.11 and failed the suite on 3.13 and 3.14, on every
+    OS, blaming a Hypothesis tamper-detection test that only ever touches MemoryBackend.
+    """
     watcher = Probe()
     real_connect = sqlite3.connect
 
@@ -155,6 +171,11 @@ def probe(monkeypatch: Any) -> Probe:
                     watcher.before_journal_mode(watcher.journal_mode_attempts)
                 if watcher.journal_mode_answer is not None:
                     return FrozenJournalMode(watcher.journal_mode_answer)
+            if watcher.fail_first_readonly_probe and statement.startswith(
+                "SELECT COUNT(*) FROM SQLITE_MASTER"
+            ):
+                watcher.fail_first_readonly_probe = False
+                raise sqlite3.OperationalError("unable to open database file")
             cursor = super().execute(sql, *args, **kwargs)
             if watcher.hoard_pragma_cursors and statement.startswith("PRAGMA"):
                 watcher.pragma_cursors.append(cursor)
@@ -167,7 +188,15 @@ def probe(monkeypatch: Any) -> Probe:
         return connection
 
     monkeypatch.setattr(sqlite3, "connect", watched_connect)
-    return watcher
+    yield watcher
+
+    # Close what this fixture kept alive, and nothing else. Assertions have already run,
+    # so a test that checks the library closed its own connections is unaffected.
+    watcher.pragma_cursors.clear()
+    for connection in watcher.connections:
+        with suppress(sqlite3.Error):
+            connection.close()
+    watcher.connections.clear()
 
 
 def hold_the_write_lock(path: str) -> sqlite3.Connection:
@@ -822,3 +851,52 @@ class TestTheReadOnlyFileUriIsBuiltForThePlatform:
             assert reader.count() == 1
         finally:
             reader.close()
+
+
+class TestTheReadOnlyFallbackDoesNotStrandItsFirstConnection:
+    """Falling back to ``immutable=1`` must close the connection it is abandoning.
+
+    ``_raw_connect`` opens with ``mode=ro``, then forces SQLite to reach the wal-index. If
+    that raises, it opens a second connection with ``immutable=1`` and returns that - and
+    the first one was left open, reachable by nothing, until the collector finalised it and
+    emitted ``ResourceWarning: unclosed database`` inside whatever test happened to be
+    running at the time.
+
+    On CPython 3.11 the collector reclaimed it quietly. On 3.13 and 3.14 it surfaced as an
+    unraisable exception and, under ``filterwarnings = ["error"]``, failed a Hypothesis
+    tamper-detection test in another file that never opens a SQLite database at all.
+    """
+
+    def store(self, tmp_path: Any) -> Any:
+        path = tmp_path / "fallback.db"
+        backend = SQLiteBackend(str(path))
+        try:
+            BackendConformanceSuite().append(backend)
+        finally:
+            backend.close()
+        return path
+
+    def test_the_abandoned_connection_is_closed(self, tmp_path: Any, probe: Probe) -> None:
+        path = self.store(tmp_path)
+        probe.fail_first_readonly_probe = True
+
+        backend = SQLiteBackend(str(path), create=False)
+        try:
+            assert backend.count() == 1
+        finally:
+            backend.close()
+
+        assert probe.leaked_connections() == []
+
+    def test_the_fallback_still_returns_a_usable_connection(
+        self, tmp_path: Any, probe: Probe
+    ) -> None:
+        """Closing the first one must not cost us the second."""
+        path = self.store(tmp_path)
+        probe.fail_first_readonly_probe = True
+
+        backend = SQLiteBackend(str(path), create=False)
+        try:
+            assert [entry.sequence for entry in backend.iter_entries()] == [0]
+        finally:
+            backend.close()

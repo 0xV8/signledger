@@ -248,14 +248,20 @@ class SQLiteBackend:
             return self._open(self.path, uri=False)
 
         uri = _file_uri(pathlib.Path(os.path.abspath(self.path)))
+        connection = self._open(uri + "?mode=ro", uri=True)
         try:
-            connection = self._open(uri + "?mode=ro", uri=True)
             # Force SQLite to reach the wal-index now rather than on the first read, so
             # the fallback below is chosen here or not at all.
             connection.execute("SELECT count(*) FROM sqlite_master").close()
-            return connection
         except sqlite3.OperationalError:
+            # Close the one being abandoned before opening its replacement. Left open it
+            # is reachable by nothing and is finalised whenever the collector next runs,
+            # emitting ``ResourceWarning: unclosed database`` from inside an unrelated
+            # test - which under ``filterwarnings = ["error"]`` fails that test instead of
+            # this code. CPython 3.11 reclaimed it quietly; 3.13 and 3.14 do not.
+            connection.close()
             return self._open(uri + "?mode=ro&immutable=1", uri=True)
+        return connection
 
     def _open(self, target: str, *, uri: bool) -> sqlite3.Connection:
         return sqlite3.connect(

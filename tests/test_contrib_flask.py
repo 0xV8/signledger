@@ -14,6 +14,7 @@ real backend.
 import json
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any, Dict, Iterator, List
 
 import pytest
@@ -211,10 +212,16 @@ def test_the_module_imports_cleanly_in_a_fresh_interpreter() -> None:
 
 
 def test_the_flask_module_is_not_shadowed_by_an_empty_package() -> None:
-    """v1 shipped four empty directories that shadowed their own sibling modules."""
+    """v1 shipped four empty directories that shadowed their own sibling modules.
+
+    Compared as path components rather than as a string: ``__file__`` is separated with
+    backslashes on Windows, so ``endswith("contrib/flask.py")`` was False there and this
+    check - which exists to catch the defect that broke v1 - silently failed on Windows
+    while claiming to guard it.
+    """
     import signledger.contrib.flask as module
 
-    assert module.__file__.endswith("contrib/flask.py")
+    assert Path(module.__file__).parts[-2:] == ("contrib", "flask.py")
 
 
 # ======================================================================================
