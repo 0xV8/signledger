@@ -4461,3 +4461,45 @@ def test_a_windows_drive_still_loses_the_slash_the_uri_added(monkeypatch: Any) -
     monkeypatch.setattr(os, "name", "nt")
 
     assert _sqlite_path("sqlite:///C:/Users/me/audit.db") == "C:/Users/me/audit.db"
+
+
+def test_a_sqlite_path_containing_a_hash_names_the_file_that_was_typed() -> None:
+    """``#`` and ``?`` end a URL, but a ``sqlite:`` URI carries a filename, not a URL.
+
+    ``urlsplit`` reads everything after ``#`` as a fragment and everything after ``?`` as
+    a query, so ``sqlite:audit#2026.db`` used to resolve to ``audit``. If a file happened
+    to exist under that name, ``verify`` opened it, reported a different ledger entirely
+    and exited 0 - a success about a store nobody asked about, which is the same failure
+    as reading the wrong MongoDB database.
+
+    There is no escape hatch either: the path is deliberately not unquoted, so percent-
+    encoding ``%23`` names a file with a literal ``%23`` in it rather than a ``#``.
+    """
+    assert _sqlite_path("sqlite:reports/audit#2026.db") == "reports/audit#2026.db"
+    assert _sqlite_path("sqlite:reports/audit?draft.db") == "reports/audit?draft.db"
+    assert _sqlite_path("sqlite:///var/lib/audit#2026.db") == "/var/lib/audit#2026.db"
+
+
+def test_the_shapes_a_sqlite_uri_already_supported_are_unchanged(
+    monkeypatch: Any,
+) -> None:
+    """The fragment fix must not disturb any spelling that already worked."""
+    monkeypatch.setattr(os, "name", "nt")
+
+    assert _sqlite_path("sqlite:relative/path.db") == "relative/path.db"
+    assert _sqlite_path("sqlite:/absolute/posix.db") == "/absolute/posix.db"
+    assert _sqlite_path("sqlite:///absolute/posix.db") == "/absolute/posix.db"
+    assert _sqlite_path("sqlite:C:/Users/me/audit.db") == "C:/Users/me/audit.db"
+    assert _sqlite_path("sqlite://C:/Users/me/audit.db") == "C:/Users/me/audit.db"
+    assert _sqlite_path(r"sqlite://C:\Users\me\audit.db") == r"C:\Users\me\audit.db"
+    assert _sqlite_path(r"sqlite://\\server\share\audit.db") == r"\\server\share\audit.db"
+    assert _sqlite_path("sqlite:////server/share/audit.db") == "//server/share/audit.db"
+    assert _sqlite_path("sqlite://") == ":memory:"
+    assert _sqlite_path("sqlite:") == ":memory:"
+
+
+def test_a_real_host_is_still_refused_after_the_fragment_fix() -> None:
+    with pytest.raises(ConfigurationError):
+        _sqlite_path("sqlite://somehost/path.db")
+    with pytest.raises(ConfigurationError):
+        _sqlite_path("sqlite://backup:pw@fileserver/audit.db")

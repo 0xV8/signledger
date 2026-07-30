@@ -30,6 +30,12 @@ down by a test in ``tests/test_sqlite_concurrency.py``:
 ``CREATE TABLE``, no triggers, and - the one that surprises people - no
 ``PRAGMA journal_mode = WAL``, which is itself a write to the database header. See
 :meth:`SQLiteBackend._configure`.
+
+It does **not** mean the directory is untouched. Opening a WAL database read-only in a
+*writable* directory lets SQLite materialise its own ``-wal`` and ``-shm`` wal-index
+beside the file; that is SQLite's, not signledger's, and ``query_only`` refuses every
+write this backend could issue. The database file itself is byte-identical afterwards, no
+stored row changes, and on genuinely read-only media nothing is created at all.
 """
 
 import os
@@ -151,7 +157,7 @@ class SQLiteBackend:
 
     ``create`` defaults to True, which is the behaviour every writer wants: the schema is
     provisioned on open. Pass ``create=False`` to read a store that already exists,
-    provisioning nothing and issuing no write at all - what ``signledger verify`` does,
+    provisioning nothing and issuing no write of its own - what ``signledger verify`` does,
     because an integrity check that provisions the thing it is checking cannot be run
     against a copy this process may not write, and a mistyped path was answered with
     "your ledger is empty" rather than with "that is not a ledger".

@@ -322,9 +322,18 @@ def _sqlite_path(uri: str) -> str:
     ``sqlite:///C:/x.db`` - the URL spelling of the same Windows file - drops its leading
     slash, exactly as SQLite's own ``file:`` parser does with ``file:///C:/x.db``.
     """
-    parts = urlsplit(uri)
-    netloc = parts.netloc
-    path = parts.path
+    # Split the authority off by hand rather than with ``urlsplit``. A ``sqlite:`` URI
+    # carries a *filename*, and ``urlsplit`` reads everything after ``#`` as a fragment
+    # and everything after ``?`` as a query - so ``sqlite:audit#2026.db`` resolved to
+    # ``audit``, and if a file happened to exist there, ``verify`` opened it, reported a
+    # different ledger and exited 0. Percent-encoding was no escape either: the path is
+    # deliberately not unquoted, so ``%23`` names a file containing a literal ``%23``.
+    remainder = uri.split(":", 1)[1]
+    netloc, path = "", remainder
+    if remainder.startswith("//"):
+        rest = remainder[2:]
+        boundary = rest.find("/")
+        netloc, path = (rest, "") if boundary < 0 else (rest[:boundary], rest[boundary:])
     if netloc:
         if not (_is_windows_drive(netloc) or netloc.startswith("\\")):
             raise ConfigurationError(_SQLITE_HOST_REFUSAL)

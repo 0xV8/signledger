@@ -324,6 +324,20 @@ A `create=False` backend refuses `append()`, and refuses to open a store that is
 rather than bringing one into being. `memory://` has nothing to read, so it is refused
 outright.
 
+Two honest caveats, because "reads nothing" is a stronger claim than SQLite lets anyone
+make:
+
+- **The directory may still gain a `-wal` and `-shm`.** Opening a WAL database read-only
+  in a *writable* directory lets SQLite build its own wal-index beside the file. That is
+  SQLite's doing, not the library's; the database file is byte-identical afterwards and no
+  stored row changes. On genuinely read-only media nothing is created at all.
+- **A store whose `-wal` cannot be read is refused, not guessed at.** If a snapshot arrives
+  with uncheckpointed commits still in its write-ahead log and the log cannot be replayed,
+  reading the `.db` alone would return a valid-looking *prefix* of the chain — it hashes,
+  it links, it verifies — while silently omitting everything the log still held.
+  `signledger` stops instead, and tells you to checkpoint at the source or copy the store
+  somewhere writable.
+
 If you point the CLI at a non-default table, name **both** — `--entries-table` alone now
 fails rather than silently provisioning a default-named `ledger_checkpoints` beside it and
 reporting success.
