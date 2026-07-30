@@ -967,19 +967,24 @@ class TestTheImmutableFallbackRefusesAStoreWithAnUncheckpointedWal:
         return snapshot, snapshot / "audit.db"
 
     def test_a_store_whose_wal_cannot_be_read_is_refused_not_under_reported(
-        self, tmp_path: Any
+        self, tmp_path: Any, probe: Probe
     ) -> None:
-        directory, path = self.store_with_uncheckpointed_commits(tmp_path)
-        for entry in directory.iterdir():
-            entry.chmod(0o444)
-        directory.chmod(0o555)
-        try:
-            with pytest.raises(StorageError) as caught:
-                SQLiteBackend(str(path), create=False)
-        finally:
-            directory.chmod(0o755)
-            for entry in directory.iterdir():
-                entry.chmod(0o644)
+        """The condition is forced through the probe, not through file permissions.
+
+        The real-world trigger is read-only media, but ``chmod(0o555)`` on a directory is
+        a no-op on Windows - the directory stays writable, SQLite builds its wal-index
+        happily, and the fallback never fires. A permissions-based test therefore asserts
+        nothing there while looking like it does, which is how a Windows-blind shadowing
+        check survived in this suite once already.
+
+        ``fail_first_readonly_probe`` reproduces the one thing that matters - SQLite could
+        not reach the wal-index - on every platform.
+        """
+        _, path = self.store_with_uncheckpointed_commits(tmp_path)
+        probe.fail_first_readonly_probe = True
+
+        with pytest.raises(StorageError) as caught:
+            SQLiteBackend(str(path), create=False)
 
         message = str(caught.value).lower()
         assert "write-ahead log" in message
