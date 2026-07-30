@@ -276,8 +276,37 @@ class SQLiteBackend:
             # test - which under ``filterwarnings = ["error"]`` fails that test instead of
             # this code. CPython 3.11 reclaimed it quietly; 3.13 and 3.14 do not.
             connection.close()
+            self._refuse_unreadable_wal()
             return self._open(uri + "?mode=ro&immutable=1", uri=True)
         return connection
+
+    def _refuse_unreadable_wal(self) -> None:
+        """Refuse ``immutable=1`` when the write-ahead log still holds commits.
+
+        ``immutable=1`` licenses SQLite to skip the ``-wal`` entirely. On a store between
+        checkpoints - which is every WAL store, and WAL is what this backend creates - that
+        silently reads an older prefix of the ledger and reports it as the whole thing.
+        Measured: a store holding 10 committed entries read back as 5, and ``verify``
+        called it VERIFIED.
+
+        Under-reporting a log while claiming success is the worst answer an audit tool can
+        give, and strictly worse than the refusal it would replace, so this path stops
+        here. A published checkpoint does not rescue it either - the checkpoint covers the
+        very entries that went missing, so an intact ledger looks truncated.
+        """
+        wal = self.path + "-wal"
+        try:
+            has_commits = os.path.getsize(wal) > 0
+        except OSError:
+            return  # No -wal at all: nothing for `immutable` to skip. This is the
+            # auditor's snapshot, and reading it is the whole point of the fallback.
+        if has_commits:
+            raise StorageError(
+                "open failed: this store has a write-ahead log that cannot be read here, "
+                "and reading it without one would silently omit every entry the log still "
+                "holds. Checkpoint the store at its source, or copy it somewhere writable "
+                "so the log can be replayed"
+            )
 
     def _open(self, target: str, *, uri: bool) -> sqlite3.Connection:
         return sqlite3.connect(

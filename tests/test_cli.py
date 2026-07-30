@@ -172,9 +172,17 @@ def test_a_sqlite_uri_with_a_drive_letter_and_one_colon_names_the_same_file() ->
     assert _sqlite_path("sqlite:C:/Users/me/audit.db") == "C:/Users/me/audit.db"
 
 
-def test_a_triple_slash_sqlite_uri_with_a_drive_letter_names_the_same_file() -> None:
+def test_a_triple_slash_sqlite_uri_with_a_drive_letter_names_the_same_file(
+    monkeypatch: Any,
+) -> None:
     # `sqlite:///C:/x.db` is the URL spelling of an absolute Windows path; SQLite's own
     # `file:` parser drops that leading slash for exactly the same reason.
+    #
+    # Only on Windows. `/c:/data/audit.db` is an ordinary absolute path on POSIX - a
+    # directory called `c:` at the root - and dropping the slash there would quietly make
+    # it relative. The two spellings cannot be told apart, so the platform decides.
+    monkeypatch.setattr(os, "name", "nt")
+
     assert _sqlite_path("sqlite:///C:/Users/me/audit.db") == "C:/Users/me/audit.db"
     assert _sqlite_path(r"sqlite:///C:\Users\me\audit.db") == r"C:\Users\me\audit.db"
 
@@ -4427,3 +4435,29 @@ def test_a_passing_verification_still_says_the_entries_were_verified(
 
     entries_line = next(line for line in out.splitlines() if line.startswith("entries"))
     assert "3 verified" in entries_line
+
+
+def test_a_posix_absolute_path_beginning_with_a_letter_and_colon_keeps_its_root(
+    monkeypatch: Any,
+) -> None:
+    """``/c:/data/audit.db`` is an ordinary absolute path on POSIX, not a drive letter.
+
+    The leading slash is dropped in front of a drive designator because
+    ``sqlite:///C:/Users/me/audit.db`` names a file on the C: drive and SQLite needs it
+    unrooted. On POSIX the identical string names a directory called ``c:`` at the
+    filesystem root, and dropping the slash silently turns an absolute path into a
+    relative one resolved against the working directory - so a verify would read, or
+    create, some other file entirely.
+
+    The two spellings are indistinguishable, so the platform has to decide.
+    """
+    monkeypatch.setattr(os, "name", "posix")
+
+    assert _sqlite_path("sqlite:///c:/data/audit.db") == "/c:/data/audit.db"
+
+
+def test_a_windows_drive_still_loses_the_slash_the_uri_added(monkeypatch: Any) -> None:
+    """The other half of the same decision, asserted from any OS."""
+    monkeypatch.setattr(os, "name", "nt")
+
+    assert _sqlite_path("sqlite:///C:/Users/me/audit.db") == "C:/Users/me/audit.db"

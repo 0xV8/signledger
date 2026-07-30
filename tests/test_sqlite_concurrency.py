@@ -22,6 +22,8 @@ import hashlib
 import multiprocessing
 import shutil
 import sqlite3
+import subprocess
+import sys
 import time
 from contextlib import closing, suppress
 from datetime import datetime, timezone
@@ -913,3 +915,104 @@ class TestTheReadOnlyFallbackDoesNotStrandItsFirstConnection:
         assert _file_uri(PureWindowsPath(r"\\server\share\audit.db")) == (
             "file://server/share/audit.db"
         )
+
+
+class TestTheImmutableFallbackRefusesAStoreWithAnUncheckpointedWal:
+    """``immutable=1`` ignores the ``-wal``, so it must never be used when one has content.
+
+    Telling SQLite a file is immutable licenses it to skip the write-ahead log entirely.
+    For a store whose recent commits are still in ``audit.db-wal`` - which is every store
+    between checkpoints, because WAL is the mode this backend puts them in - that means
+    reading an older prefix of the ledger and reporting it as the whole thing.
+
+    Measured before this guard existed: a store holding 10 committed entries was read back
+    as 5, and ``verify`` called it VERIFIED. Under-reporting a log while claiming success
+    is the worst answer an audit tool can give, and it is strictly worse than the refusal
+    it replaced. A published checkpoint does not save it either: the checkpoint covers the
+    entries that are missing, so the ledger looks truncated rather than intact.
+
+    So the fallback refuses, and says what to do about it.
+    """
+
+    def store_with_uncheckpointed_commits(self, tmp_path: Any) -> Any:
+        """A ``.db`` plus a ``-wal`` holding commits that never reached it."""
+        live = tmp_path / "live"
+        live.mkdir()
+        path = live / "audit.db"
+
+        backend = SQLiteBackend(str(path))
+        try:
+            BackendConformanceSuite().append(backend)
+        finally:
+            backend.close()
+
+        # A second writer that commits and dies without checkpointing. Its entries are
+        # durable - they are in the -wal - but they are not in the .db.
+        program = (
+            "from signledger.backends.base import BackendConformanceSuite\n"
+            "from signledger.backends.sqlite import SQLiteBackend\n"
+            "import os\n"
+            f"b = SQLiteBackend({str(path)!r})\n"
+            "suite = BackendConformanceSuite()\n"
+            "suite.append(b)\n"
+            "suite.append(b)\n"
+            "os._exit(0)\n"
+        )
+        subprocess.run([sys.executable, "-c", program], check=True, timeout=60)
+
+        snapshot = tmp_path / "snapshot"
+        snapshot.mkdir()
+        for suffix in ("", "-wal"):
+            shutil.copy2(str(path) + suffix, str(snapshot / ("audit.db" + suffix)))
+        return snapshot, snapshot / "audit.db"
+
+    def test_a_store_whose_wal_cannot_be_read_is_refused_not_under_reported(
+        self, tmp_path: Any
+    ) -> None:
+        directory, path = self.store_with_uncheckpointed_commits(tmp_path)
+        for entry in directory.iterdir():
+            entry.chmod(0o444)
+        directory.chmod(0o555)
+        try:
+            with pytest.raises(StorageError) as caught:
+                SQLiteBackend(str(path), create=False)
+        finally:
+            directory.chmod(0o755)
+            for entry in directory.iterdir():
+                entry.chmod(0o644)
+
+        message = str(caught.value).lower()
+        assert "write-ahead log" in message
+        assert "checkpoint" in message
+
+    def test_the_entries_are_really_there_so_the_refusal_is_not_hiding_an_empty_wal(
+        self, tmp_path: Any
+    ) -> None:
+        """Guards the guard: prove the -wal genuinely holds commits the .db lacks."""
+        directory, path = self.store_with_uncheckpointed_commits(tmp_path)
+
+        recovered = SQLiteBackend(str(path))
+        try:
+            total = recovered.count()
+        finally:
+            recovered.close()
+
+        assert total == 3
+
+    def test_a_snapshot_without_a_wal_still_opens_on_read_only_media(
+        self, tmp_path: Any
+    ) -> None:
+        """The auditor case must keep working - that is why the fallback exists at all."""
+        directory, path = self.store_with_uncheckpointed_commits(tmp_path)
+        (directory / "audit.db-wal").unlink()
+        path.chmod(0o444)
+        directory.chmod(0o555)
+        try:
+            backend = SQLiteBackend(str(path), create=False)
+            try:
+                assert backend.count() == 1
+            finally:
+                backend.close()
+        finally:
+            directory.chmod(0o755)
+            path.chmod(0o644)

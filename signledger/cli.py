@@ -333,7 +333,14 @@ def _sqlite_path(uri: str) -> str:
         return netloc + path
     if path in ("", "/", "/:memory:", ":memory:"):
         return ":memory:"
-    if path.startswith("/") and _is_windows_drive(path[1:]):
+    if os.name == "nt" and path.startswith("/") and _is_windows_drive(path[1:]):
+        # `sqlite:///C:/Users/me/audit.db` is the URL spelling of an absolute Windows
+        # path, and SQLite needs it without the slash the URI syntax added.
+        #
+        # Gated on the platform because the two readings are indistinguishable: on POSIX
+        # the identical string names a directory called `c:` at the filesystem root, and
+        # stripping the slash there turns an absolute path into a relative one resolved
+        # against the working directory - so a verify would answer about another file.
         return path[1:]
     return path
 
