@@ -10,7 +10,15 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Supersede an in-flight run on a pull request, where only the latest commit matters.
+  # NEVER on a push: a branch push is the record of what that commit was worth, and a
+  # cancelled job leaves a gap that reads exactly like a job that was never needed.
+  #
+  # Measured, not hypothetical - `multi-worker cold start` is the slowest job here and was
+  # cancelled by the next push in six consecutive runs, so the gate guarding this project's
+  # two original release blockers had never once run to completion while every summary
+  # above it said green.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   FORCE_COLOR: "1"
