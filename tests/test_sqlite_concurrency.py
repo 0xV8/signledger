@@ -900,3 +900,16 @@ class TestTheReadOnlyFallbackDoesNotStrandItsFirstConnection:
             assert [entry.sequence for entry in backend.iter_entries()] == [0]
         finally:
             backend.close()
+
+    def test_a_unc_share_keeps_the_server_as_the_uri_authority(self) -> None:
+        """``\\\\server\\share\\audit.db`` is a real Windows path shape, and the CLI accepts it.
+
+        The server name is the URI's authority, so it takes a bare ``file:`` prefix rather
+        than the empty-authority ``file://`` the drive-letter and POSIX forms use. Matches
+        what ``PureWindowsPath.as_uri()`` produced before it was deprecated.
+        """
+        from signledger.backends.sqlite import _file_uri
+
+        assert _file_uri(PureWindowsPath(r"\\server\share\audit.db")) == (
+            "file://server/share/audit.db"
+        )

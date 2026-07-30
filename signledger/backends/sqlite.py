@@ -36,6 +36,7 @@ import os
 import pathlib
 import sqlite3
 import threading
+import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime
 from typing import (
@@ -123,11 +124,26 @@ def _file_uri(path: "pathlib.PurePath") -> str:
     ``/`` it is treated as a **relative** filename resolved against the working directory.
     A read-only verify would then open some other file, or nothing.
 
-    ``PurePath.as_uri`` is the platform's own answer - ``file:///C:/Users/me/audit.db`` on
-    Windows, ``file:///var/lib/audit.db`` on POSIX - and it escapes ``?`` and ``#``, which
-    SQLite would otherwise read as the start of its own query string.
+    The transformation is spelled out here rather than delegated to ``PurePath.as_uri``
+    for two reasons. ``as_uri`` is deprecated on ``PurePath`` in 3.14 and scheduled for
+    removal in 3.19 - only the concrete, platform-bound ``Path`` keeps it - and a concrete
+    ``Path`` cannot carry Windows semantics on a POSIX machine, so relying on it would
+    make the Windows behaviour untestable anywhere but Windows. This produces byte-identical
+    output to ``as_uri()`` for POSIX paths, Windows drive paths and UNC shares.
+
+    ``?`` and ``#`` are escaped because SQLite reads them as the start of its own query
+    string; ``:`` and ``/`` are kept, because a drive designator needs the first and every
+    separator needs the second.
     """
-    return path.as_uri()
+    text = str(path).replace("\\", "/")
+    if text.startswith("//"):
+        # A UNC share: the server is the authority, so it takes a bare ``file:`` prefix.
+        return "file:" + urllib.parse.quote(text, safe="/:")
+    if not text.startswith("/"):
+        # A drive designator - ``C:/x`` - is not rooted until the URI adds the slash that
+        # separates an empty authority from the path.
+        text = "/" + text
+    return "file://" + urllib.parse.quote(text, safe="/:")
 
 
 class SQLiteBackend:
