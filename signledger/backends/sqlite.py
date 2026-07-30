@@ -33,9 +33,9 @@ down by a test in ``tests/test_sqlite_concurrency.py``:
 """
 
 import os
+import pathlib
 import sqlite3
 import threading
-import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime
 from typing import (
@@ -111,6 +111,23 @@ _WAL_MODE = "wal"
 
 #: Suffixes of the two ``BEFORE`` triggers that make the entries table append-only.
 _APPEND_ONLY_TRIGGER_SUFFIXES = ("_no_update", "_no_delete")
+
+
+
+def _file_uri(path: "pathlib.PurePath") -> str:
+    """The ``file:`` URI naming ``path``, in the spelling SQLite documents.
+
+    Hand-assembling this as ``"file:" + quote(path)`` is right on POSIX and wrong on
+    Windows: ``quote`` escapes the drive colon and every backslash, SQLite percent-decodes
+    the result back to ``C:\\Users\\me\\audit.db``, and since that does not begin with
+    ``/`` it is treated as a **relative** filename resolved against the working directory.
+    A read-only verify would then open some other file, or nothing.
+
+    ``PurePath.as_uri`` is the platform's own answer - ``file:///C:/Users/me/audit.db`` on
+    Windows, ``file:///var/lib/audit.db`` on POSIX - and it escapes ``?`` and ``#``, which
+    SQLite would otherwise read as the start of its own query string.
+    """
+    return path.as_uri()
 
 
 class SQLiteBackend:
@@ -230,9 +247,7 @@ class SQLiteBackend:
         if self.create:
             return self._open(self.path, uri=False)
 
-        # ``quote`` leaves ``/`` alone and escapes ``?``, ``#`` and spaces, which SQLite
-        # would otherwise read as the start of its own query string.
-        uri = "file:" + urllib.parse.quote(os.path.abspath(self.path))
+        uri = _file_uri(pathlib.Path(os.path.abspath(self.path)))
         try:
             connection = self._open(uri + "?mode=ro", uri=True)
             # Force SQLite to reach the wal-index now rather than on the first read, so

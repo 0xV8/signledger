@@ -18,11 +18,15 @@ and handed over at a named point, never by starting workers and hoping they coll
 one genuinely multi-process test is marked ``slow``. A flaky test is worse than no test.
 """
 
+import hashlib
 import multiprocessing
+import shutil
 import sqlite3
 import time
+from contextlib import closing
 from datetime import datetime, timezone
-from typing import Any, Callable, List, Optional, Set
+from pathlib import PurePosixPath, PureWindowsPath
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import pytest
 
@@ -30,11 +34,50 @@ from signledger.backends.base import (
     CAP_APPEND_ONLY_ENFORCED,
     MAX_APPEND_ATTEMPTS,
     BackendConformanceSuite,
+    build_next_entry,
 )
 from signledger.backends.sqlite import SQLiteBackend
+from signledger.core.entry import Entry
 from signledger.core.exceptions import StorageError
 
 TRIGGER_SUFFIXES = ("_no_update", "_no_delete")
+
+#: The shapes an evidence snapshot arrives in, and the files a read-only open of each may
+#: leave behind beyond the ones it was handed.
+#:
+#: * ``db only`` - the ``.db`` of a WAL store on its own, which is what an auditor is
+#:   emailed. The ``-wal`` and ``-shm`` are transient and do not travel with it.
+#: * ``db and its wal`` - what ``cp -a`` of a running service's directory captures. Not
+#:   exotic, and the shape that made the first CI run fail: SQLite can reach the wal-index
+#:   from here, so the ``mode=ro`` open succeeds and materialises a ``-shm``.
+#: * ``rollback journal db`` - a store whose file is not in WAL mode at all, the network
+#:   share ``SQLiteBackend._configure`` documents. No wal-index is possible, so a read-only
+#:   open of one must add *nothing*, on every build.
+#:
+#: The permitted additions are SQLite's own wal-index, never a signledger write:
+#: ``query_only`` refuses every write statement on a read-only connection.
+SNAPSHOT_SHAPES: Dict[str, Tuple[str, ...]] = {
+    "db only": ("-wal", "-shm"),
+    "db and its wal": ("-wal", "-shm"),
+    "rollback journal db": (),
+}
+
+
+class AuditorSnapshot(NamedTuple):
+    """The evidence an auditor was handed, and the ledger it is supposed to contain."""
+
+    directory: Any
+    path: Any
+    written: List[Entry]
+
+
+def _pragma_answer(connection: sqlite3.Connection, statement: str) -> str:
+    """Run a ``PRAGMA`` on a raw connection, returning its answer and closing the cursor."""
+    cursor = connection.execute(statement)
+    try:
+        return str(cursor.fetchone()[0]).lower()
+    finally:
+        cursor.close()
 
 
 # --------------------------------------------------------------------------------------
@@ -507,83 +550,275 @@ class TestAReadOnlyOpenWorksOnReadOnlyMedia:
     the open fails outright on a 0444 file in a 0555 directory - failing precisely the
     case the mode was built for. Opening through a ``file:...?mode=ro`` URI asks SQLite
     for a read-only connection and lets it use the immutable path instead.
+
+    **What is asserted here, and what deliberately is not.**
+
+    The first CI run failed on ``assert ['evidence.db', 'evidence.db-shm',
+    'evidence.db-wal'] == ['evidence.db']`` on the ubuntu and macos runners while passing
+    on the machine it was written on, and it was the assertion that was wrong, not the
+    backend. "No sidecar appears" is one SQLite build's answer, not a promise this library
+    is in a position to make: materialising a wal-index is SQLite's own housekeeping, this
+    backend issues no write at all on a read-only connection (``query_only`` refuses every
+    one), and whether the housekeeping succeeds or is refused varies by build. sqlite 3.51
+    here declines to build a wal-index for a snapshot that arrived without its ``-wal`` and
+    falls back to ``immutable=1``; the runners' sqlite succeeds and writes both sidecars.
+    Neither is a defect and neither is a guarantee.
+
+    What *is* guaranteed, holds on every build, and is what an auditor actually needs:
+
+    * every file the auditor was handed is byte-identical after the open;
+    * every entry, hash and link reads back exactly as written;
+    * nothing is removed, and the only files that may appear are SQLite's transient
+      wal-index beside a WAL database - beside a rollback-journal database, nothing at all;
+    * media that genuinely cannot be written to - a 0555 directory - still opens and reads.
+
+    Each shape in :data:`SNAPSHOT_SHAPES` drives a different route through
+    ``SQLiteBackend._raw_connect``, and all three run on every platform, so the routes are
+    covered here rather than left to whichever one a given SQLite build happens to take.
     """
 
     def snapshot(self, directory: Any) -> Any:
         return sorted(p.name for p in directory.iterdir())
 
-    def handed_to_an_auditor(self, tmp_path: Any) -> Any:
-        """Build a store, then copy ONLY the .db into a fresh directory.
+    def digests(self, directory: Any) -> Any:
+        """Every file in ``directory`` by name, with the sha256 of its bytes."""
+        return {
+            entry.name: hashlib.sha256(entry.read_bytes()).hexdigest()
+            for entry in directory.iterdir()
+        }
 
-        That is what an auditor is actually given: the database file, not the ``-wal`` and
-        ``-shm`` sidecars, which are transient. With them present SQLite can open a WAL
-        database read-only without writing anything, so a test that leaves them in place
-        proves nothing about read-only media.
+    def handed_to_an_auditor(self, tmp_path: Any, shape: str = "db only") -> Any:
+        """Copy the evidence out of a live store, in one of the shapes it arrives in.
+
+        See :data:`SNAPSHOT_SHAPES`. The WAL is checkpointed before the copy, so the
+        ``.db`` is complete on its own and every route must report the same ledger -
+        without that, ``immutable=1`` (which ignores the ``-wal`` entirely) would honestly
+        report a shorter ledger than ``mode=ro`` and no portable assertion would be
+        possible.
         """
-        import shutil
+        rollback_journal = shape == "rollback journal db"
+        source, written, bystander = self.build_store(
+            tmp_path / "live", rollback_journal=rollback_journal
+        )
+        with closing(bystander):
+            snapshot_dir = tmp_path / "snapshot"
+            snapshot_dir.mkdir()
+            target = snapshot_dir / "evidence.db"
+            shutil.copy2(source, target)
+            if shape == "db and its wal":
+                shutil.copy2(f"{source}-wal", f"{target}-wal")
+        return AuditorSnapshot(snapshot_dir, target, written)
 
-        source = self.build_store(tmp_path / "live")
-        snapshot_dir = tmp_path / "snapshot"
-        snapshot_dir.mkdir()
-        target = snapshot_dir / "evidence.db"
-        shutil.copy2(source, target)
-        return snapshot_dir, target
+    def build_store(self, tmp_path: Any, *, rollback_journal: bool = False) -> Any:
+        """Three linked entries, and a second connection holding the ``-wal`` in place.
 
-    def build_store(self, tmp_path: Any) -> Any:
-        from signledger.backends.sqlite import SQLiteBackend
-
+        SQLite checkpoints and deletes the ``-wal`` when the *last* connection to a WAL
+        database closes, so without a bystander open there is no sidecar left to copy - and
+        a bystander is exactly what production has: the service that is still running while
+        the auditor takes the copy. The caller closes it.
+        """
         tmp_path.mkdir(parents=True, exist_ok=True)
-
         path = tmp_path / "evidence.db"
-        from signledger.backends.base import build_next_entry
 
         backend = SQLiteBackend(str(path))
+        written = []
         try:
             for index in range(3):
-                backend.append_atomic(
-                    lambda tip, i=index: build_next_entry(
-                        tip,
-                        ledger_id="evidence-ledger",
-                        created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-                        data={"index": i},
-                        timestamp=datetime(2024, 6, 1, 12, 0, i, tzinfo=timezone.utc),
+                written.append(
+                    backend.append_atomic(
+                        lambda tip, i=index: build_next_entry(
+                            tip,
+                            ledger_id="evidence-ledger",
+                            created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                            data={"index": i},
+                            timestamp=datetime(2024, 6, 1, 12, 0, i, tzinfo=timezone.utc),
+                        )
                     )
                 )
+            bystander = sqlite3.connect(str(path))
         finally:
             backend.close()
-        return path
+        try:
+            if rollback_journal:
+                # The network-share deployment `SQLiteBackend._configure` names: a ledger
+                # whose file is not in WAL mode at all. Converting checkpoints the -wal and
+                # removes it, so this shape arrives as a lone .db by construction.
+                mode = _pragma_answer(bystander, "PRAGMA journal_mode = DELETE")
+                assert mode == "delete"
+            else:
+                # FULL, so every frame the -wal holds is also in the .db. The snapshot is
+                # then complete whichever route the read-only open takes.
+                _pragma_answer(bystander, "PRAGMA wal_checkpoint(FULL)")
+        except BaseException:
+            bystander.close()
+            raise
+        return path, written, bystander
 
-    def test_a_read_only_open_of_a_read_only_file_reads_every_entry(
-        self, tmp_path: Any
+    @pytest.mark.parametrize("shape", SNAPSHOT_SHAPES)
+    def test_a_read_only_open_of_read_only_media_reads_every_entry(
+        self, tmp_path: Any, shape: str
     ) -> None:
-        from signledger.backends.sqlite import SQLiteBackend
+        """The case ``create=False`` exists for, and the one that holds everywhere.
 
-        directory, path = self.handed_to_an_auditor(tmp_path)
-        path.chmod(0o444)
-        directory.chmod(0o555)
+        A 0555 directory is media nothing can be written to at all - no wal-index, no
+        journal, nothing - so no SQLite build has a way to litter here and none has a way
+        to disagree. This is also the assertion that fails outright if the read-only URI is
+        ever dropped: a plain ``sqlite3.connect`` of the two WAL shapes here is
+        ``StorageError: open failed: OperationalError``, measured.
+        """
+        snapshot = self.handed_to_an_auditor(tmp_path, shape)
+        for entry in snapshot.directory.iterdir():
+            entry.chmod(0o444)
+        snapshot.directory.chmod(0o555)
         try:
-            backend = SQLiteBackend(str(path), create=False)
+            backend = SQLiteBackend(str(snapshot.path), create=False)
             try:
                 assert backend.count() == 3
+                assert list(backend.iter_entries()) == snapshot.written
             finally:
                 backend.close()
         finally:
-            directory.chmod(0o755)
-            path.chmod(0o644)
+            snapshot.directory.chmod(0o755)
+            for entry in snapshot.directory.iterdir():
+                entry.chmod(0o644)
 
-    def test_a_read_only_open_leaves_no_sidecar_behind(self, tmp_path: Any) -> None:
-        """A writable directory is the subtler case: the open succeeds, and litters."""
+    @pytest.mark.parametrize("shape", SNAPSHOT_SHAPES)
+    def test_a_read_only_open_leaves_every_file_it_was_handed_byte_identical(
+        self, tmp_path: Any, shape: str
+    ) -> None:
+        """The guarantee an auditor actually needs, and a portable one.
+
+        Not "no sidecar appeared" - that is an SQLite build's answer, and both answers are
+        legitimate - but "the evidence I gave you came back unchanged".
+
+        The snapshot is left **writable** on purpose. At 0444 the operating system is what
+        prevents a write, so the assertion would pass even against a backend that opened
+        read-write and would be measuring the chmod rather than the library. Writable, the
+        only thing standing between the evidence and a write is the backend's own choice
+        of ``mode=ro`` and ``query_only``. Measured teeth: on the ``rollback journal db``
+        shape an open that provisions - ``create=True``, i.e. ``PRAGMA journal_mode = WAL``
+        rewriting the header - changes ``evidence.db`` and fails this.
+        """
+        snapshot = self.handed_to_an_auditor(tmp_path, shape)
+        before = self.digests(snapshot.directory)
+
+        backend = SQLiteBackend(str(snapshot.path), create=False)
+        try:
+            assert backend.count() == 3
+        finally:
+            backend.close()
+
+        after = self.digests(snapshot.directory)
+        assert {name: after.get(name) for name in before} == before
+
+    @pytest.mark.parametrize("shape", SNAPSHOT_SHAPES)
+    def test_a_read_only_open_adds_nothing_but_sqlites_own_wal_index(
+        self, tmp_path: Any, shape: str
+    ) -> None:
+        """A writable directory is the subtler case: the open succeeds, and may litter.
+
+        Whether it litters is SQLite's decision, so what is pinned is the *bound*: at most
+        the transient wal-index of the database being read, and beside a rollback-journal
+        database not even that, on any build. A ``-journal``, a second database, a renamed
+        or deleted evidence file all fail this.
+        """
+        snapshot = self.handed_to_an_auditor(tmp_path, shape)
+        before = set(self.snapshot(snapshot.directory))
+
+        backend = SQLiteBackend(str(snapshot.path), create=False)
+        try:
+            assert backend.count() == 3
+        finally:
+            backend.close()
+
+        after = set(self.snapshot(snapshot.directory))
+        permitted = {
+            f"{snapshot.path.name}{suffix}" for suffix in SNAPSHOT_SHAPES[shape]
+        }
+        assert after - before <= permitted
+        assert before - after == set()
+
+    @pytest.mark.parametrize("shape", SNAPSHOT_SHAPES)
+    def test_a_read_only_open_reads_back_every_entry_and_every_digest(
+        self, tmp_path: Any, shape: str
+    ) -> None:
+        """No stored row, hash or link changes - the same guarantee, read from inside.
+
+        Byte-identity says the file did not move; this says the ledger inside it did not
+        either, which is what a verdict is computed from.
+        """
+        snapshot = self.handed_to_an_auditor(tmp_path, shape)
+
+        backend = SQLiteBackend(str(snapshot.path), create=False)
+        try:
+            assert list(backend.iter_entries()) == snapshot.written
+            assert backend.get_head() == snapshot.written[-1]
+            assert backend.get_oldest() == snapshot.written[0]
+        finally:
+            backend.close()
+
+
+class TestTheReadOnlyFileUriIsBuiltForThePlatform:
+    """A ``create=False`` open must name an ABSOLUTE file on every platform.
+
+    The read-only route builds a ``file:`` URI so SQLite opens without creating anything.
+    Hand-assembling it as ``"file:" + quote(path)`` is correct on POSIX only: on Windows
+    ``quote`` escapes the drive colon and the backslashes, SQLite percent-decodes the
+    result to ``C:\\Users\\me\\audit.db``, and because that does not begin with ``/`` it is
+    classified as a **relative** filename and resolved against the process working
+    directory instead of the path the caller asked for.
+
+    Nobody caught it because this route had never executed on Windows: every CLI test
+    there died earlier, in URI parsing, before a backend was ever constructed.
+
+    ``PurePath.as_uri()`` is the platform's own answer and is what SQLite documents -
+    ``file:///C:/Users/me/audit.db``. These assert the rule on both flavours, so the
+    Windows half is checked from any machine.
+    """
+
+    def test_a_windows_path_becomes_a_triple_slash_file_uri(self) -> None:
+        from signledger.backends.sqlite import _file_uri
+
+        assert _file_uri(PureWindowsPath(r"C:\Users\me\audit.db")) == (
+            "file:///C:/Users/me/audit.db"
+        )
+
+    def test_a_posix_path_is_unchanged_in_shape(self) -> None:
+        from signledger.backends.sqlite import _file_uri
+
+        assert _file_uri(PurePosixPath("/var/lib/audit.db")) == "file:///var/lib/audit.db"
+
+    def test_a_character_sqlite_would_read_as_its_own_query_is_escaped(self) -> None:
+        """``?`` and ``#`` end the filename in a SQLite URI, so they must not survive raw."""
+        from signledger.backends.sqlite import _file_uri
+
+        built = _file_uri(PurePosixPath("/var/lib/od?d#b.db"))
+
+        assert "?" not in built and "#" not in built
+        assert built.startswith("file:///var/lib/")
+
+    def test_a_read_only_open_reads_the_file_the_caller_named(self, tmp_path: Any) -> None:
+        """The functional half, on whatever platform is running this."""
+        from signledger.backends.base import build_next_entry
         from signledger.backends.sqlite import SQLiteBackend
 
-        directory, path = self.handed_to_an_auditor(tmp_path)
-        path.chmod(0o444)
-        before = self.snapshot(directory)
+        path = tmp_path / "named.db"
+        writer = SQLiteBackend(str(path))
         try:
-            backend = SQLiteBackend(str(path), create=False)
-            try:
-                assert backend.count() == 3
-            finally:
-                backend.close()
-            assert self.snapshot(directory) == before
+            writer.append_atomic(
+                lambda tip: build_next_entry(
+                    tip,
+                    ledger_id="uri-ledger",
+                    created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    data={"event": "one"},
+                    timestamp=datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+                )
+            )
         finally:
-            path.chmod(0o644)
+            writer.close()
+
+        reader = SQLiteBackend(str(path), create=False)
+        try:
+            assert reader.count() == 1
+        finally:
+            reader.close()

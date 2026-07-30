@@ -191,6 +191,16 @@ def open_backend(
             "a backend URI needs a scheme: memory://, sqlite:<path>, "
             "postgresql://… or mongodb://…"
         )
+    if len(scheme) == 1:
+        # A bare Windows path is not a URI: `urlsplit(r"C:\ledger.db").scheme` is "c", so
+        # the generic refusal below named a scheme the operator never typed and offered no
+        # fix. No supported scheme is one character, and `urlsplit` only ever produces a
+        # one-character scheme from a drive letter. The letter itself is not echoed -
+        # a URI can carry a credential, and this message must be safe for any of them.
+        raise ConfigurationError(
+            "a backend URI needs a scheme, and a Windows drive letter is not one: write "
+            "sqlite:C:\\path\\to.db, or sqlite:///C:/path/to.db"
+        )
     opener = _OPENERS.get(scheme)
     if opener is None:
         raise ConfigurationError(
@@ -267,6 +277,23 @@ def _open_sqlite(uri: str, store: _Store) -> Any:
     )
 
 
+#: Refused when a sqlite URI's authority is a host rather than a Windows path. Static: a
+#: URI can carry a credential, so nothing from it is echoed (contract section 10).
+_SQLITE_HOST_REFUSAL = (
+    "a sqlite URI takes a path, not a host; write sqlite:///absolute/path.db, "
+    "sqlite:relative/path.db, or - on Windows - sqlite:C:\\path\\to.db"
+)
+
+
+def _is_windows_drive(text: str) -> bool:
+    """True when ``text`` opens with a Windows drive designator: one ASCII letter, ``:``.
+
+    ASCII only, and deliberately: ``str.isalpha`` is true of every Unicode letter, and a
+    drive is one of twenty-six.
+    """
+    return len(text) >= 2 and text[1] == ":" and text[0].isascii() and text[0].isalpha()
+
+
 def _sqlite_path(uri: str) -> str:
     """The filesystem path a ``sqlite://`` URI names.
 
@@ -274,16 +301,40 @@ def _sqlite_path(uri: str) -> str:
     reading, rather than SQLAlchemy's extra-slash convention, because an operator typing a
     path into a shell means the path they typed. ``sqlite:x.db`` is relative to the
     working directory, and ``sqlite://`` on its own is a throwaway in-memory database.
+
+    A Windows path is not a URI, and ``urlsplit`` does not pretend otherwise: it reads the
+    ``C:`` of ``sqlite://C:\\Users\\me\\audit.db`` as an authority, and the whole thing as
+    one when there is no ``/`` to end it. Refusing that as "a host" made every absolute
+    path on Windows - which is to say, the normal way to name a database there - unusable,
+    and it is what the first Windows CI run reported 172 times.
+
+    Two authorities are therefore paths rather than hosts, and both are unambiguous:
+
+    * one ASCII letter followed by ``:`` is a drive. No hostname has that shape.
+    * anything starting with ``\\`` is a UNC share (``\\\\server\\share\\audit.db``).
+      A backslash is not a legal character in a host, so nothing else can be meant.
+
+    Everything else with an authority is still refused, and still by a message that names
+    the fix rather than quoting the URI: ``sqlite://data/ledger.db`` names a *file* the
+    operator did not ask for, and guessing is worse than stopping. Widening this to admit
+    a drive letter must not widen it to admit a host.
+
+    ``sqlite:///C:/x.db`` - the URL spelling of the same Windows file - drops its leading
+    slash, exactly as SQLite's own ``file:`` parser does with ``file:///C:/x.db``.
     """
     parts = urlsplit(uri)
-    if parts.netloc:
-        raise ConfigurationError(
-            "a sqlite URI takes a path, not a host; write sqlite:///absolute/path.db "
-            "or sqlite:relative/path.db"
-        )
+    netloc = parts.netloc
     path = parts.path
+    if netloc:
+        if not (_is_windows_drive(netloc) or netloc.startswith("\\")):
+            raise ConfigurationError(_SQLITE_HOST_REFUSAL)
+        # `sqlite://C:/Users/me/audit.db` splits into `C:` and `/Users/me/audit.db`;
+        # rejoining them is the path the operator typed, unchanged.
+        return netloc + path
     if path in ("", "/", "/:memory:", ":memory:"):
         return ":memory:"
+    if path.startswith("/") and _is_windows_drive(path[1:]):
+        return path[1:]
     return path
 
 

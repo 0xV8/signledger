@@ -1325,38 +1325,99 @@ class TestSQLiteSurvivesWalPragmaContention:
             holder.join(timeout=10)
         assert released.is_set()
 
-    def test_a_lock_held_throughout_still_fails_as_storage_error(self, tmp_path):
+    #: How much longer each ``busy_timeout`` wait takes to come back than it asked for,
+    #: as a multiple of the timeout itself, injected per attempt. ``0`` is this machine.
+    #: ``3`` is worse than the runner that broke the old wall-clock bound: windows-latest
+    #: returned 3.02s for five 0.3s waits, a multiple of about one.
+    RUNNER_SLOWNESS = (0, 3)
+
+    @pytest.mark.parametrize("slowness", RUNNER_SLOWNESS)
+    def test_a_lock_held_throughout_still_fails_as_storage_error(
+        self, tmp_path, monkeypatch, slowness
+    ):
         """Guards the retry: waiting for ever is not an improvement on failing.
 
         A retry loop with no bound turns one stuck worker into a hung fleet. The lock is
-        held for the whole of the attempt and released only after it, so this observes
-        the bound rather than racing a sleeping thread against it - the earlier version
-        of this test held the lock for a fixed 1.5s, which the bounded retry now outlasts
-        legitimately.
+        held for the whole of the attempt and released only after it, so this observes the
+        bound rather than racing a sleeping thread against it.
 
-        The budget is derived, not guessed: at most ``MAX_APPEND_ATTEMPTS`` tries, each
-        waiting out its own ``busy_timeout``, plus the exponential backoff between them.
-        ``tests/test_sqlite_concurrency.py`` asserts the attempt count itself.
+        **Why the bound is no longer a wall clock.** This used to end in
+        ``assert timeout <= elapsed < MAX_APPEND_ATTEMPTS * timeout + 1.0`` and
+        windows-latest failed it with ``assert 3.020011799999992 < ((5 * 0.3) + 1.0)``.
+        Nothing was wrong with the backend: the runner took about twice as long to return
+        from each 0.3s wait as it was asked for. A ceiling in seconds on a shared runner
+        measures the runner, and no ceiling tight enough to mean anything is loose enough
+        to stay true - so the bound is asserted where this library actually imposes one,
+        on the *number of attempts*.
+
+        That is stronger than what it replaces, not weaker. ``elapsed < 2.5s`` was also
+        satisfied by an unbounded loop that happened to get lucky and by a bound of any
+        size that ran fast; ``attempts == MAX_APPEND_ATTEMPTS`` is satisfied only by the
+        bound itself, and ``slowness`` is what proves it has teeth on a busy host: a
+        runner that makes every wait four times as long moves the wall clock and changes
+        nothing else here. An unbounded loop is not left to hang either - attempt six
+        raises a ``RuntimeError``, which ``_is_conflict`` does not recognise and
+        ``_translating`` does not catch, so it leaves the constructor immediately and this
+        fails in seconds.
+
+        The other half of the old assertion, "it did not fail instantly", was really
+        asking whether ``busy_timeout`` had been applied at all - but whether SQLite
+        consults the busy handler for a journal-mode change is SQLite's answer and varies
+        with which lock is held (see the class docstring), so reading it off the clock is
+        the same mistake in the other direction. What *this library* owes is the pragma,
+        with the timeout converted to milliseconds, and that is asserted directly: a
+        dropped ``* 1000`` fails the last line here without timing anything.
         """
         import sqlite3
 
+        import signledger.backends.sqlite as sqlite_backend
         from signledger.backends.sqlite import SQLiteBackend
 
-        timeout = 0.3
+        timeout = 0.1
+        settings = []
+        attempts = []
+        real_pragma = sqlite_backend._pragma
+        real_pragma_value = sqlite_backend._pragma_value
+
+        def record_setting(connection, statement):
+            settings.append(statement)
+            return real_pragma(connection, statement)
+
+        def record_attempt(connection, statement):
+            if not statement.strip().upper().startswith("PRAGMA JOURNAL_MODE"):
+                return real_pragma_value(connection, statement)
+            attempts.append(statement)
+            if len(attempts) > MAX_APPEND_ATTEMPTS:
+                # Deliberately not an OperationalError: `_is_conflict` says no to this, so
+                # `retry_on_conflict` re-raises it untouched and an unbounded retry fails
+                # here rather than running until the 300s suite timeout kills the session.
+                raise RuntimeError(f"the wal retry is unbounded: attempt {len(attempts)}")
+            time.sleep(slowness * timeout)  # the slow runner, reproduced on any OS
+            return real_pragma_value(connection, statement)
+
+        monkeypatch.setattr(sqlite_backend, "_pragma", record_setting)
+        monkeypatch.setattr(sqlite_backend, "_pragma_value", record_attempt)
+
         path = str(tmp_path / "stuck.db")
         holder = sqlite3.connect(path, isolation_level=None)
         holder.execute("BEGIN EXCLUSIVE")
         try:
-            started = time.monotonic()
             with pytest.raises(StorageError):
                 SQLiteBackend(path, timeout=timeout)
-            elapsed = time.monotonic() - started
         finally:
             holder.execute("COMMIT")
             holder.close()
 
-        # It neither failed instantly nor hung.
-        assert timeout <= elapsed < MAX_APPEND_ATTEMPTS * timeout + 1.0
+        # It gave up after exactly the attempts it is allowed, however long they took.
+        assert len(attempts) == MAX_APPEND_ATTEMPTS
+        # And each of those attempts was given the timeout it was configured with, in the
+        # milliseconds SQLite expects - which is the part "it did not fail instantly" was
+        # really about, stated without a stopwatch.
+        assert [
+            int(statement.split("=")[1])
+            for statement in settings
+            if statement.strip().upper().startswith("PRAGMA BUSY_TIMEOUT")
+        ] == [int(timeout * 1000)]
 
 
 class TestPayloadDecodeFailsClosed:

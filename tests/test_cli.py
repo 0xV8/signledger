@@ -12,7 +12,7 @@ import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Iterator, List, Tuple
 from urllib.parse import urlsplit
 
@@ -33,6 +33,7 @@ from signledger.cli import (
     EXIT_INVALID,
     EXIT_OK,
     MIGRATION_FORMAT,
+    _sqlite_path,
     build_parser,
     find_forks,
     main,
@@ -129,6 +130,128 @@ def test_a_sqlite_uri_with_a_host_is_refused_rather_than_silently_mis_parsed() -
     # would open a different file from the one they named.
     with pytest.raises(ConfigurationError, match="host"):
         open_backend("sqlite://data/ledger.db")
+
+
+# ======================================================================================
+# Windows paths in a sqlite URI
+#
+# The first CI run on windows-latest failed 172 tests with one message - "a sqlite URI
+# takes a path, not a host" - because a Windows tmp_path is `C:\Users\runneradmin\...`,
+# so the backend URI is `sqlite://C:\Users\...\ledger.db` and `urlsplit` reads the `C:`
+# as a URI authority.
+#
+# Every test below is a pure-function test over a Windows-shaped *string*, so all of them
+# execute on macOS and Linux too. A test that only ran under `os.name == "nt"` would be
+# skipped on the machine this bug is fixed on, and would protect nobody.
+# ======================================================================================
+
+#: What `tmp_path / "ledger.db"` renders as on a GitHub windows-latest runner.
+WINDOWS_TMP_DB = r"C:\Users\runneradmin\AppData\Local\Temp\pytest-0\test_verify0\ledger.db"
+
+
+def test_the_sqlite_uri_this_suite_builds_survives_a_windows_tmp_path() -> None:
+    # This is the CI failure itself, reproduced without Windows: `sqlite_uri` is what
+    # every store-backed test in this file calls, and `PureWindowsPath` renders a
+    # Windows path on any OS.
+    windows_tmp_path = PureWindowsPath(WINDOWS_TMP_DB)
+
+    assert _sqlite_path(sqlite_uri(windows_tmp_path)) == WINDOWS_TMP_DB
+
+
+def test_a_sqlite_uri_with_a_drive_letter_authority_names_a_file_on_that_drive() -> None:
+    # `C:` is a drive, never a host: a host cannot contain a backslash, and no host is
+    # one letter followed by a colon.
+    assert _sqlite_path("sqlite://" + WINDOWS_TMP_DB) == WINDOWS_TMP_DB
+    assert _sqlite_path("sqlite://C:/Users/me/audit.db") == "C:/Users/me/audit.db"
+    assert _sqlite_path("sqlite://d:/data/audit.db") == "d:/data/audit.db"
+
+
+def test_a_sqlite_uri_with_a_drive_letter_and_one_colon_names_the_same_file() -> None:
+    # The documented `sqlite:<path>` spelling, which is what `--backend` advertises.
+    assert _sqlite_path(r"sqlite:C:\Users\me\audit.db") == r"C:\Users\me\audit.db"
+    assert _sqlite_path("sqlite:C:/Users/me/audit.db") == "C:/Users/me/audit.db"
+
+
+def test_a_triple_slash_sqlite_uri_with_a_drive_letter_names_the_same_file() -> None:
+    # `sqlite:///C:/x.db` is the URL spelling of an absolute Windows path; SQLite's own
+    # `file:` parser drops that leading slash for exactly the same reason.
+    assert _sqlite_path("sqlite:///C:/Users/me/audit.db") == "C:/Users/me/audit.db"
+    assert _sqlite_path(r"sqlite:///C:\Users\me\audit.db") == r"C:\Users\me\audit.db"
+
+
+def test_a_sqlite_uri_naming_a_unc_share_keeps_both_leading_backslashes() -> None:
+    # `\\server\share\audit.db` is a real Windows path shape, and it is unambiguous: a
+    # backslash is not legal in a host, so an authority starting with one is a UNC path.
+    assert _sqlite_path(r"sqlite:\\server\share\audit.db") == r"\\server\share\audit.db"
+    assert _sqlite_path(r"sqlite://\\server\share\audit.db") == r"\\server\share\audit.db"
+    assert _sqlite_path("sqlite:////server/share/audit.db") == "//server/share/audit.db"
+
+
+def test_a_posix_absolute_path_is_still_read_as_the_path_it_is() -> None:
+    # The drive-letter rule must not touch the ordinary reading of a rooted path.
+    assert _sqlite_path("sqlite:///var/lib/audit.db") == "/var/lib/audit.db"
+    assert _sqlite_path("sqlite:/x") == "/x"
+    assert _sqlite_path("sqlite:audit.db") == "audit.db"
+
+
+def test_a_sqlite_uri_with_a_real_host_is_still_refused_after_the_windows_fix() -> None:
+    # Widening the rule to admit `C:` must not widen it to admit everything: guessing
+    # what `sqlite://data/ledger.db` meant would open a file the operator never named.
+    for uri in (
+        "sqlite://somehost/path",
+        "sqlite://data/ledger.db",
+        "sqlite://cc:/data.db",
+        "sqlite://ledger.db/x",
+    ):
+        with pytest.raises(ConfigurationError, match="host"):
+            _sqlite_path(uri)
+
+
+def test_the_host_refusal_still_names_the_fix_and_still_quotes_no_uri() -> None:
+    with pytest.raises(ConfigurationError) as caught:
+        _sqlite_path("sqlite://backup:hunter2@fileserver/audit.db")
+
+    message = str(caught.value)
+    assert "sqlite:///absolute/path.db" in message
+    assert "sqlite:relative/path.db" in message
+    # Contract section 10: a URI can carry a credential, so none of it is echoed.
+    assert "hunter2" not in message
+    assert "fileserver" not in message
+
+
+def test_a_bare_windows_path_is_reported_as_a_missing_scheme_not_an_unknown_one() -> None:
+    # `urlsplit(r"C:\ledger.db").scheme` is "c". Reporting `unsupported backend scheme
+    # 'c'` names a scheme the operator never typed and offers no fix.
+    with pytest.raises(ConfigurationError) as caught:
+        open_backend(r"C:\ledger.db")
+
+    message = str(caught.value)
+    assert "sqlite:" in message
+    assert "scheme 'c'" not in message
+
+
+def test_every_uri_the_windows_refusals_document_is_one_this_parser_reads_back() -> None:
+    """A message that tells an operator to write a form the parser mangles is the bug.
+
+    ``--help`` and the schemeless refusal are already held to this (see
+    ``documented_sqlite_uris`` below); the two refusals a Windows operator actually hits
+    were not, so the fix they name has to be checked the same way. Pure: each form is
+    parsed, never opened.
+    """
+    messages = []
+    with pytest.raises(ConfigurationError) as caught:
+        _sqlite_path("sqlite://fileserver/audit.db")
+    messages.append(str(caught.value))
+    with pytest.raises(ConfigurationError) as caught:
+        open_backend(r"C:\ledger.db")
+    messages.append(str(caught.value))
+
+    documented = [form for text in messages for form in documented_sqlite_uris(text)]
+    assert [form for form in documented if "C:" in form], "no Windows form is offered"
+    for form in documented:
+        # Read back as a Windows path on every OS: the file each message names, not a
+        # trailing bracket or a slash the parser failed to drop.
+        assert PureWindowsPath(_sqlite_path(form)).suffix == ".db", form
 
 
 def test_an_unknown_scheme_is_refused_by_name() -> None:
