@@ -241,70 +241,23 @@ jobs:
         run: pip install -e '.[flask,postgresql,test]' gunicorn requests
 
       - name: Library-level cold-start race
-        # No web framework at all: N processes, one fresh file. This reproduced
-        # 11 failures out of 20 before the fix.
+        # Runs the maintained test, not a copy of it.
         #
-        # Every wait here is bounded. The first version of this step used a bare
-        # `barrier.wait()` and a bare `q.get()`, and a child that dies before
-        # reaching the barrier makes both block forever - which is exactly what
-        # happened: the job ran for 254 minutes and was killed, so the gate that
-        # guards this project's two original blockers still had never completed.
-        # A hang and a pass are indistinguishable in a summary line.
+        # This step used to carry its own multiprocessing program in a heredoc. It could
+        # never have worked: `mp.set_start_method("spawn")` makes each child re-import the
+        # parent module, and the parent was fed on stdin, so every child died with
+        # `FileNotFoundError: .../<stdin>` before reaching the barrier. With unbounded
+        # waits that hung the job for 254 minutes; with bounded ones it reported
+        # `only 0/4 workers reported`. Either way the gate never once produced a verdict
+        # about the library.
+        #
+        # tests/test_sqlite_concurrency.py already holds this case as a `slow` test - 5
+        # trials of 4 spawned processes against one fresh file, the exact shape that
+        # produced 11 failures out of 20 before the retry landed. It is reviewed, it is
+        # covered by the suite, and it runs from a real file so spawn works. A second
+        # implementation of the same check bought nothing and broke twice.
         timeout-minutes: 10
-        run: |
-          python - <<'PY'
-          import multiprocessing as mp, os, queue, sys, tempfile
-
-          WORKERS, TRIALS = 4, 10
-
-          def open_backend(path, barrier, q):
-              try:
-                  from signledger.backends.sqlite import SQLiteBackend
-                  barrier.wait(timeout=60)
-                  SQLiteBackend(path).close()
-                  q.put(("ok", os.getpid()))
-              except Exception as err:
-                  q.put(("FAIL", f"{type(err).__name__}: {err}"))
-
-          if __name__ == "__main__":
-              mp.set_start_method("spawn")
-              failures = 0
-              for trial in range(TRIALS):
-                  path = os.path.join(tempfile.mkdtemp(), "audit.db")
-                  barrier, q = mp.Barrier(WORKERS), mp.Queue()
-                  procs = [mp.Process(target=open_backend, args=(path, barrier, q))
-                           for _ in range(WORKERS)]
-                  for p in procs:
-                      p.start()
-
-                  # Drain before joining: a child that put a result and exited can
-                  # leave the parent waiting on a queue feeder that never flushes.
-                  seen = 0
-                  for _ in range(WORKERS):
-                      try:
-                          status, detail = q.get(timeout=90)
-                      except queue.Empty:
-                          break
-                      seen += 1
-                      if status != "ok":
-                          failures += 1
-                          print(f"trial {trial}: {detail}", flush=True)
-
-                  for p in procs:
-                      p.join(30)
-                      if p.is_alive():
-                          p.kill()
-                          p.join(10)
-
-                  if seen != WORKERS:
-                      failures += WORKERS - seen
-                      print(f"trial {trial}: only {seen}/{WORKERS} workers reported",
-                            flush=True)
-
-              total = WORKERS * TRIALS
-              print(f"failed opens: {failures} of {total}")
-              sys.exit(1 if failures else 0)
-          PY
+        run: pytest --no-cov -q -m slow tests/test_sqlite_concurrency.py
 
       - name: gunicorn -w 4 against a store that does not exist yet
         timeout-minutes: 10
