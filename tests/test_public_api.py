@@ -11,11 +11,32 @@ at and users hit first.
 """
 
 import importlib
-from typing import Any, List
+from typing import Any, List, Optional
 
 import pytest
 
 import signledger
+
+#: Imports ``signledger.contrib.django.middleware`` for real - the models it reaches need
+#: a configured Django - and reports any ``__all__`` entry with nothing behind it.
+_DJANGO_MIDDLEWARE_PROBE = """
+import django
+from django.conf import settings
+
+settings.configure(
+    DATABASES={},
+    INSTALLED_APPS=["django.contrib.contenttypes", "signledger.contrib.django"],
+    USE_TZ=True,
+    DEFAULT_AUTO_FIELD="django.db.models.BigAutoField",
+)
+django.setup()
+
+import signledger.contrib.django.middleware as middleware
+
+missing = [name for name in middleware.__all__ if not hasattr(middleware, name)]
+assert missing == [], missing
+print("OK")
+"""
 
 
 class TestVersion:
@@ -199,19 +220,55 @@ class TestSubpackageExports:
         assert hasattr(imported, name)
 
     @pytest.mark.parametrize(
-        "module",
+        ("module", "requires"),
         [
-            "signledger.core",
-            "signledger.crypto",
-            "signledger.anchor",
-            "signledger.backends",
-            "signledger.contrib",
+            ("signledger.core", None),
+            ("signledger.crypto", None),
+            ("signledger.anchor", None),
+            ("signledger.backends", None),
+            ("signledger.contrib", None),
+            # Every module that publishes an ``__all__`` belongs here, not just the four
+            # wave packages: an entry with no attribute behind it is v1's exact defect,
+            # and it is no less broken for living in ``cli`` or in a contrib integration.
+            ("signledger.cli", None),
+            ("signledger.observability", None),
+            ("signledger.contrib.redaction", None),
+            # The framework integrations are optional extras, so they are checked the way
+            # the rest of this suite checks an extra: skipped when it is not installed.
+            ("signledger.contrib.flask", "flask"),
+            ("signledger.contrib.fastapi", "fastapi"),
+            ("signledger.contrib.django", "django"),
         ],
     )
-    def test_every_name_the_subpackage_advertises_exists(self, module: str) -> None:
+    def test_every_name_the_subpackage_advertises_exists(
+        self, module: str, requires: Optional[str]
+    ) -> None:
+        if requires is not None:
+            pytest.importorskip(requires, reason=f"{requires} is not installed")
         imported = importlib.import_module(module)
         missing = [name for name in imported.__all__ if not hasattr(imported, name)]
         assert missing == []
+
+    def test_every_name_the_django_middleware_advertises_exists(self) -> None:
+        """The middleware is the one module that cannot be imported bare.
+
+        It reaches the ORM, so Django has to be configured before the import runs -
+        and ``settings.configure`` is global and one-shot per process, owned here by
+        ``tests/test_contrib_django.py``. A subprocess gets the module imported for
+        real without taking that global away from the file that needs it.
+        """
+        import subprocess
+        import sys
+
+        pytest.importorskip("django", reason="django is not installed")
+        result = subprocess.run(
+            [sys.executable, "-c", _DJANGO_MIDDLEWARE_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+        assert result.stdout.strip().endswith("OK")
 
     def test_the_crypto_package_still_imports_without_cryptography(self) -> None:
         """``signledger.crypto`` must re-export the signature surface *lazily*.

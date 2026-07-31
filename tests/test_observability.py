@@ -1,6 +1,7 @@
 """Tests for ``signledger.observability``."""
 
 import contextlib
+import dataclasses
 import json
 import logging
 import subprocess
@@ -162,6 +163,19 @@ def test_ledger_health_measures_a_live_ledger_including_its_capabilities() -> No
     assert health.ok is True
     assert health.ledger_id == ledger.ledger_id
     assert health.capabilities == ("atomic_append", "unique_chain_link")
+
+
+def test_a_health_record_cannot_be_rewritten_after_it_is_made() -> None:
+    """A health record is evidence, and evidence that a caller can edit is not evidence.
+
+    Nothing else pins the frozen-ness: every other test only ever reads the fields, so the
+    record could quietly become mutable and a dashboard, a pager or a caller holding a
+    reference could flip ``ok`` on a ledger that failed verification.
+    """
+    health = LedgerHealth(ledger_id="ledger-a", ok=False, assurance="chain_only")
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        health.ok = True  # type: ignore[misc]
 
 
 # ======================================================================================
@@ -495,6 +509,27 @@ def test_an_observer_finds_the_opentelemetry_tracer_when_it_is_installed() -> No
     tracer = StubTracer()
 
     with stub_opentelemetry(tracer=tracer, meter=StubMeter()):
+        observer = LedgerObserver()
+
+    assert observer.otel_enabled is True
+
+
+def test_otel_is_enabled_when_only_a_tracer_resolved() -> None:
+    """The mixed case: tracing wired up, metrics not.
+
+    Only "neither resolved" and "both resolved" were ever asserted, and those two agree
+    however the two halves are combined. A deployment that ships spans but no meter is a
+    perfectly ordinary one, and it is instrumented.
+    """
+    with stub_opentelemetry(tracer=StubTracer(), meter=None):
+        observer = LedgerObserver()
+
+    assert observer.otel_enabled is True
+
+
+def test_otel_is_enabled_when_only_a_meter_resolved() -> None:
+    """The other mixed case: metrics wired up, tracing not."""
+    with stub_opentelemetry(tracer=None, meter=StubMeter()):
         observer = LedgerObserver()
 
     assert observer.otel_enabled is True

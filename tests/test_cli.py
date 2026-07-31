@@ -33,6 +33,7 @@ from signledger.cli import (
     EXIT_INVALID,
     EXIT_OK,
     MIGRATION_FORMAT,
+    _is_windows_drive,
     _sqlite_path,
     build_parser,
     find_forks,
@@ -164,6 +165,24 @@ def test_a_sqlite_uri_with_a_drive_letter_authority_names_a_file_on_that_drive()
     assert _sqlite_path("sqlite://" + WINDOWS_TMP_DB) == WINDOWS_TMP_DB
     assert _sqlite_path("sqlite://C:/Users/me/audit.db") == "C:/Users/me/audit.db"
     assert _sqlite_path("sqlite://d:/data/audit.db") == "d:/data/audit.db"
+
+
+def test_a_drive_designator_is_recognised_by_the_letter_not_by_the_colon() -> None:
+    """The guard is ASCII-only on purpose, and nothing checked that it was.
+
+    ``str.isalpha`` is true of every Unicode letter, and a drive is one of twenty-six.
+    ``\u03a9`` is a letter, so with the ASCII test applied to the wrong character - the
+    ``:``, which is ASCII in every URI ever written - the check passes for anything that
+    is a letter at all, and the guard admits drive omega.
+    """
+    assert _is_windows_drive("C:/x") is True
+    assert _is_windows_drive("d:\\x") is True
+    assert _is_windows_drive("\u03a9:/x") is False
+    # And through the parser, where getting it wrong opens a file: an authority that is
+    # not a drive is a host, and a host is refused rather than guessed at.
+    assert _sqlite_path("sqlite://C:/audit.db") == "C:/audit.db"
+    with pytest.raises(ConfigurationError, match="host"):
+        _sqlite_path("sqlite://\u03a9:/audit.db")
 
 
 def test_a_sqlite_uri_with_a_drive_letter_and_one_colon_names_the_same_file() -> None:

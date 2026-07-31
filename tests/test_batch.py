@@ -519,6 +519,73 @@ def test_a_batch_produces_entries_indistinguishable_from_single_appends() -> Non
     assert ledger.check_integrity().ok
 
 
+def test_the_batch_path_and_the_append_path_agree_on_the_signature_fields() -> None:
+    """The signing identity is inside the preimage, and both writers must put it there.
+
+    ``Ledger.append`` and ``BatchProcessor`` build their own ``Entry`` each, and each
+    stamps ``key_id`` and ``signature_algorithm`` from the signer. Dropping either from
+    one of the two still yields a chain that verifies perfectly: the digest is recomputed
+    over whatever was actually written, so verification cannot see the difference. Only
+    holding the two paths against each other can - so the same signer writes through
+    both, and the entries are compared field by field.
+    """
+    signer = Ed25519Signer.generate()
+    ledger = Ledger(MemoryBackend(), enable_signatures=True, signer=signer)
+
+    direct = ledger.append({"n": 1})
+    batched = BatchProcessor(ledger).append_batch([{"n": 2}]).entries[0]
+
+    assert direct.signature_algorithm == signer.algorithm
+    assert direct.key_id == signer.key_id
+    assert batched.signature_algorithm == direct.signature_algorithm
+    assert batched.key_id == direct.key_id
+    # And as stored, not merely as returned.
+    stored = list(ledger.iter_entries())
+    assert [e.signature_algorithm for e in stored] == [signer.algorithm] * 2
+    assert [e.key_id for e in stored] == [signer.key_id] * 2
+    assert ledger.check_integrity().ok
+
+
+@pytest.mark.parametrize(
+    "batch_first", [True, False], ids=["batch-writes-genesis", "append-writes-genesis"]
+)
+@pytest.mark.parametrize(("algorithm", "digest_length"), [("sha256", 64), ("sha512", 128)])
+def test_a_ledger_on_a_non_default_algorithm_writes_checkpoints_and_verifies(
+    algorithm: str, digest_length: int, batch_first: bool
+) -> None:
+    """Every ``algorithm=`` handed down the write path, exercised off the default.
+
+    Nothing in this suite ever built a ``Ledger`` on anything but sha256, so a hop that
+    quietly dropped the keyword - the genesis anchor, the entry digest, the Merkle tree
+    the checkpoint publishes - fell back to the default on *both* sides of every
+    comparison, and the chain still verified against itself.
+
+    Digest *length* is what makes the fallback visible: sha256 and sha512 disagree about
+    it, so a component still hashing with the default is measurable rather than merely
+    self-consistent.
+
+    The genesis anchor is derived by whichever writer lands the first entry, so both
+    orderings are run: ``append`` and the batch each own their own copy of that line.
+    """
+    ledger = Ledger(MemoryBackend(), hash_algorithm=algorithm)
+    if batch_first:
+        BatchProcessor(ledger).append_batch([{"n": 0}, {"n": 1}, {"n": 2}])
+        ledger.append({"n": 3})
+    else:
+        ledger.append({"n": 0})
+        BatchProcessor(ledger).append_batch([{"n": 1}, {"n": 2}, {"n": 3}])
+
+    checkpoint = ledger.checkpoint()
+
+    entries = list(ledger.iter_entries())
+    assert [len(e.hash) for e in entries] == [digest_length] * 4
+    # Entry 0's is the genesis anchor; the rest are the digest of the entry before.
+    assert [len(e.previous_hash) for e in entries] == [digest_length] * 4
+    assert len(checkpoint.head_hash) == digest_length
+    assert len(checkpoint.merkle_root) == digest_length
+    assert ledger.check_integrity().ok
+
+
 def test_an_item_with_a_naive_timestamp_is_refused() -> None:
     ledger = Ledger(MemoryBackend())
 

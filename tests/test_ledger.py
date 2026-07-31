@@ -375,6 +375,25 @@ def test_verify_integrity_raises_for_a_damaged_ledger(ledger):
         ledger.verify_integrity()
 
 
+def test_verify_integrity_verifies_only_the_window_it_was_asked_for(ledger):
+    """``from_sequence`` has to reach ``check_integrity``, or the answer is about a
+    different chain than the one the caller asked about.
+
+    Dropping it silently widens the scope. Here that turns a genuine ``True`` for
+    sequences 1.. into a raise about damage the caller deliberately excluded - and the
+    same defect, on a ledger whose damage sits *inside* the window, is a false ``True``.
+    """
+    from signledger.core.exceptions import IntegrityError
+
+    appended = ledger.append({"n": 0})
+    ledger.append({"n": 1})
+    ledger.backend._entries[0] = appended.model_copy(update={"data": {"n": "forged"}})
+
+    assert ledger.verify_integrity(from_sequence=1) is True
+    with pytest.raises(IntegrityError):
+        ledger.verify_integrity()
+
+
 def test_verify_integrity_raises_on_an_empty_ledger(ledger):
     from signledger.core.exceptions import IntegrityError
 
@@ -540,11 +559,49 @@ def test_a_ledger_with_caching_off_still_reads_from_the_store():
 
 
 def test_the_cache_honours_a_byte_budget():
+    """The budget is a measured bound, not a decoration.
+
+    ``len(_cache) < 20`` was the old assertion, and a cache that had thrown *everything*
+    away satisfied it just as well as one that was accounting correctly. So the running
+    total is compared against what the cache is actually holding, and the cache is
+    required to still be holding something.
+    """
+    from signledger.core.ledger import _entry_bytes
+
     instance = Ledger(max_cache_entries=1000, max_cache_bytes=400)
     try:
         for index in range(20):
             instance.append({"n": index, "filler": "x" * 100})
-        assert len(instance._cache) < 20
+        held = sum(_entry_bytes(entry) for entry in instance._cache.values())
+        assert instance._cache_bytes == held
+        assert 0 < instance._cache_bytes <= 400
+        assert 0 < len(instance._cache) <= 3
+    finally:
+        instance.close()
+
+
+def test_an_entry_exactly_on_the_byte_budget_is_kept():
+    """The budget is a ceiling the cache may sit on, not one it has to stay under.
+
+    Every field in the measurement is fixed-width - two uuid4s, two hex digests and a
+    canonical payload - so one entry costs the same on any ledger, and the boundary can
+    be landed on exactly rather than approached.
+    """
+    from signledger.core.ledger import _entry_bytes
+
+    payload = {"n": 0, "filler": "x" * 100}
+    measuring = Ledger()
+    try:
+        exactly_one_entry = _entry_bytes(measuring.append(payload))
+    finally:
+        measuring.close()
+
+    instance = Ledger(max_cache_bytes=exactly_one_entry)
+    try:
+        instance.append(payload)
+
+        assert instance._cache_bytes == exactly_one_entry
+        assert len(instance._cache) == 1
     finally:
         instance.close()
 
@@ -1040,6 +1097,61 @@ def test_a_handler_that_raises_does_not_kill_the_verifier():
         appended = instance.append({"n": 0})
         instance.backend._entries[0] = appended.model_copy(update={"data": {"n": "forged"}})
         assert seen_twice.wait(timeout=10)
+    finally:
+        instance.close()
+
+
+def test_the_verifier_keeps_watching_after_a_clean_pass():
+    """One clean pass is not the end of the job.
+
+    ``test_auto_verify_reports_a_break_to_the_handler`` forges before the first pass has
+    finished, so a verifier that stopped the moment it saw a healthy chain still passed
+    it. Here the clean pass is forced to complete *first*, and the forgery comes after -
+    which is the whole life of a real deployment, where the ledger is healthy for months
+    before it is not.
+    """
+    import threading
+    import time
+
+    called = threading.Event()
+    instance = Ledger(
+        auto_verify=True, on_integrity_failure=lambda report: called.set(), verify_interval=0.01
+    )
+    try:
+        appended = instance.append({"n": 0})
+
+        # Wait for a pass that actually reported ok. Sleeping a fixed interval would make
+        # this a race rather than a proof.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            recorded = instance._last_report
+            if recorded is not None and recorded.ok:
+                break
+            time.sleep(0.01)
+        recorded = instance._last_report
+        assert recorded is not None and recorded.ok, "no clean pass ever completed"
+
+        instance.backend._entries[0] = appended.model_copy(update={"data": {"n": "forged"}})
+
+        assert called.wait(timeout=10), "the verifier stopped watching after its first clean pass"
+    finally:
+        instance.close()
+
+
+def test_both_background_threads_are_daemons():
+    """A non-daemon worker keeps the interpreter alive after the last line of a program.
+
+    That turns "the ledger was not closed" into a process that never exits, and a hang is
+    not a test result - it is a CI job that has to be killed by hand.
+    """
+    instance = Ledger(
+        auto_verify=True, on_integrity_failure=lambda report: None, verify_interval=0.01
+    )
+    try:
+        instance.subscribe(lambda entry: None)
+
+        assert instance._notifier.daemon is True
+        assert instance._verifier.daemon is True
     finally:
         instance.close()
 

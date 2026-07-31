@@ -129,6 +129,34 @@ def test_checkpoints_for_other_ledgers_are_ignored(sink):
     assert sink.fetch_latest("ledger-a").sequence == 3
 
 
+def test_another_ledgers_record_does_not_end_the_scan(sink):
+    """The foreign record goes in the MIDDLE.
+
+    With it last, skipping it and stopping at it are indistinguishable, so the scan could
+    be turned into "stop at the first record for another ledger" with the suite still
+    green - and every checkpoint published after it would become invisible. An anchor that
+    silently reports an older head is exactly how a truncated tail goes unnoticed.
+    """
+    sink.publish(make_checkpoint(3, ledger_id="ledger-a"))
+    sink.publish(make_checkpoint(99, ledger_id="ledger-b"))
+    sink.publish(make_checkpoint(7, ledger_id="ledger-a"))
+
+    assert sink.fetch_latest("ledger-a").sequence == 7
+
+
+def test_the_first_record_at_a_sequence_wins_over_a_later_forgery(sink):
+    """Ties go to the record that was published first.
+
+    Last-writer-wins would let anyone who can append to the anchor file override a head
+    that is already published, simply by re-stating its sequence with a different hash -
+    which is the one thing an append-only anchor exists to prevent.
+    """
+    sink.publish(make_checkpoint(5, head_hash="a" * 64))
+    sink.publish(make_checkpoint(5, head_hash="f" * 64))
+
+    assert sink.fetch_latest("ledger-a").head_hash == "a" * 64
+
+
 def test_publishing_appends_rather_than_replacing(sink, anchor_path):
     """An anchor file that can be rewritten is not an anchor."""
     for sequence in (1, 2, 3):
@@ -220,6 +248,21 @@ def test_blank_lines_are_tolerated(sink, anchor_path):
         handle.write("\n\n")
 
     assert sink.fetch_latest("ledger-a").sequence == 3
+
+
+def test_a_blank_line_does_not_end_the_scan(sink, anchor_path):
+    """Tolerating a trailing blank line is not the same as scanning past one.
+
+    The test above only ever puts the blank line last, where skipping it and stopping at
+    it look identical. Here a real checkpoint follows it, so a scan that gives up on the
+    first blank line hands back the older head instead of the newest one.
+    """
+    sink.publish(make_checkpoint(3))
+    with open(anchor_path, "a", encoding="utf-8") as handle:
+        handle.write("\n")
+    sink.publish(make_checkpoint(7))
+
+    assert sink.fetch_latest("ledger-a").sequence == 7
 
 
 def test_publishing_into_a_directory_that_does_not_exist_raises_anchor_error(tmp_path):

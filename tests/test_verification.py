@@ -306,6 +306,26 @@ def test_an_entry_in_an_unknown_format_is_not_also_reported_as_a_bad_hash(
     assert FailureKind.BAD_HASH not in kinds(report)
 
 
+def test_a_later_forgery_is_still_reported_after_an_unsupported_format(
+    store, sample_entries, chain, genesis
+):
+    """An entry this build cannot hash ends *that* entry's checks, not the whole run.
+
+    Abandoning the loop at the first unsupported format would leave every entry after it
+    unexamined while the report still says how many entries it verified - a forgery
+    hidden behind a single unreadable row, which is a cheap thing for an adversary to
+    plant.
+    """
+    sample_entries(store, 3)
+    replace_stored(store, 0, format_version=99)
+    replace_stored(store, 2, data={"event": "forged"})
+
+    report = verify_chain(store, chain=chain, genesis=genesis)
+
+    assert kinds(report) == [FailureKind.FORMAT_UNSUPPORTED, FailureKind.BAD_HASH]
+    assert report.entries_verified == 3
+
+
 def test_a_non_ascii_hash_makes_verification_answer_no_rather_than_raise(
     store, sample_entries, chain, genesis
 ):

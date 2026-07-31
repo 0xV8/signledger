@@ -15,7 +15,7 @@ import os
 import socket
 import time
 import uuid
-from typing import Iterator
+from typing import Any, Iterator
 
 import pytest
 
@@ -31,6 +31,10 @@ from signledger.contrib.redaction import (
     MAX_REDACTION_DEPTH,
     OVERSIZED,
     REDACTED,
+    SENSITIVE_COMPOUNDS,
+    SENSITIVE_FIELDS,
+    SENSITIVE_SUBSTRINGS,
+    SENSITIVE_WORDS,
     TRUNCATED,
     UNENCODABLE,
     UNPARSEABLE,
@@ -103,6 +107,39 @@ def test_a_deeply_nested_hostile_payload_does_not_raise_recursionerror() -> None
     for _ in range(20_000):
         payload = {"n": payload}
     redact_payload(payload)
+
+
+def test_a_list_nested_past_the_depth_limit_is_truncated_not_recursed() -> None:
+    """The list branch is bounded by the same counter the dict branch is.
+
+    Nesting is not a dict-only shape: ``[[[[...]]]]`` is valid JSON and arrives from the
+    same client-written body. A depth counter that only advances through mappings reads
+    as a bound while imposing none, so the list branch gets its own proof.
+
+    ``redact_payload`` is entered on the wrapping dict, which spends depth 0, so the list
+    at the top of ``root`` is already at depth 1 and one fewer step is needed to reach the
+    marker than in the dict case above.
+    """
+    payload: Any = {"leaf": 1}
+    for _ in range(MAX_REDACTION_DEPTH + 5):
+        payload = [payload]
+
+    result = redact_payload({"root": payload})["root"]
+    for _ in range(MAX_REDACTION_DEPTH - 1):
+        result = result[0]
+    assert result == TRUNCATED
+
+
+def test_a_deeply_nested_hostile_list_does_not_raise_recursionerror() -> None:
+    """20,000 nested lists cost a CPython stack, not an interpreter one.
+
+    The dict version of this test is the one that has always been here; a body made of
+    lists is the cheaper attack to write and has to be just as harmless.
+    """
+    payload: Any = {"leaf": 1}
+    for _ in range(20_000):
+        payload = [payload]
+    redact_payload({"root": payload})
 
 
 def test_a_non_finite_float_becomes_a_string_the_ledger_can_store() -> None:
@@ -226,6 +263,21 @@ def test_a_body_longer_than_the_limit_is_refused_even_if_content_length_lied() -
     """Content-Length is a claim by the client, not a fact."""
     policy = RedactionPolicy(capture_body=True, max_body_bytes=10)
     assert policy.decode_body(b'{"a": "0123456789012345"}') == OVERSIZED
+
+
+def test_a_body_exactly_on_the_limit_is_decoded_not_marked_oversized() -> None:
+    """``decode_body`` re-checks the same limit ``body_decision`` applied, inclusively.
+
+    ``body_decision`` admits a body of exactly ``max_body_bytes``; if the second check
+    were the stricter one, every request that sat precisely on a deployment's configured
+    ceiling would be admitted and then thrown away as ``[OVERSIZED]``. Two checks against
+    one limit have to agree on the limit.
+    """
+    policy = RedactionPolicy(capture_body=True, max_body_bytes=13)
+    raw = b'{"a": "0123"}'
+    assert len(raw) == policy.max_body_bytes
+    assert policy.body_decision(content_length=len(raw), content_type="application/json").capture
+    assert policy.decode_body(raw) == {"a": "0123"}
 
 
 def test_a_body_capture_limit_below_one_byte_is_rejected() -> None:
@@ -570,6 +622,31 @@ def test_an_ordinary_query_parameter_is_kept() -> None:
 def test_query_parameter_names_keep_their_case() -> None:
     """Unlike headers, query parameters are case-sensitive and ``?Page`` is not ``?page``."""
     assert "Page" in RedactionPolicy().query({"Page": ["2"]})
+
+
+# ======================================================================================
+# The published policy set
+# ======================================================================================
+
+
+def test_the_published_policy_set_is_the_union_of_the_three_styles() -> None:
+    """``SENSITIVE_FIELDS`` is what a deployment prints to read the policy it is under.
+
+    It is documentation of the three matching sets, so it has to be their *union*: any
+    other combining operator still yields a frozenset, still imports, still type-checks,
+    and quietly publishes a policy the matcher is not running. The intersection of the
+    three is empty - a printed policy of nothing at all, next to a matcher that redacts
+    53 stems.
+
+    The count is asserted alongside the union because the union alone is satisfied by
+    three empty sets, and because shrinking the published policy should be a deliberate,
+    visible edit rather than a silent one.
+    """
+    assert SENSITIVE_FIELDS == SENSITIVE_SUBSTRINGS | SENSITIVE_COMPOUNDS | SENSITIVE_WORDS
+    assert len(SENSITIVE_FIELDS) == 53
+    assert SENSITIVE_SUBSTRINGS <= SENSITIVE_FIELDS
+    assert SENSITIVE_COMPOUNDS <= SENSITIVE_FIELDS
+    assert SENSITIVE_WORDS <= SENSITIVE_FIELDS
 
 
 # ======================================================================================
