@@ -310,6 +310,37 @@ class TestAppendOnlyEnforcement:
 
         assert CAP_DURABLE_FSYNC not in pg_backend.capabilities()
 
+    def test_the_two_settings_are_returned_in_the_order_the_caller_reads_them(
+        self, pg_backend
+    ) -> None:
+        """``_fsync_settings`` returns ``(fsync, synchronous_commit)`` - in that order.
+
+        Nothing observed the order. Both negative tests above monkeypatch the method
+        itself, so its body never runs, and the positive one asks a server where
+        ``fsync`` and ``synchronous_commit`` are both ``on`` - where a swap is invisible.
+        A mutation sweep found the swap surviving the whole suite: with the two values
+        exchanged, ``capabilities()`` reports ``durable_fsync`` on a server whose
+        ``fsync`` is off, which is the backend claiming a durability the disk never gave.
+
+        ``synchronous_commit`` is settable per session, so the two can be made to differ
+        and the order becomes observable. ``fsync`` needs a server restart, hence this
+        direction rather than the other.
+        """
+        with pg_backend._borrow() as connection:
+            with connection.cursor() as cur:
+                cur.execute("SET LOCAL synchronous_commit = off")
+                # Read each setting by name, so the expectation comes from the server
+                # rather than from an assumption about how it was configured.
+                cur.execute("SELECT current_setting('fsync')")
+                expected_fsync = str(cur.fetchone()[0])
+                cur.execute("SELECT current_setting('synchronous_commit')")
+                expected_commit = str(cur.fetchone()[0])
+
+                returned = pg_backend._fsync_settings(cur)
+
+        assert expected_commit == "off", "the session setting did not take"
+        assert returned == (expected_fsync, expected_commit)
+
 
 # --------------------------------------------------------------------------------------
 # timestamps

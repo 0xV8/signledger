@@ -220,10 +220,17 @@ ignore = [
 "tests/*" = ["S", "N806"]
 
 [tool.mutmut]
-# Renamed in mutmut 3.x; the old `paths_to_mutate` spelling emits a UserWarning on every
-# invocation, and this project runs with filterwarnings = ["error"].
-source_paths = "signledger/"
-tests_dir = "tests/"
+# LISTS, not strings. mutmut 3.x concatenates these onto its own argument lists, so a
+# bare string raises `TypeError: can only concatenate list (not "str") to list` while the
+# config is still loading - before a single mutant is generated. `mutmut run` therefore
+# could not start on this repository at all, and the CI job reported success anyway
+# because it ended in `|| true`. A green check over a command that never ran is the exact
+# failure this project was rebuilt to remove.
+#
+# `tests_dir` is itself deprecated in 3.x and warns; the selection now goes where mutmut
+# asks for it.
+source_paths = ["signledger/"]
+pytest_add_cli_args_test_selection = ["tests/"]
 
 [tool.bandit]
 # Run as: bandit -c pyproject.toml -r signledger

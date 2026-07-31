@@ -347,20 +347,40 @@ class TestSQLiteConnections:
             backend.close()
 
     def test_each_thread_gets_its_own_connection(self, tmp_path):
+        """All four threads must be alive at once, or the count is a coin toss.
+
+        The registry is keyed by ``threading.get_ident()``, and CPython recycles an ident
+        as soon as its thread has finished. Starting three short-lived workers and
+        counting afterwards therefore depends on none of them exiting before the next
+        starts: measured 11 failures in 40 runs, asserting 3 == 4 or 2 == 4.
+
+        A flaky test is worse than no test, and this one was worse still - it sat in the
+        kill set of a mutation sweep, where a random failure scores a surviving mutant as
+        killed and hides it.
+
+        The barrier makes the overlap a fact rather than a hope: every worker opens its
+        connection, then waits until all of them have.
+        """
         backend = SQLiteBackend(str(tmp_path / "registry.db"))
+        opened = threading.Barrier(4, timeout=30)
         try:
             backend.count()
 
             def worker():
                 backend.count()
+                opened.wait()
 
             threads = [threading.Thread(target=worker) for _ in range(3)]
             for thread in threads:
                 thread.start()
-            for thread in threads:
-                thread.join()
 
+            # The main thread is the fourth party: nobody proceeds until all four
+            # connections exist, so no ident can be recycled before the assertion.
+            opened.wait()
             assert len(backend._connections) == 4
+
+            for thread in threads:
+                thread.join(30)
         finally:
             backend.close()
 

@@ -503,10 +503,26 @@ jobs:
           cache-dependency-path: pyproject.toml
       - run: pip install -e '.[all,test,dev]'
       - name: Run mutation testing
-        run: mutmut run --no-progress || true
+        # No `|| true`, and no `--no-progress` - that flag does not exist in mutmut 3.x,
+        # so the command failed on the flag alone and the `|| true` swallowed it. Both
+        # together meant this job passed without generating a mutant. mutmut exits
+        # non-zero when mutants survive, which is information rather than an error here,
+        # so the survivor count is the gate and a crash still fails the step.
+        run: |
+          set -o pipefail
+          mutmut run || rc=$?
+          if [ "${rc:-0}" -gt 1 ]; then
+            echo "::error::mutmut did not run - exit ${rc}"
+            exit 1
+          fi
       - name: Report
         run: |
+          set -o pipefail
           mutmut results | tee mutmut.txt
+          if [ ! -s mutmut.txt ]; then
+            echo "::error::mutmut produced no results - the sweep did not happen"
+            exit 1
+          fi
           {
             echo "### Mutation results"
             echo '```'
