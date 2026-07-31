@@ -99,6 +99,7 @@ from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, Optional,
 
 from flask import Blueprint, Flask, Response, g, jsonify, request
 
+from signledger import contrib as _shared
 from signledger.contrib import (
     FAIL_CLOSED,
     AuditRecorder,
@@ -122,16 +123,16 @@ __all__ = [
 INTEGRATION = "flask"
 
 #: ``kind`` of the entry written for one request.
-KIND_REQUEST = "request"
+KIND_REQUEST = _shared.KIND_REQUEST
 
 #: ``kind`` of the entry that settles a provisional one.
-KIND_COMPLETION = "response.completion"
+KIND_COMPLETION = _shared.KIND_COMPLETION
 
 #: The response was complete when its entry was written.
-COMPLETION_FINAL = "final"
+COMPLETION_FINAL = _shared.COMPLETION_FINAL
 
 #: The status was recorded before the body existed; a settlement entry follows.
-COMPLETION_PROVISIONAL = "provisional"
+COMPLETION_PROVISIONAL = _shared.COMPLETION_PROVISIONAL
 
 #: Key under which the extension registers itself in ``app.extensions``.
 EXTENSION_KEY = "signledger"
@@ -243,12 +244,13 @@ class SignLedgerAudit:
             body=getattr(g, _BODY_KEY, None),
             body_reason=getattr(g, _REASON_KEY, "disabled"),
             user=self._user(),
+            kind=KIND_REQUEST,
+            request_id=context["request_id"],
+            # Says whether the status above is a fact or a promise. Never absent: an
+            # auditor must not have to know which version of this extension - or which
+            # framework - wrote the entry, which is why the builder owns the default.
+            completion=COMPLETION_PROVISIONAL if streamed else COMPLETION_FINAL,
         )
-        record["kind"] = KIND_REQUEST
-        record["request_id"] = context["request_id"]
-        # Says whether the status above is a fact or a promise. Never absent: an auditor
-        # must not have to know which version of this extension wrote the entry.
-        record["completion"] = COMPLETION_PROVISIONAL if streamed else COMPLETION_FINAL
         # Raises AuditWriteError under fail_closed, which Flask turns into a 500. An
         # unaudited request must not be able to answer 200.
         self.recorder.record(record, {"integration": INTEGRATION})

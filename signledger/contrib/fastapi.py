@@ -150,6 +150,7 @@ from urllib.parse import parse_qs
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
 
+from signledger import contrib as _shared
 from signledger.contrib import (
     FAIL_CLOSED,
     AuditRecorder,
@@ -175,19 +176,19 @@ __all__ = [
 INTEGRATION = "fastapi"
 
 #: ``kind`` of the entry the middleware writes for one request.
-KIND_REQUEST = "request"
+KIND_REQUEST = _shared.KIND_REQUEST
 
 #: ``kind`` of the entry :func:`audited` writes for one decorated call.
 KIND_ENDPOINT = "endpoint"
 
 #: ``kind`` of the entry that settles a provisional one.
-KIND_COMPLETION = "response.completion"
+KIND_COMPLETION = _shared.KIND_COMPLETION
 
 #: The response was complete when its entry was written.
-COMPLETION_FINAL = "final"
+COMPLETION_FINAL = _shared.COMPLETION_FINAL
 
 #: The status was promised before the body existed; a settlement entry follows.
-COMPLETION_PROVISIONAL = "provisional"
+COMPLETION_PROVISIONAL = _shared.COMPLETION_PROVISIONAL
 
 #: Default ceiling on how many entries one inspection request may return.
 DEFAULT_MAX_PAGE_SIZE = 100
@@ -368,12 +369,13 @@ class SignLedgerAuditMiddleware:
             body_reason=reason,
             user=self._user(scope),
             error=error,
+            kind=KIND_REQUEST,
+            request_id=context["request_id"],
+            # Says whether the status above is a fact or a promise. Never absent: an
+            # auditor must not have to know which version of this middleware - or which
+            # framework - wrote the entry, which is why the builder owns the default.
+            completion=COMPLETION_PROVISIONAL if provisional else COMPLETION_FINAL,
         )
-        record["kind"] = KIND_REQUEST
-        record["request_id"] = context["request_id"]
-        # Says whether the status above is a fact or a promise. Never absent: an auditor
-        # must not have to know which version of this middleware wrote the entry.
-        record["completion"] = COMPLETION_PROVISIONAL if provisional else COMPLETION_FINAL
         # The append is synchronous and may fsync. Off the event loop it goes.
         await run_in_threadpool(self.recorder.record, record, {"integration": INTEGRATION})
 

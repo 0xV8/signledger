@@ -14,13 +14,28 @@ headers and whole request bodies into an immutable store. Both failures share on
 nothing was executed by a test - which is why every line below is reached by one.
 """
 
+import uuid
 from typing import Any, Dict, Mapping, Optional
 
 from signledger.contrib.redaction import RedactionPolicy, redact_payload
 from signledger.core.exceptions import ConfigurationError, SignLedgerError
 
+#: What an entry describes. ``request`` is the record of one request; a settlement entry
+#: written when a streamed body finishes carries ``response.completion``.
+KIND_REQUEST = "request"
+KIND_COMPLETION = "response.completion"
+
+#: Whether ``status`` is a fact or a promise. A streamed response is audited at its status
+#: line, before the body exists, so its first entry is provisional.
+COMPLETION_FINAL = "final"
+COMPLETION_PROVISIONAL = "provisional"
+
 __all__ = [
     "AUDIT_FAILURE_POLICIES",
+    "COMPLETION_FINAL",
+    "COMPLETION_PROVISIONAL",
+    "KIND_COMPLETION",
+    "KIND_REQUEST",
     "FAIL_CLOSED",
     "FAIL_OPEN",
     "AuditRecorder",
@@ -120,6 +135,9 @@ def build_audit_record(
     body_reason: str = "disabled",
     user: Optional[str] = None,
     error: Optional[str] = None,
+    kind: str = KIND_REQUEST,
+    request_id: Optional[str] = None,
+    completion: str = COMPLETION_FINAL,
 ) -> Dict[str, Any]:
     """Assemble the audit payload every integration writes.
 
@@ -154,6 +172,15 @@ def build_audit_record(
         # absent field would be indistinguishable from a middleware nobody installed.
         "body": body if body_reason == "captured" else f"[OMITTED:{body_reason}]",
         "user": None if user is None else redact_payload(user),
+        # These three used to be stamped on by the Flask and FastAPI middlewares *after*
+        # this function returned, and the Django one did not stamp them at all - so an
+        # auditor querying on `kind` saw every Flask and FastAPI request and no Django
+        # one, against the promise three paragraphs up. Two of three call sites adding
+        # the same fields is exactly the divergence a shared builder exists to prevent,
+        # so they live here now and no integration can forget them.
+        "kind": kind,
+        "request_id": uuid.uuid4().hex if request_id is None else request_id,
+        "completion": completion,
     }
     if error is not None:
         # Present only when there was one. A field that is always there and always null
