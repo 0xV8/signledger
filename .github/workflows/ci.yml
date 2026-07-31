@@ -7,6 +7,11 @@ on:
     branches: [main, "rebuild/**"]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # The mutation sweep only. A full run is ~9,600 mutants, each needing its own test
+    # run, so it is hours of work and cannot sit in a per-push job. Nightly is where it
+    # belongs; the per-push jobs stay fast enough to be read.
+    - cron: "0 3 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -492,8 +497,16 @@ jobs:
   mutation:
     name: mutmut
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    timeout-minutes: 120
+    # Scheduled and on-demand, not per-push. A sweep of ~9,600 mutants runs the test
+    # selection once per mutant; it is hours, not minutes, and a job that cannot finish
+    # inside its timeout reports failure for the wrong reason.
+    #
+    # It ran per-push for eight runs and reported success every time while executing
+    # nothing at all - `mutmut run` could not even load its config. The guard below now
+    # requires actual verdicts, so this job can no longer be green over nothing; making
+    # it nightly is what lets it be green over something.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 340
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -519,8 +532,17 @@ jobs:
         run: |
           set -o pipefail
           mutmut results | tee mutmut.txt
-          if [ ! -s mutmut.txt ]; then
-            echo "::error::mutmut produced no results - the sweep did not happen"
+
+          # A non-empty file is NOT evidence that anything ran. The previous version of
+          # this guard checked only `-s`, and passed on a 40 KB report in which every
+          # single line read "not checked" - mutmut had generated mutants, failed its
+          # own clean baseline, and refused to execute any of them. That is the same
+          # green-over-nothing this job was already caught doing once.
+          checked=$(grep -cvE 'not checked' mutmut.txt || true)
+          notchecked=$(grep -cE 'not checked' mutmut.txt || true)
+          echo "mutants with a verdict: ${checked}; not checked: ${notchecked}"
+          if [ "${checked}" -lt 100 ]; then
+            echo "::error::only ${checked} mutants were actually checked - the sweep did not run"
             exit 1
           fi
           {

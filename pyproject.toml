@@ -230,7 +230,23 @@ ignore = [
 # `tests_dir` is itself deprecated in 3.x and warns; the selection now goes where mutmut
 # asks for it.
 source_paths = ["signledger/"]
-pytest_add_cli_args_test_selection = ["tests/"]
+pytest_add_cli_args_test_selection = [
+    "tests/",
+    # Artifact tests, not behaviour tests. They build a wheel and an sdist, so they run
+    # against the *installed* package rather than the mutated copy - a mutant could never
+    # be detected by them - and they cannot build from mutmut's `mutants/` tree at all.
+    "--ignore=tests/test_packaging.py",
+    # Two tests chdir into a tmp_path, which is essential to what they check (that a
+    # relative `sqlite:` URI resolves against the working directory). mutmut cannot
+    # tolerate it: __main__.py:120 does `p.resolve(strict=True)` on the *relative*
+    # source_paths at every trampoline hit, so once the CWD moves it raises
+    # FileNotFoundError: 'signledger' and the clean baseline fails - which makes mutmut
+    # refuse to check a single mutant and report all 9,595 as "not checked".
+    "--deselect",
+    "tests/test_cli.py::test_the_backend_help_only_names_sqlite_uris_the_parser_accepts",
+    "--deselect",
+    "tests/test_cli.py::test_the_schemeless_refusal_only_names_sqlite_uris_the_parser_accepts",
+]
 
 [tool.bandit]
 # Run as: bandit -c pyproject.toml -r signledger

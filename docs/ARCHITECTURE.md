@@ -353,8 +353,18 @@ failing first.**
 
 **Gates** (CI-blocking):
 - `pytest --cov=signledger --cov-branch --cov-fail-under=100`
-- `mutmut run` — mutation score reported; surviving mutants are a failure.
+- `mutmut run` — **nightly and on demand, not per-push.** A sweep is ~9,600 mutants, each
+  needing its own test run; it does not fit in a per-push job. The job fails unless real
+  verdicts come back, because it previously reported success for eight consecutive runs
+  while executing nothing: `[tool.mutmut]` declared its paths as strings, mutmut 3.x
+  concatenates them onto lists and died loading the config, and the job ended in
+  `|| true`. Surviving mutants are reported, not auto-failed — the score is read by a
+  person, since an equivalent mutant is not a defect.
   Coverage proves lines ran; **mutation proves the assertions mattered**.
+  Two exclusions, both because the test cannot see a mutant rather than because it is
+  inconvenient: `test_packaging.py` exercises the built artifact, and two `test_cli.py`
+  tests `chdir` away from the source root, which mutmut's own `resolve(strict=True)`
+  cannot survive.
 - `mypy --strict -p signledger`, `ruff check`, `bandit -r signledger`
 - Postgres/Mongo: real servers (local binaries / CI service containers), never mocks.
 

@@ -34,7 +34,27 @@ import pytest
 import signledger
 from signledger.cli import build_parser
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+
+def _repo_root() -> Path:
+    """The directory holding README.md, found by walking up from this file.
+
+    ``parent.parent`` is right for a checkout and wrong everywhere the tests are copied
+    without the docs beside them. mutmut is the case that bit: it copies source and tests
+    into ``mutants/`` and runs a clean baseline there, README.md does not come along, this
+    module read an empty string, and `assert 0 >= 10` failed the baseline - so mutmut
+    refused to check a single mutant and reported every one of them as "not checked".
+
+    Walking up finds the real README from either location and keeps the assertion honest
+    rather than skipping it.
+    """
+    here = Path(__file__).resolve()
+    for candidate in here.parents:
+        if (candidate / "README.md").is_file():
+            return candidate
+    raise RuntimeError(f"no README.md above {here}")
+
+
+REPO_ROOT = _repo_root()
 
 #: Files whose Python examples must execute.
 DOC_FILES = ["README.md", "examples/README.md"]
