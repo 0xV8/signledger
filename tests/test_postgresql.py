@@ -73,9 +73,20 @@ def pg_dsn() -> str:
     return _require_server()
 
 
+#: Every table this pytest process creates starts with this, and the sweep below drops
+#: exactly these and nothing else.
+#:
+#: The sweep used to drop every ``sl_%`` table in the database after each test, which
+#: quietly made the suite unsafe to run twice against one server: a second run - another
+#: developer, or CI sharing a database - had its tables dropped mid-test and failed
+#: somewhere unrelated. Observed while a parallel run was in progress: two round-trip
+#: tests failed that pass in isolation.
+RUN_PREFIX = f"sl_{os.getpid()}_{uuid.uuid4().hex[:8]}_"
+
+
 @pytest.fixture
 def table_prefix() -> str:
-    return "sl_" + uuid.uuid4().hex[:12]
+    return RUN_PREFIX + uuid.uuid4().hex[:8]
 
 
 def _drop_test_tables(dsn: str, prefix: str) -> None:
@@ -115,7 +126,7 @@ def pg_backend(pg_dsn: str, table_prefix: str):
 def _sweep_stray_tables(request, pg_dsn: str):
     """Tests that build their own backends still get their tables reclaimed."""
     yield
-    _drop_test_tables(pg_dsn, "sl_")
+    _drop_test_tables(pg_dsn, RUN_PREFIX)
 
 
 @pytest.fixture
@@ -562,7 +573,7 @@ class TestSchema:
     ) -> None:
         from signledger.backends.postgresql import PostgresBackend
 
-        stem = "sl_" + uuid.uuid4().hex[:12]
+        stem = RUN_PREFIX + uuid.uuid4().hex[:8]
         long_a = (stem + "a" * 60)[:60]
         long_b = (stem + "b" * 60)[:60]
         backends = []
@@ -920,7 +931,7 @@ class TestIdentifierSafety:
     def test_a_table_name_of_the_maximum_length_is_accepted(self, pg_dsn: str) -> None:
         from signledger.backends.postgresql import PostgresBackend
 
-        name = ("sl_" + uuid.uuid4().hex[:12]).ljust(60, "x")
+        name = (RUN_PREFIX + uuid.uuid4().hex[:8]).ljust(60, "x")
         backend = PostgresBackend(pg_dsn, entries_table=name, checkpoints_table=name + "_cp")
         try:
             assert backend.count() == 0
@@ -1659,7 +1670,7 @@ class TestTheGuardIsSchemaQualified:
         holding rows."""
         from signledger.backends.postgresql import PostgresBackend
 
-        entries = "sl_" + uuid.uuid4().hex[:8] + "Entries"
+        entries = RUN_PREFIX + uuid.uuid4().hex[:6] + "Entries"
         backend = PostgresBackend(
             pg_dsn, entries_table=entries, checkpoints_table=entries + "Cp"
         )
@@ -2000,7 +2011,7 @@ def _catalog(dsn: str, prefix: str) -> dict:
 @pytest.fixture
 def ro_prefix() -> str:
     """A table prefix of this section's own, swept by ``_sweep_stray_tables``."""
-    return "slro_" + uuid.uuid4().hex[:10]
+    return RUN_PREFIX + "ro" + uuid.uuid4().hex[:6]
 
 
 @pytest.fixture

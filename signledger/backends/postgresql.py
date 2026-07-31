@@ -156,10 +156,15 @@ class _ConnectionPool:
 
     **And fork-aware.** A condition variable stops two *threads* sharing a socket; it says
     nothing about two *processes*. ``gunicorn --preload`` builds the pool once and forks
-    the workers onto it, so every worker held the same descriptors and interleaved its
-    wire protocol with three siblings: measured, that was 60-second hung requests, rows
-    from one process's query arriving for another's, and a ledger holding 266 entries
-    against 139 acknowledged appends.
+    the workers onto it, and before this pool recorded its owning pid, every worker held
+    the same descriptors and interleaved its wire protocol with three siblings: 60-second
+    hung requests, rows from one process's query arriving for another's, and a ledger
+    holding 266 entries against 139 acknowledged appends.
+
+    Those figures are what this guard prevents, not what it currently does. Re-measured on
+    the fork-aware pool, three ``--preload`` runs came out clean - 300/300 at ``-w 4``,
+    300/300 at ``-w 12``, 800/800 at ``-w 4``, every chain contiguous and verifying. The
+    pid check is the reason, so it is load-bearing rather than belt-and-braces.
     """
 
     def __init__(self, dsn: str, *, minconn: int = 1, maxconn: int = 8, **kwargs: Any) -> None:

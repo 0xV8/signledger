@@ -564,7 +564,7 @@ to retire that ledger and start a new one, not to edit it.
 ## Deployment
 
 Everything below was measured, on **macOS arm64** (CPython 3.12, gunicorn 26.0.0,
-uvicorn 0.51, PostgreSQL 14). There is no Linux measurement yet, so nothing here is
+uvicorn 0.52, PostgreSQL 14). There is no Linux measurement yet, so nothing here is
 claimed for Linux. Topologies that are not in the table were not tested.
 
 ### Every worker must be given the same `ledger_id`
@@ -598,10 +598,14 @@ Deploy the same way: create the ledger once, then start the workers.
 
 A PostgreSQL connection is not usable from more than one process. Under
 `gunicorn --preload` a module-level backend is created in the master and inherited by
-every child, which puts several processes on one socket. That configuration was measured
-and did not come out clean: failed appends and read timeouts, 139 of 300 requests served.
-The requirement holds whatever the backend does internally, because it is a property of
-`fork()` rather than of any pooling:
+every child, which puts several processes on one socket.
+
+That configuration used to fail outright — 139 of 300 requests served, with failed
+appends and read timeouts — and it no longer does: the pool became fork-aware, and three
+`--preload` runs on the current build came out clean (300/300 at `-w 4`, 300/300 at
+`-w 12`, 800/800 at `-w 4`, chains contiguous and verifying). **Follow the rule anyway.**
+It is a property of `fork()` rather than of any pooling, so it holds whatever a backend
+does internally, and the version that made it safe is one you have to keep:
 
 - with gunicorn, either drop `--preload`, or build the backend in a `post_fork` hook;
 - uvicorn `--workers` was clean against PostgreSQL — each worker imports the application
@@ -617,7 +621,7 @@ one `ledger_id`, and no duplicate `sequence` or `previous_hash`.
 
 | Server | Workers | Store | Requests | 2xx | Chain |
 |---|---|---|---|---|---|
-| gunicorn / Flask | `-w 1 --threads 8` | SQLite | 300 | 300 | 300 verified |
+| gunicorn / Flask | `-w 1 --threads 8` | SQLite | 300 | 300 | 301 verified |
 | gunicorn / Flask | `-w 4` | SQLite | 300 | 300 | 301 verified |
 | gunicorn / Flask | `-w 8` | SQLite | 800 | 800 | 801 verified |
 | gunicorn / Flask | `-w 12` | PostgreSQL | 300 | 300 | 301 verified |
