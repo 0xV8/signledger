@@ -144,7 +144,7 @@ import contextvars
 import functools
 import inspect
 import uuid
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -153,9 +153,13 @@ from starlette.concurrency import run_in_threadpool
 from signledger import contrib as _shared
 from signledger.contrib import (
     FAIL_CLOSED,
+    OUTCOME_COMPLETE,
+    OUTCOME_INCOMPLETE,
     AuditRecorder,
     AuditWriteError,
     build_audit_record,
+    is_skipped,
+    will_send_body,
 )
 from signledger.contrib.redaction import RedactionPolicy
 from signledger.core.exceptions import ConfigurationError
@@ -194,9 +198,6 @@ COMPLETION_PROVISIONAL = _shared.COMPLETION_PROVISIONAL
 DEFAULT_MAX_PAGE_SIZE = 100
 
 _AUDIT_FAILED_BODY = b'{"detail":"audit write failed"}'
-
-#: Statuses that carry no body, so a missing ``content-length`` says nothing is coming.
-_BODYLESS_STATUSES: FrozenSet[int] = frozenset({204, 304})
 
 #: The request the current task is serving, for :func:`audited` to correlate against.
 #: Set by the middleware; ``None`` in a decorated call that no request reached.
@@ -291,7 +292,7 @@ class SignLedgerAuditMiddleware:
             if message["type"] == "http.response.start" and not state["recorded"]:
                 state["recorded"] = True
                 state["status"] = message["status"]
-                state["provisional"] = _is_streamed(message)
+                state["provisional"] = _is_streamed(scope.get("method", ""), message)
                 try:
                     await self._record(
                         scope, headers, decision, chunks, message["status"], None,
@@ -338,7 +339,7 @@ class SignLedgerAuditMiddleware:
     # -- internals ---------------------------------------------------------------------
 
     def _skip(self, path: str) -> bool:
-        return any(path.startswith(prefix) for prefix in self.skip_paths)
+        return is_skipped(path, self.skip_paths)
 
     async def _record(
         self,
@@ -355,20 +356,27 @@ class SignLedgerAuditMiddleware:
     ) -> None:
         policy = self.recorder.redaction
         body, reason = self._body(decision, chunks, overflow)
+        # Kept for the settlement entry, which is written after the request scope is gone
+        # and used to hand-assemble a record carrying none of this. A settlement that
+        # cannot say who made the request is missing the field an auditor reaches for
+        # first, on exactly the half of the request that failed.
+        context["shape"] = {
+            "client_ip": policy.client_ip(
+                peer=_peer(scope), forwarded_for=headers.get("x-forwarded-for")
+            ),
+            "headers": policy.headers(headers),
+            "query": policy.query(_query(scope)),
+            "body": body,
+            "body_reason": reason,
+            "user": self._user(scope),
+        }
         record = build_audit_record(
             integration=INTEGRATION,
             method=scope.get("method", ""),
             path=scope.get("path", ""),
             status=status,
-            client_ip=policy.client_ip(
-                peer=_peer(scope), forwarded_for=headers.get("x-forwarded-for")
-            ),
-            headers=policy.headers(headers),
-            query=policy.query(_query(scope)),
-            body=body,
-            body_reason=reason,
-            user=self._user(scope),
             error=error,
+            **context["shape"],
             kind=KIND_REQUEST,
             request_id=context["request_id"],
             # Says whether the status above is a fact or a promise. Never absent: an
@@ -389,17 +397,20 @@ class SignLedgerAuditMiddleware:
         """
         if not state["provisional"]:
             return
-        record: Dict[str, Any] = {
-            "integration": INTEGRATION,
-            "kind": KIND_COMPLETION,
-            "request_id": context["request_id"],
-            "method": context["method"],
-            "path": context["path"],
-            "status": state["status"],
-            "outcome": "complete" if state["finished"] else "incomplete",
-        }
-        if error is not None:
-            record["error"] = error
+        record = build_audit_record(
+            integration=INTEGRATION,
+            method=context["method"],
+            path=context["path"],
+            status=state["status"],
+            error=error,
+            kind=KIND_COMPLETION,
+            request_id=context["request_id"],
+            # The settlement's own status is a fact by construction: it is written once
+            # the body has stopped moving.
+            completion=COMPLETION_FINAL,
+            outcome=OUTCOME_COMPLETE if state["finished"] else OUTCOME_INCOMPLETE,
+            **context["shape"],
+        )
         # There is no failing closed here: the client has had the response since the
         # first chunk. The recorder has already counted the failure and named it, so this
         # is not a swallowed error - it is one that has nowhere left to go.
@@ -536,14 +547,17 @@ def _call_record(label: str, func: Callable[..., Any], error: Optional[str]) -> 
     return record
 
 
-def _is_streamed(message: Dict[str, Any]) -> bool:
+def _is_streamed(method: str, message: Dict[str, Any]) -> bool:
     """Whether a body is still to come that the status has already been promised for.
 
     A response declaring a ``content-length`` was fully built before its status went out;
-    one that does not is being generated as it is sent, and may yet fail. Statuses that
-    carry no body at all declare no length either, and are not waiting on anything.
+    one that does not is being generated as it is sent, and may yet fail. Responses that
+    will not send a body at all are not waiting on anything - and that test now comes from
+    the shared helper, because testing the status alone left ``HEAD`` on a streaming route
+    provisional here and final on the other two integrations, waiting for a settlement no
+    server would ever trigger.
     """
-    if message["status"] in _BODYLESS_STATUSES:
+    if not will_send_body(method, message["status"]):
         return False
     return not any(name.lower() == b"content-length" for name, _ in message.get("headers", []))
 

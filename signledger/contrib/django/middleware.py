@@ -10,7 +10,12 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from django.db import IntegrityError, transaction
 
-from signledger.contrib import FAIL_CLOSED, AuditRecorder, build_audit_record
+from signledger.contrib import (
+    FAIL_CLOSED,
+    AuditRecorder,
+    build_audit_record,
+    is_skipped,
+)
 from signledger.contrib.django import _resolve, get_ledger, get_settings
 from signledger.contrib.django.models import AuditIndex
 from signledger.contrib.redaction import RedactionPolicy
@@ -60,7 +65,7 @@ class SignLedgerAuditMiddleware:
         )
 
     def __call__(self, request: Any) -> Any:
-        if any(request.path.startswith(prefix) for prefix in self.skip_paths):
+        if is_skipped(request.path, self.skip_paths):
             return self.get_response(request)
 
         # Decided and read *before* the view runs. Django caches ``request.body``, so
