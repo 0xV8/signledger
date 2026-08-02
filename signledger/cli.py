@@ -1078,10 +1078,22 @@ class _BundleView:
     def __init__(self, entries: List[Any]) -> None:
         self._entries = entries
 
-    def iter_entries(self, *, start_seq: Optional[int] = None) -> Any:
-        if start_seq is None:
-            return iter(list(self._entries))
-        return iter([e for e in self._entries if e.sequence >= start_seq])
+    def iter_entries(
+        self, *, start_seq: Optional[int] = None, end_seq: Optional[int] = None
+    ) -> Any:
+        """The window verification asks for, both ends inclusive.
+
+        ``end_seq`` is here because checkpoint verification recomputes the Merkle root
+        over the entries up to the checkpointed sequence. Without it an offline bundle
+        check raised ``TypeError`` at exactly the moment it was asked to do the work the
+        bundle exists for.
+        """
+        selected = self._entries
+        if start_seq is not None:
+            selected = [e for e in selected if e.sequence >= start_seq]
+        if end_seq is not None:
+            selected = [e for e in selected if e.sequence <= end_seq]
+        return iter(list(selected))
 
     def get_by_sequence(self, sequence: int) -> Any:
         return next((e for e in self._entries if e.sequence == sequence), None)

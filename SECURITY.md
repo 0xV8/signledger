@@ -104,6 +104,39 @@ exactly this reason — it tells you what the verdict is worth:
 A report that says `ok=True, assurance=CHAIN_ONLY` means "nothing here is
 inconsistent", not "nobody tampered with this".
 
+### What a checkpoint is worth
+
+Verification authenticates the checkpoint before it compares anything against
+it: the `key_id` is resolved, the signature over the signing payload is
+verified, the `ledger_id` must be this chain's, the `format_version` must be one
+this build can read, and the `merkle_root` is recomputed over the entries up to
+the checkpointed sequence. A checkpoint that fails any of these is reported and
+confers no assurance.
+
+Both copies of the checkpoint are consulted — the one in the store and the one
+at the anchor — and the newer wins. Preferring the anchor unconditionally made
+anyone who could reach the anchor a downgrade oracle: rolling it back to an
+older genuine checkpoint had the store's contradicting copy discarded unread.
+
+An anchor that is behind, or that holds nothing, is **not** reported as an
+integrity failure. The commonest cause by far is a publish that did not land,
+and an integrity report is the wrong place to raise an operational alarm. It
+costs the `ANCHORED`/`WORM` label instead, which is the honest answer: nobody
+outside the process is holding a copy of this head.
+
+**The limit.** An attacker with write access to *both* the store and the anchor
+can roll both back to a genuinely signed older checkpoint, and nothing detects
+it — every field reconciles, because it is a true statement about a chain that
+really did exist. Freshness cannot be established from inside a system the
+attacker fully controls. The defence is operational: publish to an anchor the
+ledger host cannot write. By the same limit, a ledger that was checkpointed and
+then had every copy wiped is indistinguishable from one that was never
+checkpointed.
+
+The SQLite append-only triggers are defence in depth against an application bug,
+not storage-enforced immutability. Any writer of the file can drop them with
+ordinary DDL and recreate them afterwards from `sqlite_master`.
+
 ## Scope
 
 In scope: anything that lets a ledger pass verification after being modified,

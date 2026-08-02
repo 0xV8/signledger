@@ -543,6 +543,7 @@ class Ledger:
             checkpoint=checkpoint,
             anchored=anchored,
             capabilities=self.backend.capabilities(),
+            ledger_id=self.ledger_id,
         )
         self._last_report = report
         self._last_verified_at = _utcnow()
@@ -589,16 +590,35 @@ class Ledger:
     def _newest_checkpoint(self) -> Tuple[Optional[Any], bool]:
         """The checkpoint to verify against, and whether it came from outside this store.
 
-        An externally anchored checkpoint is preferred over a locally stored one even when
-        the local one is newer. The local copy sits in the same database as the entries, so
-        anyone who can truncate the chain can delete the record of how long it used to be;
-        the anchored copy is the only one an insider does not control.
+        The anchored copy used to win unconditionally, on the reasoning that the local one
+        sits in the same database as the entries and so is controlled by anyone who can
+        truncate them. That is true, and it is only half the picture: preferring the anchor
+        no matter what hands the same power to anyone who can reach the anchor *file*, who
+        needs only to roll it back to an older genuine checkpoint to have the store's own
+        contradicting evidence discarded unread. Measured: the local table still said
+        sequence 7 while a rolled-back anchor said 3, and verification answered with the
+        anchor's story.
+
+        So both are consulted and the **newer** wins, which makes a rollback cost the
+        attacker *both* copies rather than whichever one they happen to reach.
+
+        An anchor that is behind, or that holds nothing at all, returns ``anchored=False``
+        rather than a failure. It is not damage to the chain: the commonest cause by far is
+        a publish that did not land, and an integrity report is the wrong place to raise an
+        operational alarm. What it does cost is the ``ANCHORED``/``WORM`` label, which is
+        the honest answer - nobody outside this process is holding a copy of this head, so
+        the evidence is worth exactly what a local signature is worth.
         """
-        if self._anchor_sink is not None:
-            external = self._anchor_sink.fetch_latest(self.ledger_id)
-            if external is not None:
-                return external, True
-        return self.backend.get_latest_checkpoint(), False
+        local = self.backend.get_latest_checkpoint()
+        if self._anchor_sink is None:
+            return local, False
+
+        external = self._anchor_sink.fetch_latest(self.ledger_id)
+        if external is None:
+            return local, False
+        if local is not None and local.sequence > external.sequence:
+            return local, False
+        return external, True
 
     def _resolver(self) -> Any:
         """The key resolver verification should use.

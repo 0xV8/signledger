@@ -81,7 +81,28 @@ signatures are handled at `verification.py:107-150`:
 - recompute the Merkle root over `backend.iter_entries(end_seq=checkpoint.sequence)`
   using `chain.algorithm` and compare against `checkpoint.merkle_root`. `end_seq` is
   inclusive and the prefix root is stable under growth — both verified.
-- make the count check bidirectional.
+
+**Correction, found while implementing (A-1).** The design originally called for a
+bidirectional count check. That is wrong and was dropped: `stored > entry_count` is
+ordinary growth past the checkpoint, and failing it would break every live ledger. The
+attack it was meant to catch — truncate, then re-append to restore the count — is caught
+by the head digest whenever the checkpoint is current, and is a freshness problem, not a
+counting one, when the checkpoint is old.
+
+**Correction, found while implementing (A-3).** `CHECKPOINT_ROLLBACK` and
+`CHECKPOINT_MISSING` were specified as failure kinds. Both were removed. A publish that
+fails leaves the local checkpoint ahead of the anchor, which is *indistinguishable* from a
+rollback, so reporting either as an integrity failure turns an anchor-service outage into
+`ok=False` — and `tests/test_anchor.py::test_a_checkpoint_the_anchor_service_refused_
+confers_no_anchored_assurance` already, correctly, required `SIGNED` in that case. Both
+conditions are now expressed as `anchored=False`, so they cost the `ANCHORED`/`WORM`
+label rather than claiming damage that did not happen.
+
+**Refinement (A-1).** The Merkle check runs only when the head and count checks pass. A
+truncated tail fails all three at once, and a report naming three symptoms of one cause is
+harder to act on than one naming the two that locate it. The Merkle check earns its place
+on the case the other two cannot see: a head and count that reconcile over a tree that
+does not.
 
 **A-2. Selection becomes `max(local, external)` by sequence.** `ledger.py:589-600` and
 `cli.py:567-577` currently prefer the anchor unconditionally. Taking the highest sequence

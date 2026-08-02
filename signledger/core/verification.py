@@ -42,6 +42,16 @@ class FailureKind(str, Enum):
     UNKNOWN_KEY = "unknown_key"
     FORMAT_UNSUPPORTED = "format_unsupported"
 
+    # A checkpoint is the only thing that sees a truncated tail, which makes it the next
+    # thing an attacker goes for. It was signed and never verified, so these exist to say
+    # precisely which part of it did not hold up rather than collapsing into HEAD_MISMATCH.
+    CHECKPOINT_UNSIGNED = "checkpoint_unsigned"
+    CHECKPOINT_UNKNOWN_KEY = "checkpoint_unknown_key"
+    CHECKPOINT_BAD_SIGNATURE = "checkpoint_bad_signature"
+    CHECKPOINT_LEDGER_MISMATCH = "checkpoint_ledger_mismatch"
+    CHECKPOINT_FORMAT_UNSUPPORTED = "checkpoint_format_unsupported"
+    CHECKPOINT_MERKLE_MISMATCH = "checkpoint_merkle_mismatch"
+
 
 @dataclass(frozen=True)
 class VerificationFailure:
@@ -150,7 +160,186 @@ def _check_signature(entry: Any, key_resolver: Any) -> Optional[VerificationFail
     return None
 
 
-def _check_checkpoint(backend: Any, checkpoint: Any) -> List[VerificationFailure]:
+def _check_checkpoint_authenticity(
+    checkpoint: Any,
+    *,
+    ledger_id: Optional[str],
+    enable_signatures: bool,
+    key_resolver: Any,
+) -> List[VerificationFailure]:
+    """Establish that this checkpoint is *this* ledger's, and that nobody wrote it.
+
+    Until this existed a checkpoint was believed on sight. Every field it carries was
+    signed at ``Ledger.checkpoint`` and then read back without ever being checked, so
+    rewriting the anchor file - or, cheaper, one ``UPDATE`` on a checkpoints table that
+    carries no append-only trigger - restored ``ok=True`` on a chain with its tail cut
+    off, and *raised* the reported assurance while doing it.
+
+    The order matters. A checkpoint describing another ledger, or written in a format
+    this build cannot read, is rejected before its contents are compared against
+    anything: comparing them would be answering a question about the wrong chain.
+    """
+    failures: List[VerificationFailure] = []
+
+    if ledger_id is not None and checkpoint.ledger_id != ledger_id:
+        failures.append(
+            VerificationFailure(
+                kind=FailureKind.CHECKPOINT_LEDGER_MISMATCH,
+                sequence=checkpoint.sequence,
+                entry_id=None,
+                expected=ledger_id,
+                actual=checkpoint.ledger_id,
+                message=(
+                    "the checkpoint describes a different ledger; it is not evidence "
+                    "about this chain"
+                ),
+            )
+        )
+
+    if checkpoint.format_version > CURRENT_FORMAT_VERSION:
+        failures.append(
+            VerificationFailure(
+                kind=FailureKind.CHECKPOINT_FORMAT_UNSUPPORTED,
+                sequence=checkpoint.sequence,
+                entry_id=None,
+                expected=str(CURRENT_FORMAT_VERSION),
+                actual=str(checkpoint.format_version),
+                message=(
+                    f"the checkpoint is in format_version {checkpoint.format_version}, "
+                    f"which this build cannot interpret"
+                ),
+            )
+        )
+
+    if failures or not enable_signatures:
+        # With signing off there is nothing to verify and saying so is honest: assurance
+        # tops out at CHAIN_ONLY, so no caller can mistake this for an authenticated
+        # checkpoint.
+        return failures
+
+    if checkpoint.signature is None or checkpoint.key_id is None:
+        return [
+            VerificationFailure(
+                kind=FailureKind.CHECKPOINT_UNSIGNED,
+                sequence=checkpoint.sequence,
+                entry_id=None,
+                expected="a signature and a key_id",
+                actual=None,
+                message=(
+                    f"the checkpoint at sequence {checkpoint.sequence} carries no "
+                    f"signature, and this ledger signs its checkpoints"
+                ),
+            )
+        ]
+
+    public_key = None if key_resolver is None else key_resolver.resolve(checkpoint.key_id)
+    if public_key is None:
+        return [
+            VerificationFailure(
+                kind=FailureKind.CHECKPOINT_UNKNOWN_KEY,
+                sequence=checkpoint.sequence,
+                entry_id=None,
+                expected=checkpoint.key_id,
+                actual=None,
+                message=(
+                    f"the checkpoint at sequence {checkpoint.sequence} names a key this "
+                    f"resolver cannot supply"
+                ),
+            )
+        ]
+
+    # Deferred for the same reason as the entry path: importing ``cryptography`` at module
+    # scope would load the optional extra on every ``import signledger``.
+    from signledger.anchor.sinks import checkpoint_signing_payload
+    from signledger.crypto.signatures import verify
+
+    try:
+        payload = checkpoint_signing_payload(checkpoint)
+    except (ValidationError, TypeError, ValueError):
+        # A doctored field that cannot even be canonicalised. Raising here would let an
+        # attacker turn verification into a crash, which is a denial of the answer.
+        return [
+            VerificationFailure(
+                kind=FailureKind.CHECKPOINT_BAD_SIGNATURE,
+                sequence=checkpoint.sequence,
+                entry_id=None,
+                expected=checkpoint.key_id,
+                actual=None,
+                message=(
+                    f"the checkpoint at sequence {checkpoint.sequence} holds a field no "
+                    f"signing payload can be framed from"
+                ),
+            )
+        ]
+
+    if not verify(payload, checkpoint.signature, public_key):
+        return [
+            VerificationFailure(
+                kind=FailureKind.CHECKPOINT_BAD_SIGNATURE,
+                sequence=checkpoint.sequence,
+                entry_id=None,
+                expected=checkpoint.key_id,
+                actual=None,
+                message=(
+                    f"the checkpoint at sequence {checkpoint.sequence} has a signature "
+                    f"that does not verify"
+                ),
+            )
+        ]
+    return []
+
+
+def _check_merkle_root(backend: Any, checkpoint: Any, chain: Any) -> List[VerificationFailure]:
+    """Recompute the tree the checkpoint claims to summarise.
+
+    ``merkle_root`` was computed, signed and published, and then never recomputed - so a
+    forged checkpoint could carry any 32 bytes at all. The window is the entries up to and
+    including ``checkpoint.sequence``: ``end_seq`` is inclusive, and the root over that
+    prefix is stable as the chain grows past it, which is what lets this run against a
+    live ledger rather than only a frozen one.
+    """
+    from signledger.crypto.merkle import MerkleTree
+
+    try:
+        leaves = [
+            bytes.fromhex(entry.hash)
+            for entry in backend.iter_entries(end_seq=checkpoint.sequence)
+        ]
+    except ValueError:
+        # A tampered digest that is not hex. The entry-level BAD_HASH check reports the
+        # damage precisely; there is no tree to build over it.
+        return []
+    if not leaves:
+        # Nothing to summarise. The head check above has already reported the absence.
+        return []
+
+    recomputed = MerkleTree(leaves, algorithm=chain.algorithm).root
+    if _same_digest(recomputed, checkpoint.merkle_root):
+        return []
+    return [
+        VerificationFailure(
+            kind=FailureKind.CHECKPOINT_MERKLE_MISMATCH,
+            sequence=checkpoint.sequence,
+            entry_id=None,
+            expected=checkpoint.merkle_root,
+            actual=recomputed,
+            message=(
+                f"the entries up to sequence {checkpoint.sequence} do not build the "
+                f"Merkle root the checkpoint recorded for them"
+            ),
+        )
+    ]
+
+
+def _check_checkpoint(
+    backend: Any,
+    checkpoint: Any,
+    *,
+    chain: Any = None,
+    ledger_id: Optional[str] = None,
+    enable_signatures: bool = False,
+    key_resolver: Any = None,
+) -> List[VerificationFailure]:
     """Compare the store against a checkpoint taken earlier.
 
     This is the only mechanism that sees a **truncated tail** (contract section 8). Lop
@@ -160,7 +349,21 @@ def _check_checkpoint(backend: Any, checkpoint: Any) -> List[VerificationFailure
 
     Growth past the checkpoint is normal and is *not* a failure; the comparison is made
     against the entry that sat at ``checkpoint.sequence``, never against today's head.
+
+    A checkpoint is only worth comparing against once it has been shown to be this
+    ledger's and unmodified, so authenticity is established first and the rest is skipped
+    when it fails - a forged checkpoint's head and count describe whatever the forger
+    chose, and reporting them as mismatches would bury the reason under its symptoms.
     """
+    authenticity = _check_checkpoint_authenticity(
+        checkpoint,
+        ledger_id=ledger_id,
+        enable_signatures=enable_signatures,
+        key_resolver=key_resolver,
+    )
+    if authenticity:
+        return authenticity
+
     failures: List[VerificationFailure] = []
 
     anchored_entry = backend.get_by_sequence(checkpoint.sequence)
@@ -208,6 +411,14 @@ def _check_checkpoint(backend: Any, checkpoint: Any) -> List[VerificationFailure
                 ),
             )
         )
+
+    if chain is not None and not failures:
+        # Only once the head and the count agree. A truncated tail fails all three checks
+        # at once, and a report listing three symptoms of one cause is harder to act on
+        # than one listing the two that locate it. Where this earns its place is the case
+        # the other two cannot see: a head and a count that both reconcile over a tree that
+        # does not - a substituted entry, or a ``merkle_root`` somebody chose.
+        failures.extend(_check_merkle_root(backend, checkpoint, chain))
     return failures
 
 
@@ -246,6 +457,7 @@ def verify_chain(
     checkpoint: Any = None,
     anchored: bool = False,
     capabilities: FrozenSet[str] = frozenset(),
+    ledger_id: Optional[str] = None,
 ) -> VerificationReport:
     """Verify the entries the backend holds and report everything wrong with them.
 
@@ -357,7 +569,16 @@ def verify_chain(
         )
 
     if checkpoint is not None:
-        failures.extend(_check_checkpoint(backend, checkpoint))
+        failures.extend(
+            _check_checkpoint(
+                backend,
+                checkpoint,
+                chain=chain,
+                ledger_id=ledger_id,
+                enable_signatures=enable_signatures,
+                key_resolver=key_resolver,
+            )
+        )
 
     return VerificationReport(
         ok=not failures,

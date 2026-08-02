@@ -23,6 +23,7 @@ from signledger.backends.base import CAP_APPEND_ONLY_ENFORCED
 from signledger.backends.memory import MemoryBackend
 from signledger.core.ledger import Ledger
 from signledger.core.verification import AssuranceLevel, FailureKind, verify_chain
+from signledger.crypto.hashing import DEFAULT_ALGORITHM
 
 BASE_INSTANT = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
@@ -521,18 +522,41 @@ def test_an_unsigned_chain_with_signatures_required_is_reported_as_missing_signa
 # --------------------------------------------------------------------------------------
 
 
-def checkpoint_over(backend, ledger_id):
-    """A checkpoint describing the store exactly as it stands right now."""
+def checkpoint_over(backend, ledger_id, algorithm=DEFAULT_ALGORITHM, signer=None):
+    """A checkpoint describing the store exactly as it stands right now.
+
+    ``merkle_root`` used to be a placeholder of 64 zeroes here, which was harmless only
+    for as long as nothing recomputed it. It is real now, because a helper whose whole
+    purpose is to describe the store accurately cannot be the thing that hands the
+    verifier a value the product would never produce.
+
+    ``signer`` is required whenever the verification under test has signing enabled, for
+    the same reason: a ledger that signs its entries signs its checkpoints too, so an
+    unsigned one is not a checkpoint that deployment could have produced.
+    """
+    from dataclasses import replace as _replace
+
     from signledger.anchor.checkpoint import Checkpoint
+    from signledger.crypto.merkle import MerkleTree
 
     head = backend.get_head()
-    return Checkpoint(
+    leaves = [bytes.fromhex(entry.hash) for entry in backend.iter_entries()]
+    checkpoint = Checkpoint(
         ledger_id=ledger_id,
         sequence=head.sequence,
         head_hash=head.hash,
         entry_count=backend.count(),
-        merkle_root="0" * 64,
+        merkle_root=MerkleTree(leaves, algorithm=algorithm).root,
         timestamp=BASE_INSTANT,
+        key_id=None if signer is None else signer.key_id,
+    )
+    if signer is None:
+        return checkpoint
+
+    from signledger.anchor.sinks import checkpoint_signing_payload
+
+    return _replace(
+        checkpoint, signature=signer.sign(checkpoint_signing_payload(checkpoint))
     )
 
 
@@ -674,10 +698,10 @@ def test_signatures_alone_do_not_earn_anchored(store, signed_entries, chain, gen
 
 
 def test_a_signed_chain_with_an_external_anchor_earns_anchored(
-    store, signed_entries, chain, genesis, resolver, ledger_id
+    store, signed_entries, chain, genesis, resolver, ledger_id, signer
 ):
     signed_entries(store, 3)
-    cp = checkpoint_over(store, ledger_id)
+    cp = checkpoint_over(store, ledger_id, signer=signer)
 
     report = verify_chain(
         store,
@@ -693,10 +717,10 @@ def test_a_signed_chain_with_an_external_anchor_earns_anchored(
 
 
 def test_an_anchored_chain_on_an_append_only_store_earns_worm(
-    store, signed_entries, chain, genesis, resolver, ledger_id
+    store, signed_entries, chain, genesis, resolver, ledger_id, signer
 ):
     signed_entries(store, 3)
-    cp = checkpoint_over(store, ledger_id)
+    cp = checkpoint_over(store, ledger_id, signer=signer)
 
     report = verify_chain(
         store,
