@@ -15,7 +15,7 @@ nothing was executed by a test - which is why every line below is reached by one
 """
 
 import uuid
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional
 
 from signledger.contrib.redaction import RedactionPolicy, redact_payload
 from signledger.core.exceptions import ConfigurationError, SignLedgerError
@@ -30,19 +30,64 @@ KIND_COMPLETION = "response.completion"
 COMPLETION_FINAL = "final"
 COMPLETION_PROVISIONAL = "provisional"
 
+#: How a promised response actually ended. Carried only by settlement entries.
+OUTCOME_COMPLETE = "complete"
+OUTCOME_INCOMPLETE = "incomplete"
+
+#: Statuses whose body no server sends, so nothing will ever settle a promise made for
+#: one. Werkzeug's ``Response.get_app_iter`` and Starlette agree on this set.
+_BODYLESS_STATUSES: FrozenSet[int] = frozenset({204, 304})
+
 __all__ = [
     "AUDIT_FAILURE_POLICIES",
     "COMPLETION_FINAL",
     "COMPLETION_PROVISIONAL",
     "KIND_COMPLETION",
     "KIND_REQUEST",
+    "OUTCOME_COMPLETE",
+    "OUTCOME_INCOMPLETE",
     "FAIL_CLOSED",
     "FAIL_OPEN",
     "AuditRecorder",
     "AuditWriteError",
     "RedactionPolicy",
     "build_audit_record",
+    "is_skipped",
+    "will_send_body",
 ]
+
+
+def will_send_body(method: str, status: int) -> bool:
+    """Whether a server will consume this response's body at all.
+
+    Written once because the two integrations that had it wrote it differently: Flask
+    excluded ``HEAD`` and FastAPI tested the status alone, so a ``HEAD`` against a
+    streaming route produced one final entry on Flask and two entries with a provisional
+    first on FastAPI, for byte-identical traffic.
+
+    It matters beyond tidiness. A response whose body is never iterated is never closed
+    either, so a provisional entry written for one waits forever for a settlement that
+    cannot come - a worse record than the overclaim it was meant to replace.
+    """
+    return method != "HEAD" and status >= 200 and status not in _BODYLESS_STATUSES
+
+
+def is_skipped(path: str, prefixes: Iterable[str]) -> bool:
+    """Whether ``path`` falls under one of the configured skip prefixes.
+
+    All three integrations used a bare ``str.startswith``, which is not a path match: with
+    ``skip_paths=("/health",)`` - the value the README recommends - a request to
+    ``/healthz-admin-secret`` returned 200 with real data and wrote no audit entry at all.
+    For a library whose product is a complete trail, that is a hole, not a nicety.
+
+    A prefix matches the path itself or anything below it as a **path segment**, so
+    ``/health`` covers ``/health`` and ``/health/live`` and nothing else.
+    """
+    for prefix in prefixes:
+        trimmed = prefix.rstrip("/")
+        if path == trimmed or path.startswith(trimmed + "/"):
+            return True
+    return False
 
 #: The audit write must succeed or the request must not. The default.
 FAIL_CLOSED = "fail_closed"
@@ -138,6 +183,7 @@ def build_audit_record(
     kind: str = KIND_REQUEST,
     request_id: Optional[str] = None,
     completion: str = COMPLETION_FINAL,
+    outcome: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assemble the audit payload every integration writes.
 
@@ -186,4 +232,7 @@ def build_audit_record(
         # Present only when there was one. A field that is always there and always null
         # teaches people to stop reading it.
         record["error"] = redact_payload(error)
+    if outcome is not None:
+        # Only settlement entries have one, for the same reason.
+        record["outcome"] = redact_payload(outcome)
     return record

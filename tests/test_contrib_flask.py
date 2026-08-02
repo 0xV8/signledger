@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List
 
 import pytest
-from flask import Flask, Response
+from flask import Flask, Response, abort
 from werkzeug.test import EnvironBuilder
 
 from signledger.backends.memory import MemoryBackend
@@ -100,7 +100,7 @@ def streaming_app(ledger: Ledger, **kwargs: Any) -> Flask:
     return app
 
 
-def run_wsgi(app: Flask, path: str) -> List[bytes]:
+def run_wsgi(app: Flask, path: str, method: str = "GET") -> List[bytes]:
     """Drive one request the way a conforming WSGI server does.
 
     PEP 3333: "If the iterable returned by the application has a ``close()`` method, the
@@ -114,7 +114,7 @@ def run_wsgi(app: Flask, path: str) -> List[bytes]:
     it at all - which is also why the defect this drives at was invisible until the
     consumer project ran under a real server.
     """
-    iterable = wsgi_request(app, path)
+    iterable = wsgi_request(app, path, method)
     chunks: List[bytes] = []
     try:
         for chunk in iterable:
@@ -126,13 +126,13 @@ def run_wsgi(app: Flask, path: str) -> List[bytes]:
     return chunks
 
 
-def wsgi_request(app: Flask, path: str) -> Any:
+def wsgi_request(app: Flask, path: str, method: str = "GET") -> Any:
     """The raw WSGI iterable for one request, not yet consumed."""
 
     def start_response(status: str, headers: Any, exc_info: Any = None) -> Any:
         return lambda chunk: None
 
-    return app(EnvironBuilder(path=path).get_environ(), start_response)
+    return app(EnvironBuilder(path=path, method=method).get_environ(), start_response)
 
 
 # ======================================================================================
@@ -440,11 +440,22 @@ def test_an_iterable_with_no_close_method_is_still_settled(ledger: Ledger) -> No
     assert entries(ledger)[1].data["outcome"] == "complete"
 
 
-def test_a_file_response_is_settled_too(ledger: Ledger, tmp_path: Any) -> None:
-    """``send_file`` returns a streamed ``direct_passthrough`` response, and werkzeug
-    skips a response's ``call_on_close`` callbacks entirely for those - it hands the
-    server the body iterable directly. Settling from the body itself is what reaches
-    this case at all."""
+def test_a_file_response_is_recorded_final_and_not_settled(
+    ledger: Ledger, tmp_path: Any
+) -> None:
+    """``send_file`` declares a ``Content-Length``, so it is recorded as a fact and gets
+    no settlement entry.
+
+    The line this draws is what the client can check for itself. A body sent under a
+    declared length is one the receiver can detect a truncation of - a short read is
+    visibly short - so a second ledger entry tells an auditor nothing the transfer did
+    not already tell the client. A body sent without one cannot be told apart from a
+    complete one by anybody, which is the case the settlement entry exists for.
+
+    Django's ``FileResponse`` is left on the same footing deliberately: wrapping it to
+    settle it would take every download off the ``sendfile`` zero-copy path, and the two
+    integrations must not answer this question differently.
+    """
     from flask import send_file
 
     path = tmp_path / "statement.txt"
@@ -457,7 +468,8 @@ def test_a_file_response_is_settled_too(ledger: Ledger, tmp_path: Any) -> None:
         return send_file(str(path), mimetype="text/plain")
 
     assert run_wsgi(app, "/file") == [b"hello file body"]
-    assert kinds(ledger) == ["request", "response.completion"]
+    assert kinds(ledger) == ["request"]
+    assert entries(ledger)[0].data["completion"] == "final"
 
 
 def test_closing_a_response_twice_settles_it_once(ledger: Ledger) -> None:
@@ -831,3 +843,63 @@ def test_a_recorder_without_an_explicit_redaction_policy_still_redacts(
     app = SignLedgerAudit(ledger=ledger)
     assert isinstance(app.recorder.redaction, RedactionPolicy)
 
+
+
+# --------------------------------------------------------------------------------------
+# error responses are facts, not promises
+# --------------------------------------------------------------------------------------
+
+
+def error_app(ledger: Ledger) -> Flask:
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+
+    @app.get("/ok")
+    def ok() -> str:
+        return "fine"
+
+    @app.get("/bad")
+    def bad() -> str:
+        abort(400)
+
+    @app.get("/gone")
+    def gone() -> str:
+        abort(404)
+
+    @app.post("/onlypost")
+    def onlypost() -> str:
+        return "posted"
+
+    return app
+
+
+@pytest.mark.parametrize(
+    ("path", "method"),
+    [("/bad", "GET"), ("/gone", "GET"), ("/nosuchroute", "GET"), ("/onlypost", "GET")],
+)
+def test_an_error_response_writes_exactly_one_entry(
+    ledger: Ledger, path: str, method: str
+) -> None:
+    """Every ``HTTPException``-derived response used to write two: a request entry marked
+    ``provisional`` - untrue, the body went out with a ``Content-Length`` - plus a
+    settlement claiming it completed. ``skip_paths`` defaults to empty, so any anonymous
+    caller hitting bad URLs doubled their write amplification against a store that by
+    design cannot be pruned."""
+    run_wsgi(error_app(ledger), path, method=method)
+
+    assert kinds(ledger) == ["request"]
+
+
+@pytest.mark.parametrize("path", ["/bad", "/gone", "/nosuchroute"])
+def test_an_error_response_is_recorded_as_final(ledger: Ledger, path: str) -> None:
+    run_wsgi(error_app(ledger), path)
+
+    assert entries(ledger)[0].data["completion"] == "final"
+
+
+def test_a_streamed_response_is_still_provisional(ledger: Ledger) -> None:
+    """The control. Fixing the error responses must not stop the case the provisional
+    mechanism exists for from being provisional."""
+    run_wsgi(streaming_app(ledger), "/stream")
+
+    assert entries(ledger)[0].data["completion"] == "provisional"

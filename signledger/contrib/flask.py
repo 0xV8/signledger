@@ -95,16 +95,20 @@ closed after that.
 import contextlib
 import functools
 import uuid
-from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Tuple
 
 from flask import Blueprint, Flask, Response, g, jsonify, request
 
 from signledger import contrib as _shared
 from signledger.contrib import (
     FAIL_CLOSED,
+    OUTCOME_COMPLETE,
+    OUTCOME_INCOMPLETE,
     AuditRecorder,
     AuditWriteError,
     build_audit_record,
+    is_skipped,
+    will_send_body,
 )
 from signledger.contrib.redaction import RedactionPolicy
 from signledger.core.exceptions import ConfigurationError
@@ -139,9 +143,6 @@ EXTENSION_KEY = "signledger"
 
 #: Default ceiling on how many entries one inspection request may return.
 DEFAULT_MAX_PAGE_SIZE = 100
-
-#: Statuses whose body a WSGI server discards. Werkzeug's ``Response.get_app_iter``.
-_BODYLESS_STATUSES: FrozenSet[int] = frozenset({204, 304})
 
 _BODY_KEY = "_signledger_body"
 _REASON_KEY = "_signledger_body_reason"
@@ -187,7 +188,7 @@ class SignLedgerAudit:
     # -- hooks -------------------------------------------------------------------------
 
     def _skip(self, path: str) -> bool:
-        return any(path.startswith(prefix) for prefix in self.skip_paths)
+        return is_skipped(path, self.skip_paths)
 
     def _before_request(self) -> None:
         """Decide about the body *before* the view has a chance to consume it.
@@ -226,8 +227,24 @@ class SignLedgerAudit:
             "method": request.method,
             "path": request.path,
             "status": response.status_code,
+            # Everything the settlement entry needs, captured while the request context
+            # still exists. It is torn down before the WSGI server closes the body, and
+            # the settlement used to be assembled by hand from what little survived - so
+            # it named no client, no user and no headers, on precisely the half of the
+            # request that went wrong.
+            "shape": {
+                "client_ip": policy.client_ip(
+                    peer=request.remote_addr,
+                    forwarded_for=request.headers.get("X-Forwarded-For"),
+                ),
+                "headers": policy.headers(dict(request.headers)),
+                "query": policy.query(request.args.to_dict(flat=False)),
+                "body": getattr(g, _BODY_KEY, None),
+                "body_reason": getattr(g, _REASON_KEY, "disabled"),
+                "user": self._user(),
+            },
         }
-        streamed = response.is_streamed and _sends_a_body(
+        streamed = _will_stream(response) and will_send_body(
             request.method, response.status_code
         )
         record = build_audit_record(
@@ -235,16 +252,8 @@ class SignLedgerAudit:
             method=request.method,
             path=request.path,
             status=response.status_code,
-            client_ip=policy.client_ip(
-                peer=request.remote_addr,
-                forwarded_for=request.headers.get("X-Forwarded-For"),
-            ),
-            headers=policy.headers(dict(request.headers)),
-            query=policy.query(request.args.to_dict(flat=False)),
-            body=getattr(g, _BODY_KEY, None),
-            body_reason=getattr(g, _REASON_KEY, "disabled"),
-            user=self._user(),
             kind=KIND_REQUEST,
+            **context["shape"],
             request_id=context["request_id"],
             # Says whether the status above is a fact or a promise. Never absent: an
             # auditor must not have to know which version of this extension - or which
@@ -264,17 +273,20 @@ class SignLedgerAudit:
         self, context: Dict[str, Any], complete: bool, error: Optional[str]
     ) -> None:
         """Record how a promised response actually ended."""
-        record: Dict[str, Any] = {
-            "integration": INTEGRATION,
-            "kind": KIND_COMPLETION,
-            "request_id": context["request_id"],
-            "method": context["method"],
-            "path": context["path"],
-            "status": context["status"],
-            "outcome": "complete" if complete else "incomplete",
-        }
-        if error is not None:
-            record["error"] = error
+        record = build_audit_record(
+            integration=INTEGRATION,
+            method=context["method"],
+            path=context["path"],
+            status=context["status"],
+            error=error,
+            kind=KIND_COMPLETION,
+            request_id=context["request_id"],
+            # The settlement's own status is a fact by construction: it is written once
+            # the body has stopped moving.
+            completion=COMPLETION_FINAL,
+            outcome=OUTCOME_COMPLETE if complete else OUTCOME_INCOMPLETE,
+            **context["shape"],
+        )
         # No failing closed here: the client has had the response since the first chunk.
         # The recorder has counted the failure and named it, so this is not a swallowed
         # error - it is one with nowhere left to go.
@@ -291,6 +303,26 @@ class SignLedgerAudit:
             return None
         resolved = self.user_resolver(request)
         return None if resolved is None else str(resolved)
+
+
+def _will_stream(response: Response) -> bool:
+    """Whether this response's body still has to be produced.
+
+    ``Response.is_streamed`` is the obvious test and it is the wrong one. Werkzeug defines
+    it as "``len(self.response)`` raises", and ``make_response`` runs every
+    ``HTTPException`` through ``Response.force_type``, which replaces the body list with a
+    ``werkzeug.wsgi.ClosingIterator``. That has no ``__len__``, so every 400, 404, 405 and
+    500 answered by an error handler looked streamed: each was recorded ``provisional`` -
+    untrue, the body went out with a ``Content-Length`` - and then earned a second
+    settlement entry saying it completed. Two signed rows per error response, against a
+    store that by design cannot be pruned, from any anonymous caller hitting bad URLs.
+
+    A declared ``Content-Length`` means the body was fully built before the status went
+    out. That is the same test :mod:`signledger.contrib.fastapi` applies to
+    ``http.response.start``, which is the point: the two integrations answered this
+    question differently, and an auditor's query cannot depend on which one wrote the row.
+    """
+    return response.content_length is None
 
 
 class _SettlingBody:
@@ -345,16 +377,6 @@ class _SettlingBody:
             # must not be what leaks it.
             close()
         self._settle(self._complete, self._error)
-
-
-def _sends_a_body(method: str, status: int) -> bool:
-    """Whether a WSGI server will consume the response body at all.
-
-    Werkzeug's own rule, in ``Response.get_app_iter``. For these the iterable is never
-    iterated *or closed*, so a provisional entry would wait forever for a settlement that
-    cannot come - which is a worse record than the overclaim it was meant to replace.
-    """
-    return method != "HEAD" and status >= 200 and status not in _BODYLESS_STATUSES
 
 
 def audit_blueprint(
