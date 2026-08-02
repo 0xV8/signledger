@@ -90,6 +90,24 @@ all (``HEAD``, ``204``, ``304``, ``1xx``), because nothing would ever settle it.
 A settlement that cannot be written is counted on ``recorder.audit_failures`` rather than
 raised: the client has had the response since the first chunk, and there is no failing
 closed after that.
+
+A request that fails is still a request
+---------------------------------------
+
+``after_request`` does not run when an exception leaves the application, which is what
+``TESTING``, ``DEBUG`` and ``PROPAGATE_EXCEPTIONS`` each arrange - and two of those are
+what people develop and run their test suites against. The client received a real 500 over
+TCP and the ledger gained nothing: ``fail_closed`` could not help, because the failure is
+upstream of the audit write, and ``check_integrity()`` reported ``ok`` on a chain with no
+memory of the request.
+
+``teardown_request`` is the backstop. It fires only when there is an exception and nothing
+has been recorded yet, so it cannot double-count the ordinary path, and it records
+``status=500`` because that is what the server sends. ``got_request_exception`` is what
+lets both paths name the cause: ``after_request`` is handed a response and no exception,
+so a handled 500 used to be recorded with no ``error`` field at all, and
+``WHERE error IS NOT NULL`` came back structurally empty however many times a view had
+blown up.
 """
 
 import contextlib
@@ -98,6 +116,7 @@ import uuid
 from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Tuple
 
 from flask import Blueprint, Flask, Response, g, jsonify, request
+from flask.signals import got_request_exception
 
 from signledger import contrib as _shared
 from signledger.contrib import (
@@ -147,6 +166,16 @@ DEFAULT_MAX_PAGE_SIZE = 100
 _BODY_KEY = "_signledger_body"
 _REASON_KEY = "_signledger_body_reason"
 
+#: Set once this request is one we audit, so the teardown backstop can tell a request it
+#: must account for from one that was skipped or never reached ``before_request``.
+_AUDITED_KEY = "_signledger_audited"
+
+#: Set once an entry exists for this request, so the backstop never writes a second one.
+_RECORDED_KEY = "_signledger_recorded"
+
+#: The exception Flask is about to turn into a 500, captured while it is still knowable.
+_ERROR_KEY = "_signledger_error"
+
 
 class SignLedgerAudit:
     """Flask extension that writes one ledger entry per request.
@@ -180,9 +209,21 @@ class SignLedgerAudit:
             self.init_app(app)
 
     def init_app(self, app: Flask) -> None:
-        """Attach the request hooks to ``app``."""
+        """Attach the request hooks to ``app``.
+
+        ``teardown_request`` is the backstop and ``got_request_exception`` is what makes
+        it able to say *what* failed. Neither is decoration: ``after_request`` does not run
+        at all when an exception leaves the application, which every one of
+        ``TESTING``, ``DEBUG`` and ``PROPAGATE_EXCEPTIONS`` arranges - so the client
+        received a real 500 over TCP and the ledger gained nothing. ``fail_closed`` cannot
+        help there, because the failure is upstream of the audit write.
+        """
         app.before_request(self._before_request)
         app.after_request(self._after_request)
+        app.teardown_request(self._teardown_request)
+        # weak=False: the receiver is a bound method, and a weak reference to one dies
+        # immediately, which would leave the signal connected to nothing.
+        got_request_exception.connect(self._note_exception, app, weak=False)
         app.extensions[EXTENSION_KEY] = self
 
     # -- hooks -------------------------------------------------------------------------
@@ -199,6 +240,7 @@ class SignLedgerAudit:
         """
         if self._skip(request.path):
             return
+        setattr(g, _AUDITED_KEY, True)
         policy = self.recorder.redaction
         decision = policy.body_decision(
             content_length=request.content_length,
@@ -252,6 +294,7 @@ class SignLedgerAudit:
             method=request.method,
             path=request.path,
             status=response.status_code,
+            error=getattr(g, _ERROR_KEY, None),
             kind=KIND_REQUEST,
             **context["shape"],
             request_id=context["request_id"],
@@ -263,6 +306,7 @@ class SignLedgerAudit:
         # Raises AuditWriteError under fail_closed, which Flask turns into a 500. An
         # unaudited request must not be able to answer 200.
         self.recorder.record(record, {"integration": INTEGRATION})
+        setattr(g, _RECORDED_KEY, True)
         if streamed:
             response.response = _SettlingBody(
                 response.response, functools.partial(self._settle, context)
@@ -290,6 +334,56 @@ class SignLedgerAudit:
         # No failing closed here: the client has had the response since the first chunk.
         # The recorder has counted the failure and named it, so this is not a swallowed
         # error - it is one with nowhere left to go.
+        with contextlib.suppress(AuditWriteError):
+            self.recorder.record(record, {"integration": INTEGRATION})
+
+    def _note_exception(self, sender: Any, exception: BaseException, **extra: Any) -> None:
+        """Remember what failed, while it is still knowable.
+
+        ``after_request`` receives a response and no exception, so the entry it wrote for
+        a handled 500 named no cause at all - ``WHERE error IS NOT NULL`` came back
+        structurally empty on Flask however many times a view had blown up. Flask sends
+        this signal for every unhandled exception, whether it goes on to render a 500 or
+        to propagate, so one receiver covers both paths.
+        """
+        setattr(g, _ERROR_KEY, type(exception).__name__)
+
+    def _teardown_request(self, exception: Optional[BaseException]) -> None:
+        """Audit a request whose exception escaped before ``after_request`` could run.
+
+        Only fires when there is an exception *and* nothing has been recorded yet, so it
+        cannot double-count the ordinary path. The status is 500 because that is what the
+        server sends once an exception reaches it - which is the point: the client got one,
+        and until this existed the ledger had no memory of the request at all.
+
+        Failing closed here would be theatre. The response is already being assembled by
+        the server, so raising would replace one 500 with another while losing the record
+        a second time; the recorder counts and names the failure instead.
+        """
+        if exception is None:
+            return
+        if not getattr(g, _AUDITED_KEY, False) or getattr(g, _RECORDED_KEY, False):
+            return
+        policy = self.recorder.redaction
+        record = build_audit_record(
+            integration=INTEGRATION,
+            method=request.method,
+            path=request.path,
+            status=500,
+            client_ip=policy.client_ip(
+                peer=request.remote_addr,
+                forwarded_for=request.headers.get("X-Forwarded-For"),
+            ),
+            headers=policy.headers(dict(request.headers)),
+            query=policy.query(request.args.to_dict(flat=False)),
+            body=getattr(g, _BODY_KEY, None),
+            body_reason=getattr(g, _REASON_KEY, "disabled"),
+            user=self._user(),
+            error=type(exception).__name__,
+            kind=KIND_REQUEST,
+            completion=COMPLETION_FINAL,
+        )
+        setattr(g, _RECORDED_KEY, True)
         with contextlib.suppress(AuditWriteError):
             self.recorder.record(record, {"integration": INTEGRATION})
 

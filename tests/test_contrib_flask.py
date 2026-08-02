@@ -11,6 +11,7 @@ that went through a real WSGI stack and a real hash-chained entry that came back
 real backend.
 """
 
+import contextlib
 import json
 import subprocess
 import sys
@@ -903,3 +904,90 @@ def test_a_streamed_response_is_still_provisional(ledger: Ledger) -> None:
     run_wsgi(streaming_app(ledger), "/stream")
 
     assert entries(ledger)[0].data["completion"] == "provisional"
+
+
+# --------------------------------------------------------------------------------------
+# a request that fails must still be audited
+# --------------------------------------------------------------------------------------
+
+
+def propagating_app(ledger: Ledger, **config: Any) -> Flask:
+    """An app configured the way pytest, staging and `flask run --debug` configure it."""
+    app = Flask(__name__)
+    app.config.update(config)
+    SignLedgerAudit(app, ledger=ledger)
+
+    @app.get("/boom")
+    def boom() -> str:
+        raise RuntimeError("view exploded")
+
+    return app
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"TESTING": True},
+        {"DEBUG": True},
+        {"PROPAGATE_EXCEPTIONS": True},
+    ],
+    ids=["testing", "debug", "propagate"],
+)
+def test_a_view_that_raises_is_audited_even_when_the_exception_propagates(
+    ledger: Ledger, config: Dict[str, Any]
+) -> None:
+    """``after_request`` does not run when the exception leaves the app, so the client
+    got a real 500 over TCP and the ledger gained nothing: ``fail_closed`` could not help,
+    ``audit_failures`` stayed 0, and ``check_integrity()`` reported ok on a chain with no
+    memory of the request. Three configurations reach it, and two of them - pytest and
+    ``--debug`` - are what people develop against."""
+    app = propagating_app(ledger, **config)
+    with contextlib.suppress(RuntimeError):
+        run_wsgi(app, "/boom")
+
+    assert len(entries(ledger)) == 1
+
+
+@pytest.mark.parametrize(
+    "config", [{"TESTING": True}, {"PROPAGATE_EXCEPTIONS": True}], ids=["testing", "propagate"]
+)
+def test_a_propagated_failure_is_recorded_as_a_500(
+    ledger: Ledger, config: Dict[str, Any]
+) -> None:
+    app = propagating_app(ledger, **config)
+    with contextlib.suppress(RuntimeError):
+        run_wsgi(app, "/boom")
+
+    assert entries(ledger)[0].data["status"] == 500
+
+
+def test_a_propagated_failure_names_the_exception(ledger: Ledger) -> None:
+    """``error`` reached ``build_audit_record`` from one of three call sites, so
+    ``WHERE error IS NOT NULL`` was structurally empty on Flask."""
+    app = propagating_app(ledger, TESTING=True)
+    with contextlib.suppress(RuntimeError):
+        run_wsgi(app, "/boom")
+
+    assert entries(ledger)[0].data["error"] == "RuntimeError"
+
+
+def test_a_handled_failure_also_names_the_exception(ledger: Ledger) -> None:
+    """The path that already wrote an entry wrote it without an ``error`` field."""
+    app = make_app(ledger)
+    app.test_client().get("/boom")
+
+    assert entries(ledger)[0].data["error"] == "RuntimeError"
+
+
+def test_a_request_that_succeeds_has_no_error_key(ledger: Ledger) -> None:
+    make_app(ledger).test_client().get("/items")
+
+    assert "error" not in entries(ledger)[0].data
+
+
+def test_a_propagated_failure_is_audited_exactly_once(ledger: Ledger) -> None:
+    """The backstop and the normal path must not both fire."""
+    app = make_app(ledger)
+    app.test_client().get("/boom")
+
+    assert len(entries(ledger)) == 1
