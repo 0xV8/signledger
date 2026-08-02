@@ -11,6 +11,9 @@ that no backend reports ``worm``. An insider with DDL rights removes it in one s
 which is exactly why signatures and external anchors have to carry the real guarantee.
 """
 
+import json
+from dataclasses import replace
+
 import pytest
 
 from signledger.anchor.sinks import FileAnchorSink
@@ -18,7 +21,7 @@ from signledger.backends.base import serialize_payload
 from signledger.backends.memory import MemoryBackend
 from signledger.backends.sqlite import SQLiteBackend
 from signledger.core.ledger import Ledger
-from signledger.core.verification import FailureKind, verify_chain
+from signledger.core.verification import AssuranceLevel, FailureKind, verify_chain
 
 # --------------------------------------------------------------------------------------
 # adversaries - real write access to a real store
@@ -52,6 +55,9 @@ class MemoryAdversary:
             self.backend._entries[index] = stripped
             self.backend._by_entry_id[stripped.entry_id] = stripped
 
+    def clear_checkpoints(self):
+        self.backend._checkpoints.clear()
+
 
 class SQLiteAdversary:
     """A DBA with UPDATE and DELETE on the table, plus the DDL rights to unlock it."""
@@ -83,6 +89,13 @@ class SQLiteAdversary:
     def strip_signatures(self):
         self.backend._connection().execute(
             f"UPDATE {self.table} SET signature = NULL"  # noqa: S608
+        )
+
+    def clear_checkpoints(self):
+        # No DDL needed: the checkpoints table carries no append-only triggers, which is
+        # itself why a local checkpoint is not evidence against the insider.
+        self.backend._connection().execute(
+            f"DELETE FROM {self.backend.checkpoints_table}"  # noqa: S608
         )
 
 
@@ -120,6 +133,18 @@ def sink(tmp_path):
 
 def kinds(report):
     return [failure.kind for failure in report.failures]
+
+
+def _resign(checkpoint, signer):
+    """Re-sign a doctored checkpoint so its signature is genuinely valid.
+
+    Without this the signature check would catch every attack below and the other checks
+    would never be exercised - each one has to be shown to stand on its own.
+    """
+    from signledger.anchor.sinks import checkpoint_signing_payload
+
+    stamped = replace(checkpoint, key_id=signer.key_id)
+    return replace(stamped, signature=signer.sign(checkpoint_signing_payload(stamped)))
 
 
 # --------------------------------------------------------------------------------------
@@ -542,3 +567,368 @@ def test_the_re_rooted_chain_is_internally_flawless(store):
         assert forged.check_integrity().ok is True
     finally:
         forged_store.close()
+
+
+# --------------------------------------------------------------------------------------
+# 6. checkpoint forgery - the checkpoint is signed, so it has to be verified
+# --------------------------------------------------------------------------------------
+#
+# A checkpoint is the only thing that sees a truncated tail, which makes it the thing an
+# attacker goes for next. Every attack below was demonstrated succeeding against
+# rebuild/v2.0.0 at commit 6681640: each one restored ``ok=True``, and several *raised*
+# the reported assurance above what the intact ledger had earned.
+
+
+def anchor_lines(path):
+    with open(path, encoding="utf-8") as handle:
+        return [line for line in handle.read().splitlines() if line.strip()]
+
+
+def rewrite_anchor(path, lines):
+    with open(path, "w", encoding="utf-8") as handle:
+        for line in lines:
+            handle.write(line + "\n")
+
+
+def forge_anchor_line(line, **fields):
+    """Rewrite one published anchor record the way someone with the file would."""
+    record = json.loads(line)
+    record.update(fields)
+    return json.dumps(record, sort_keys=True, ensure_ascii=False)
+
+
+@pytest.fixture
+def reachable_sink(tmp_path):
+    """An anchor on a path the adversary in *these* tests does reach.
+
+    The separate fixture is the point: the attacks above are earned by an anchor the
+    insider cannot touch, and the attacks below ask what is left when they can.
+    """
+    return FileAnchorSink(str(tmp_path / "reachable.jsonl"))
+
+
+def signed_ledger(store, sink, signer, count=6):
+    ledger = Ledger(store, anchor_sink=sink, enable_signatures=True, signer=signer)
+    for index in range(count):
+        ledger.append({"n": index})
+    return ledger
+
+
+def test_a_forged_anchor_line_cannot_launder_a_truncated_chain(
+    store, adversary, reachable_sink, signer
+):
+    """The attack that motivated this section: truncate, then rewrite the anchor to
+    describe the shorter chain. The signature is garbage and the key is one no resolver
+    can supply, which is exactly what verification never looked at."""
+    ledger = signed_ledger(store, reachable_sink, signer)
+    ledger.checkpoint()
+
+    adversary.truncate_from(4)
+    head = store.get_by_sequence(3)
+    # The store's own copy goes too. Leaving it would have the genuine local checkpoint
+    # outrank the forgery and catch the truncation without the forged line ever being
+    # inspected - which is the right behaviour, and is covered by the rollback test. What
+    # is under test here is the anchor path standing on its own.
+    adversary.clear_checkpoints()
+    rewrite_anchor(
+        reachable_sink.path,
+        [
+            forge_anchor_line(
+                anchor_lines(reachable_sink.path)[0],
+                sequence=3,
+                head_hash=head.hash,
+                entry_count=4,
+                merkle_root="00" * 32,
+                signature="Zm9yZ2VkLXNpZ25hdHVyZQ==",
+                key_id="attacker-key-not-in-any-resolver",
+            )
+        ],
+    )
+
+    assert ledger.check_integrity().ok is False
+
+
+def test_a_forged_anchor_is_reported_as_an_unknown_checkpoint_key(
+    store, adversary, reachable_sink, signer
+):
+    ledger = signed_ledger(store, reachable_sink, signer)
+    ledger.checkpoint()
+
+    adversary.truncate_from(4)
+    head = store.get_by_sequence(3)
+    # The store's own copy goes too. Leaving it would have the genuine local checkpoint
+    # outrank the forgery and catch the truncation without the forged line ever being
+    # inspected - which is the right behaviour, and is covered by the rollback test. What
+    # is under test here is the anchor path standing on its own.
+    adversary.clear_checkpoints()
+    rewrite_anchor(
+        reachable_sink.path,
+        [
+            forge_anchor_line(
+                anchor_lines(reachable_sink.path)[0],
+                sequence=3,
+                head_hash=head.hash,
+                entry_count=4,
+                merkle_root="00" * 32,
+                signature="Zm9yZ2VkLXNpZ25hdHVyZQ==",
+                key_id="attacker-key-not-in-any-resolver",
+            )
+        ],
+    )
+
+    assert FailureKind.CHECKPOINT_UNKNOWN_KEY in kinds(ledger.check_integrity())
+
+
+def test_a_forged_anchor_cannot_raise_assurance_above_none(
+    store, adversary, reachable_sink, signer
+):
+    """The forgery did not merely hide the truncation - it *upgraded* the reported
+    assurance, because a forged anchor line reads as an anchor."""
+    ledger = signed_ledger(store, reachable_sink, signer)
+    ledger.checkpoint()
+
+    adversary.truncate_from(4)
+    head = store.get_by_sequence(3)
+    # The store's own copy goes too. Leaving it would have the genuine local checkpoint
+    # outrank the forgery and catch the truncation without the forged line ever being
+    # inspected - which is the right behaviour, and is covered by the rollback test. What
+    # is under test here is the anchor path standing on its own.
+    adversary.clear_checkpoints()
+    rewrite_anchor(
+        reachable_sink.path,
+        [
+            forge_anchor_line(
+                anchor_lines(reachable_sink.path)[0],
+                sequence=3,
+                head_hash=head.hash,
+                entry_count=4,
+                merkle_root="00" * 32,
+                signature="Zm9yZ2VkLXNpZ25hdHVyZQ==",
+                key_id="attacker-key-not-in-any-resolver",
+            )
+        ],
+    )
+
+    assert ledger.check_integrity().assurance is AssuranceLevel.NONE
+
+
+def test_a_forged_local_checkpoint_cannot_launder_a_truncated_chain(
+    store, adversary, signer
+):
+    """No anchor, no DDL, no key: one UPDATE on a table that carries no append-only
+    trigger. This is the insider the contract puts in scope, and it was the cheapest of
+    all the attacks in this section."""
+    ledger = Ledger(store, enable_signatures=True, signer=signer)
+    for index in range(6):
+        ledger.append({"n": index})
+    ledger.checkpoint()
+
+    adversary.truncate_from(4)
+    head = store.get_by_sequence(3)
+    genuine = store.get_latest_checkpoint()
+    adversary.clear_checkpoints()
+    store.save_checkpoint(
+        replace(
+            genuine,
+            sequence=3,
+            head_hash=head.hash,
+            entry_count=4,
+            merkle_root="ff" * 32,
+            signature="Zm9yZ2Vk",
+            key_id="attacker-key",
+        )
+    )
+
+    assert ledger.check_integrity().ok is False
+
+
+def test_a_checkpoint_whose_signature_does_not_verify_is_rejected(
+    store, adversary, signer
+):
+    """The key resolves; the signature over it does not. Distinct from an unknown key,
+    and it earns its own failure kind so an operator can tell them apart."""
+    ledger = Ledger(store, enable_signatures=True, signer=signer)
+    for index in range(6):
+        ledger.append({"n": index})
+    ledger.checkpoint()
+
+    genuine = store.get_latest_checkpoint()
+    adversary.clear_checkpoints()
+    store.save_checkpoint(replace(genuine, signature="Zm9yZ2VkLXNpZ25hdHVyZQ=="))
+
+    assert FailureKind.CHECKPOINT_BAD_SIGNATURE in kinds(ledger.check_integrity())
+
+
+def test_a_checkpoint_carrying_no_signature_is_rejected_when_signing_is_on(
+    store, adversary, signer
+):
+    ledger = Ledger(store, enable_signatures=True, signer=signer)
+    for index in range(6):
+        ledger.append({"n": index})
+    ledger.checkpoint()
+
+    genuine = store.get_latest_checkpoint()
+    adversary.clear_checkpoints()
+    store.save_checkpoint(replace(genuine, signature=None, key_id=None))
+
+    assert FailureKind.CHECKPOINT_UNSIGNED in kinds(ledger.check_integrity())
+
+
+def test_a_checkpoint_with_the_wrong_merkle_root_is_rejected(store, adversary, signer):
+    """``merkle_root`` is computed, signed and published, and was then never recomputed.
+    The store holds exactly the entries needed to check it."""
+    ledger = Ledger(store, enable_signatures=True, signer=signer)
+    for index in range(6):
+        ledger.append({"n": index})
+    ledger.checkpoint()
+
+    genuine = store.get_latest_checkpoint()
+    adversary.clear_checkpoints()
+    store.save_checkpoint(_resign(replace(genuine, merkle_root="00" * 32), signer))
+
+    assert FailureKind.CHECKPOINT_MERKLE_MISMATCH in kinds(ledger.check_integrity())
+
+
+def test_a_checkpoint_belonging_to_another_ledger_is_rejected(store, adversary, signer):
+    """Signed by a key this deployment trusts, and describing somebody else's chain."""
+    ledger = Ledger(store, enable_signatures=True, signer=signer)
+    for index in range(6):
+        ledger.append({"n": index})
+    ledger.checkpoint()
+
+    genuine = store.get_latest_checkpoint()
+    adversary.clear_checkpoints()
+    store.save_checkpoint(_resign(replace(genuine, ledger_id="someone-else"), signer))
+
+    assert FailureKind.CHECKPOINT_LEDGER_MISMATCH in kinds(ledger.check_integrity())
+
+
+def test_a_checkpoint_in_an_unreadable_format_is_rejected(store, adversary, signer):
+    """Refusing beats guessing: nothing in this build knows what a format it has never
+    seen was supposed to bind."""
+    ledger = Ledger(store, enable_signatures=True, signer=signer)
+    for index in range(6):
+        ledger.append({"n": index})
+    ledger.checkpoint()
+
+    genuine = store.get_latest_checkpoint()
+    adversary.clear_checkpoints()
+    store.save_checkpoint(_resign(replace(genuine, format_version=999), signer))
+
+    assert FailureKind.CHECKPOINT_FORMAT_UNSUPPORTED in kinds(ledger.check_integrity())
+
+
+def test_a_rolled_back_anchor_does_not_outrank_what_the_store_remembers(
+    store, reachable_sink, signer
+):
+    """The anchor was preferred over the local checkpoint unconditionally, on the
+    reasoning that the local copy is the one an insider controls. That makes anyone who
+    reaches the anchor file a downgrade oracle: roll it back and the store's own
+    contradicting evidence is discarded unread. Both are consulted now, and the newer
+    wins - so the rollback buys nothing on its own."""
+    ledger = signed_ledger(store, reachable_sink, signer, count=4)
+    ledger.checkpoint()
+    for index in range(4):
+        ledger.append({"n": 100 + index})
+    ledger.checkpoint()
+
+    rewrite_anchor(reachable_sink.path, [anchor_lines(reachable_sink.path)[0]])
+
+    assert ledger.check_integrity().checkpoint_used.sequence == 7
+
+
+def test_rolling_the_anchor_back_does_not_hide_a_truncation(
+    store, adversary, reachable_sink, signer
+):
+    """The rollback only pays off combined with damage, which is what this pins: the
+    older anchor describes a chain the truncated one is a prefix of, so on the old
+    behaviour it reconciled. The store's own newer checkpoint is what refuses it."""
+    ledger = signed_ledger(store, reachable_sink, signer, count=4)
+    ledger.checkpoint()
+    for index in range(4):
+        ledger.append({"n": 100 + index})
+    ledger.checkpoint()
+
+    adversary.truncate_from(4)
+    rewrite_anchor(reachable_sink.path, [anchor_lines(reachable_sink.path)[0]])
+
+    assert ledger.check_integrity().ok is False
+
+
+def test_an_anchor_that_is_behind_confers_no_anchored_assurance(
+    store, reachable_sink, signer
+):
+    """An anchor holding an older head is not holding *this* head, so the deployment has
+    not earned the anchored label. Reported as assurance rather than as a failure: the
+    commonest cause by far is a publish that did not land, and an integrity report is the
+    wrong place to raise an operational alarm."""
+    ledger = signed_ledger(store, reachable_sink, signer, count=4)
+    ledger.checkpoint()
+    for index in range(4):
+        ledger.append({"n": 100 + index})
+    ledger.checkpoint()
+
+    rewrite_anchor(reachable_sink.path, [anchor_lines(reachable_sink.path)[0]])
+
+    report = ledger.check_integrity()
+    assert report.ok is True
+    assert report.assurance is AssuranceLevel.SIGNED
+
+
+def test_emptying_the_anchor_costs_the_anchored_assurance(
+    store, reachable_sink, signer
+):
+    """Deleting the anchor used to be free: the local copy was never consulted once a
+    sink was configured, so an empty anchor file meant no checkpoint, and no checkpoint
+    meant no check *and* no failure. The store's copy is read now, so the chain is still
+    checked - and nobody outside the process holds this head, so the anchored label is
+    gone."""
+    ledger = signed_ledger(store, reachable_sink, signer)
+    ledger.checkpoint()
+
+    rewrite_anchor(reachable_sink.path, [])
+
+    report = ledger.check_integrity()
+    assert report.assurance is AssuranceLevel.SIGNED
+
+
+def test_emptying_the_anchor_does_not_hide_a_truncation(
+    store, adversary, reachable_sink, signer
+):
+    """The half that is a security property rather than a label."""
+    ledger = signed_ledger(store, reachable_sink, signer)
+    ledger.checkpoint()
+
+    adversary.truncate_from(4)
+    rewrite_anchor(reachable_sink.path, [])
+
+    assert ledger.check_integrity().ok is False
+
+
+def test_an_attacker_holding_both_the_store_and_the_anchor_is_not_detected(
+    store, adversary, reachable_sink, signer
+):
+    """The honest limit of this mechanism, pinned so nobody claims otherwise.
+
+    Roll the chain *and* both copies of the evidence back to a genuinely signed older
+    checkpoint and everything reconciles, because it is a true statement about a chain
+    that really did exist. Freshness cannot be established from inside a system the
+    attacker fully controls. The defence is operational - an anchor the ledger host
+    cannot write - and SECURITY.md says so rather than implying the chain self-defends.
+
+    The same limit covers wiping every copy of the evidence: a ledger that was
+    checkpointed and then wiped is indistinguishable from one that was never
+    checkpointed, so the reportable case is the *inconsistent* one - an anchor that has
+    lost what the store still holds, which the two tests above cover.
+    """
+    ledger = signed_ledger(store, reachable_sink, signer, count=4)
+    ledger.checkpoint()
+    for index in range(4):
+        ledger.append({"n": 100 + index})
+    ledger.checkpoint()
+
+    adversary.truncate_from(4)
+    rewrite_anchor(reachable_sink.path, [anchor_lines(reachable_sink.path)[0]])
+    adversary.clear_checkpoints()
+
+    assert ledger.check_integrity().ok is True
