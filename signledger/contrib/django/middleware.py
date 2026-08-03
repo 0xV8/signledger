@@ -3,14 +3,27 @@
 One ledger entry per request, plus an optional row in the ORM index so the trail can be
 searched with the ORM and the admin. The ledger is the evidence; the index is a
 convenience, and it is never allowed to be the reason a request fails.
+
+Nor is auditing itself. That promise has two halves, and both of them were broken on a
+path nothing executed: reading a body for the record must never be what fails a request
+(see :meth:`SignLedgerAuditMiddleware._body`), and wrapping a response body to find out
+how it ended must never be what breaks the response (see :class:`AsyncSettlingBody`).
+
+The middleware is sync and declares neither ``sync_capable`` nor ``async_capable``, so
+under ASGI Django wraps it in ``sync_to_async(thread_sensitive=True)``. That is a
+deliberate non-decision: it was measured not to serialise anything - four concurrent
+async views sleeping 0.3s finish in 0.31s - and a second, async implementation of this
+class would be a second place for the audit semantics to drift.
 """
 
 import functools
 import logging
 import sys
 import uuid
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, Optional, Tuple
 
+from asgiref.sync import sync_to_async
+from django.core.exceptions import RequestDataTooBig
 from django.core.signals import got_request_exception
 from django.db import IntegrityError, transaction
 
@@ -32,7 +45,7 @@ from signledger.contrib.django import _resolve, get_ledger, get_settings
 from signledger.contrib.django.models import AuditIndex
 from signledger.contrib.redaction import RedactionPolicy
 
-__all__ = ["INTEGRATION", "SignLedgerAuditMiddleware"]
+__all__ = ["INTEGRATION", "AsyncSettlingBody", "SignLedgerAuditMiddleware"]
 
 #: Name recorded in every entry this integration writes.
 INTEGRATION = "django"
@@ -66,6 +79,67 @@ def _note_exception(sender: Any, request: Any = None, **kwargs: Any) -> None:
 # instances Django builds there is exactly one receiver and nothing holds a reference to
 # a handler that has gone away.
 got_request_exception.connect(_note_exception, dispatch_uid="signledger.audit")
+
+
+class AsyncSettlingBody:
+    """An async streamed response body that reports how it ended.
+
+    :class:`~signledger.contrib.SettlingBody` is a sync iterable, and it cannot wrap this
+    one - it makes things *worse*. ``StreamingHttpResponse._set_streaming_content``
+    decides whether it is holding a sync or an async body by trying ``iter(value)``;
+    ``SettlingBody`` answers that successfully, so an async response wrapped in it was
+    flipped to ``is_async = False`` and ``ASGIHandler`` then raised
+    ``TypeError: 'async_generator' object is not iterable`` with the 200 status line
+    already on the wire and none of the body behind it. Measured: on the shipped code an
+    async stream delivered zero bytes. This class deliberately defines ``__aiter__`` and
+    no ``__iter__``, so the same check answers correctly.
+
+    Where the settlement happens is not a free choice either, and it is not the same
+    place as under WSGI. Verified by execution against ``ASGIHandler``:
+
+    * ``send_response`` consumes the body inside ``aclosing(aiter(response))``, and the
+      thing it closes is Django's *own* ``__aiter__`` wrapper, never this object;
+    * ``handle`` awaits ``response.close()`` - which is what runs ``_resource_closers``,
+      the hook WSGI settles from - only *after* ``send_response`` returns. When the body
+      raises, ``send_response`` does not return, so on the one path a settlement matters
+      most there is no close call at all.
+
+    So the outcome is recorded from inside the iteration, in a ``finally``, which is the
+    one place reached by all three endings: exhausted, raised, and closed early by a
+    client that hung up mid-stream. That is also why nothing here defines ``close``:
+    Django would register it in ``_resource_closers`` and settle a second time.
+
+    The settle itself is put back on a thread with
+    ``sync_to_async(thread_sensitive=True)``. It writes a ledger entry and an ORM row, and
+    the ORM refuses to be called from a running event loop with ``SynchronousOnlyOperation``
+    - so settling inline would have replaced a wrong audit record with no audit record.
+    ``thread_sensitive`` puts it on the same thread the rest of this request's sync work
+    ran on, which is the one holding that thread's database connection.
+    """
+
+    def __init__(self, body: Any, settle: Any) -> None:
+        # Untyped for the same reason ``SettlingBody`` is: what a body yields is between
+        # the view and Django's ``make_bytes``, and every chunk passes through untouched.
+        self._body = body
+        self._settle = settle
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        complete = False
+        error: Optional[str] = None
+        try:
+            async for chunk in self._body:
+                yield chunk
+            complete = True
+        except Exception as err:
+            # Named, not swallowed: it is re-raised into the handler unchanged, and the
+            # audit record is the only place it would otherwise leave no trace.
+            error = type(err).__name__
+            raise
+        finally:
+            # Also reached on ``GeneratorExit``, which is what a disconnected client
+            # eventually produces. That settles ``complete=False`` with no exception
+            # named, which is the honest reading: the body stopped and nothing failed.
+            await sync_to_async(self._settle, thread_sensitive=True)(complete, error)
 
 
 class SignLedgerAuditMiddleware:
@@ -151,9 +225,16 @@ class SignLedgerAuditMiddleware:
             completion=COMPLETION_PROVISIONAL if streamed else COMPLETION_FINAL,
         )
         if streamed:
-            response.streaming_content = SettlingBody(
-                response.streaming_content,
-                functools.partial(self._settle, context, response.status_code),
+            settle = functools.partial(self._settle, context, response.status_code)
+            # ``is_async`` is set by ``_set_streaming_content`` when the view handed
+            # ``StreamingHttpResponse`` an async iterator, and it is the only thing that
+            # says which of the two server models will consume this body. Wrapping with
+            # the wrong one does not degrade - it breaks the response outright.
+            body = response.streaming_content
+            response.streaming_content = (
+                AsyncSettlingBody(body, settle)
+                if getattr(response, "is_async", False)
+                else SettlingBody(body, settle)
             )
         return response
 
@@ -248,13 +329,58 @@ class SignLedgerAuditMiddleware:
     # -- internals ---------------------------------------------------------------------
 
     def _body(self, request: Any) -> Tuple[Any, str]:
+        """The redacted body, or a marker naming whatever refused to hand it over.
+
+        Reading a body for audit must never be the reason a request fails, and it was.
+        ``RedactionPolicy.max_body_bytes`` (8192 by default) and Django's
+        ``DATA_UPLOAD_MAX_MEMORY_SIZE`` (2621440) are independent settings with no
+        cross-check, so any deployment that hardens Django's limit below ours - or raises
+        ours above Django's - has a band of request sizes this policy admits and Django
+        then refuses. ``request.body`` raises ``RequestDataTooBig`` here, *before*
+        ``get_response``, which is outside the ``except`` in :meth:`__call__`: measured on
+        that code, three requests produced two entries and the 400 the auditor itself had
+        caused had none at all. An audit middleware that manufactures unaudited failures
+        is the one failure mode this integration cannot have.
+
+        So capture degrades to a marker, exactly as an over-length or unparseable body
+        already does, and *nothing else changes*: the view still asks for the body if it
+        wants it, Django still refuses it, and the client still gets the 400 that limit
+        exists to produce - now with a ledger entry saying so. A view that never touches
+        the body is served normally, which is what would have happened with no audit
+        middleware installed at all. Honouring Django's policy and recording the request
+        were never in tension; asking on the view's behalf was what made them look so.
+
+        ``RequestDataTooBig`` is named separately from everything else because the two
+        failures need different answers. It says two configured limits disagree - a
+        deployment-wide condition that will refuse every large body until someone changes
+        a setting, and which :func:`~signledger.contrib.django.apps.check_body_capture_limits`
+        reports at startup. Anything else - ``RawPostDataException`` from a middleware
+        above this one having already read the stream, ``UnreadablePostError`` from a
+        client that hung up mid-upload - is about this one request.
+        """
         decision = self.redaction.body_decision(
             content_length=_content_length(request),
             content_type=request.content_type or None,
         )
         if not decision.capture:
-            return None, decision.reason
-        return self.redaction.decode_body(request.body), "captured"
+            return None, _body_reason(request, decision.reason)
+        try:
+            raw = request.body
+        except RequestDataTooBig:
+            return None, "over-request-limit"
+        except Exception as err:  # noqa: BLE001 - counted and logged, never swallowed
+            self.recorder.audit_failures += 1
+            self.recorder.last_audit_error = type(err).__name__
+            # The exception type only. ``UnreadablePostError`` wraps an OSError whose
+            # message can carry request data: contract section 10.
+            logger.warning(
+                "the request body could not be read for audit (%s). The entry records "
+                "[OMITTED:unreadable] in its place and the request is served exactly as "
+                "it would have been without this middleware.",
+                type(err).__name__,
+            )
+            return None, "unreadable"
+        return self.redaction.decode_body(raw), "captured"
 
     def _user(self, request: Any) -> Optional[str]:
         """The acting identity, from ``USER_RESOLVER`` if a deployment named one.
@@ -368,3 +494,28 @@ def _content_length(request: Any) -> Optional[int]:
     except (TypeError, ValueError):
         # An unparseable length is no length at all, and capture will refuse it.
         return None
+
+
+def _body_reason(request: Any, reason: str) -> str:
+    """Separate a body nobody sent from a body whose length a client withheld.
+
+    ``body_decision`` is given a length and a content type and cannot tell the two apart:
+    a plain ``GET`` and a ``Transfer-Encoding: chunked`` upload both arrive with no
+    declared length and both recorded ``[OMITTED:no-content-length]``. That reads as an
+    unremarkable policy outcome, so any client could switch body capture off for itself
+    by chunking and leave an entry indistinguishable from the millions of GETs around it.
+    Reachable in practice: gunicorn and uWSGI dechunk without setting ``CONTENT_LENGTH``.
+
+    Capture still cannot happen - the size can only be checked against a length that was
+    declared, and Django's WSGI handler reads nothing at all from a body it was given no
+    length for - but the record now says which of the two happened, which is the whole
+    job of a ``body_reason``.
+
+    The framing header is only visible at the server boundary, which is why this sits
+    here rather than in :class:`~signledger.contrib.redaction.RedactionPolicy`, and why
+    ``no-content-length`` is left exactly as it was for every request that really did
+    send no body: that marker is what Flask and FastAPI write for the same traffic.
+    """
+    if reason == "no-content-length" and request.META.get("HTTP_TRANSFER_ENCODING"):
+        return "undeclared-length"
+    return reason
