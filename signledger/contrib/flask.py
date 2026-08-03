@@ -113,7 +113,7 @@ blown up.
 import contextlib
 import functools
 import uuid
-from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 from flask import Blueprint, Flask, Response, g, jsonify, request
 from flask.signals import got_request_exception
@@ -125,6 +125,7 @@ from signledger.contrib import (
     OUTCOME_INCOMPLETE,
     AuditRecorder,
     AuditWriteError,
+    SettlingBody,
     build_audit_record,
     is_skipped,
     will_send_body,
@@ -308,7 +309,7 @@ class SignLedgerAudit:
         self.recorder.record(record, {"integration": INTEGRATION})
         setattr(g, _RECORDED_KEY, True)
         if streamed:
-            response.response = _SettlingBody(
+            response.response = SettlingBody(
                 response.response, functools.partial(self._settle, context)
             )
         return response
@@ -417,60 +418,6 @@ def _will_stream(response: Response) -> bool:
     question differently, and an auditor's query cannot depend on which one wrote the row.
     """
     return response.content_length is None
-
-
-class _SettlingBody:
-    """A streamed response body that reports how it ended.
-
-    PEP 3333 requires a server to call ``close()`` on the response iterable "upon
-    completion of the current request, whether the request was completed normally or
-    terminated early due to an application error". That call is the only moment at which
-    the outcome of a streamed response is knowable, and it happens after Flask has torn
-    the request context down - so everything the settlement needs is captured in the
-    closure, and nothing here touches ``request`` or ``g``.
-
-    Wrapping the body rather than using ``Response.call_on_close`` is deliberate twice
-    over: a close callback cannot tell a body that finished from one that died, and
-    werkzeug skips the callbacks entirely for a ``direct_passthrough`` response - which
-    is what ``send_file`` returns.
-    """
-
-    def __init__(
-        self,
-        body: Iterable[Any],
-        settle: Callable[[bool, Optional[str]], None],
-    ) -> None:
-        # ``Iterable[Any]`` rather than ``Iterable[bytes]``: werkzeug allows a body to
-        # yield ``str`` and encodes it later, and every chunk passes through here
-        # untouched, so its type is genuinely none of this class's business.
-        self._body = body
-        self._settle = settle
-        self._complete = False
-        self._error: Optional[str] = None
-        self._settled = False
-
-    def __iter__(self) -> Iterator[Any]:
-        try:
-            yield from self._body
-        except Exception as err:
-            # Named, not swallowed: it is re-raised into the server unchanged, and the
-            # audit record is the only place it would otherwise leave no trace.
-            self._error = type(err).__name__
-            raise
-        self._complete = True
-
-    def close(self) -> None:
-        if self._settled:
-            # Servers and test clients both close responses more than once. A second
-            # settlement entry for one response would be a second claim, not a repeat.
-            return
-        self._settled = True
-        close = getattr(self._body, "close", None)
-        if close is not None:
-            # A generator holds a file handle open until it is closed. Wrapping a body
-            # must not be what leaks it.
-            close()
-        self._settle(self._complete, self._error)
 
 
 def audit_blueprint(
@@ -594,3 +541,7 @@ def _as_int(raw: Optional[str], default: int) -> int:
     except ValueError:
         raise ValueError("expected an integer") from None
 
+
+#: The shared implementation, under the name this module used to define it with, for
+#: anything that reached in and patched it.
+_SettlingBody: Any = SettlingBody

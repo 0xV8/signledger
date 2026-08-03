@@ -77,7 +77,11 @@ from django.core.exceptions import ImproperlyConfigured  # noqa: E402
 from django.core.management import call_command  # noqa: E402
 from django.core.management.base import SystemCheckError  # noqa: E402
 from django.db import connection, transaction  # noqa: E402
-from django.http import HttpResponse, JsonResponse  # noqa: E402
+from django.http import (  # noqa: E402
+    HttpResponse,
+    JsonResponse,
+    StreamingHttpResponse,
+)
 from django.test import Client, override_settings  # noqa: E402
 from django.urls import path, reverse  # noqa: E402
 
@@ -197,6 +201,17 @@ def audited(**options: Any) -> Any:
 
 def entries() -> List[Any]:
     return list(get_ledger().iter_entries())
+
+
+@pytest.fixture
+def audited_ledger() -> Iterator[Any]:
+    """A configured ledger plus an empty mirror, for the streaming and failure tests."""
+    with audited():
+        AuditIndex.objects.all().delete()
+        yield get_ledger()
+        AuditIndex.objects.all().delete()
+    reset_ledger()
+    CURRENT.clear()
 
 
 # ======================================================================================
@@ -1283,3 +1298,167 @@ def test_a_django_entry_has_the_same_shape_as_a_flask_one() -> None:
         django_keys = set(entries()[0].data)
 
     assert django_keys == flask_keys
+
+
+# ======================================================================================
+# Streaming, failure, and what the mirror can express
+# ======================================================================================
+
+
+def stream_view(request: Any) -> HttpResponse:
+    def body() -> Iterator[bytes]:
+        yield b'{"row": 0}\n'
+        yield b'{"row": 1}\n'
+
+    return StreamingHttpResponse(body(), content_type="application/x-ndjson")
+
+
+def broken_stream_view(request: Any) -> HttpResponse:
+    def body() -> Iterator[bytes]:
+        yield b'{"row": 0}\n'
+        raise RuntimeError("feed died mid-stream")
+
+    return StreamingHttpResponse(body(), content_type="application/x-ndjson")
+
+
+urlpatterns += [
+    path("stream", stream_view),
+    path("broken-stream", broken_stream_view),
+]
+
+
+def run_wsgi(path_info: str, method: str = "GET") -> List[bytes]:
+    """Drive one request the way a conforming WSGI server does.
+
+    ``django.test.Client`` is not one: it does not close the response iterable, which is
+    the only moment at which a streamed response's outcome is knowable. Every defect this
+    section covers was invisible through the test client and visible over a real socket,
+    so the drive has to be real even though the transport is not.
+    """
+    from django.core.handlers.wsgi import WSGIHandler
+    from django.test import RequestFactory
+
+    environ = RequestFactory().generic(method, path_info).environ
+    iterable = WSGIHandler()(environ, lambda status, headers, exc_info=None: None)
+    chunks: List[bytes] = []
+    try:
+        for chunk in iterable:
+            chunks.append(chunk)
+    except RuntimeError:
+        # The generator raising is the scenario, not a test failure.
+        pass
+    finally:
+        close = getattr(iterable, "close", None)
+        if close is not None:
+            close()
+    return chunks
+
+
+def data_of(ledger: Ledger) -> List[Dict[str, Any]]:
+    return [entry.data for entry in ledger.iter_entries()]
+
+
+def test_a_completed_stream_is_recorded_provisional_then_settled(audited_ledger: Ledger) -> None:
+    """Django had no ``response.completion`` code path at all: no
+    ``COMPLETION_PROVISIONAL``, no ``KIND_COMPLETION``, no ``_settle``. The machinery the
+    other two were rebuilt with was simply never added here."""
+    run_wsgi("/stream")
+
+    assert [row["kind"] for row in data_of(audited_ledger)] == [
+        "request",
+        "response.completion",
+    ]
+
+
+def test_a_completed_stream_settles_as_complete(audited_ledger: Ledger) -> None:
+    run_wsgi("/stream")
+
+    assert data_of(audited_ledger)[1]["outcome"] == "complete"
+
+
+def test_a_stream_that_dies_is_not_recorded_as_a_finished_200(
+    audited_ledger: Ledger,
+) -> None:
+    """The blocker. A generator raising on its second chunk produced exactly one entry
+    reading ``status=200, completion="final", error=None`` - the ledger asserting a
+    success the client never received. Under ``wsgiref`` the client sees a clean EOF, so
+    both ends believed it."""
+    run_wsgi("/broken-stream")
+
+    rows = data_of(audited_ledger)
+    assert rows[0]["completion"] == "provisional"
+
+
+def test_a_stream_that_dies_settles_as_incomplete(audited_ledger: Ledger) -> None:
+    run_wsgi("/broken-stream")
+
+    assert data_of(audited_ledger)[1]["outcome"] == "incomplete"
+
+
+def test_a_stream_that_dies_names_the_exception(audited_ledger: Ledger) -> None:
+    run_wsgi("/broken-stream")
+
+    assert data_of(audited_ledger)[1]["error"] == "RuntimeError"
+
+
+def test_a_view_that_raises_names_the_exception(audited_ledger: Ledger) -> None:
+    """``error=`` reached ``build_audit_record`` from one of three call sites, so the key
+    was absent from every Django entry and ``WHERE error IS NOT NULL`` was structurally
+    zero however many views had blown up."""
+    Client(raise_request_exception=False).get("/boom")
+
+    assert data_of(audited_ledger)[0]["error"] == "RuntimeError"
+
+
+@override_settings(DEBUG_PROPAGATE_EXCEPTIONS=True)
+def test_a_propagating_exception_is_still_audited(audited_ledger: Ledger) -> None:
+    """A real 500 was served and the ledger gained nothing: nothing incremented
+    ``audit_failures``, and ``check_integrity()`` stayed ``ok`` on a chain with no memory
+    of the request."""
+    with contextlib.suppress(RuntimeError):
+        Client(raise_request_exception=False).get("/boom")
+
+    assert len(data_of(audited_ledger)) == 1
+
+
+@override_settings(DEBUG_PROPAGATE_EXCEPTIONS=True)
+def test_a_propagating_exception_is_recorded_as_a_500(audited_ledger: Ledger) -> None:
+    with contextlib.suppress(RuntimeError):
+        Client(raise_request_exception=False).get("/boom")
+
+    assert data_of(audited_ledger)[0]["status"] == 500
+
+
+def test_the_mirror_can_say_which_entries_are_provisional(audited_ledger: Ledger) -> None:
+    """``models.py`` is documented as the queryable mirror and ships a read-only admin
+    over it, so the ORM *is* the surface Django users are told to use. It had no ``kind``,
+    ``completion`` or ``request_id`` column, which made it structurally incapable of
+    answering the one question v2.0.0 added."""
+    run_wsgi("/stream")
+
+    assert AuditIndex.objects.filter(completion="provisional").count() == 1
+
+
+def test_the_mirror_can_correlate_a_settlement_with_its_request(
+    audited_ledger: Ledger,
+) -> None:
+    run_wsgi("/stream")
+
+    rows = list(AuditIndex.objects.order_by("sequence"))
+    assert rows[0].request_id == rows[1].request_id
+
+
+def test_indexing_a_settlement_record_does_not_break_the_request(
+    audited_ledger: Ledger,
+) -> None:
+    """``_index`` promises in its own docstring that it must never raise, then built the
+    row dict - reading ``record["user"]`` among others - *outside* the ``try``. With
+    ``INDEX_ENTRIES`` defaulting to True, the first settlement record would have taken
+    every streamed request down with a ``KeyError``."""
+    middleware = SignLedgerAuditMiddleware(lambda request: HttpResponse("ok"))
+    middleware.recorder.ledger = audited_ledger
+    entry = audited_ledger.append({"probe": True})
+
+    middleware._index(entry, {})
+
+    assert middleware.recorder.audit_failures == 1

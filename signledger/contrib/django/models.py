@@ -38,8 +38,24 @@ class AuditIndex(models.Model):  # type: ignore[misc]
 
     method = models.CharField(max_length=16)
     path = models.CharField(max_length=512)
-    status = models.IntegerField()
+
+    #: Nullable because ``build_audit_record`` types ``status`` as optional, and a NOT
+    #: NULL column would turn that into an unhandled database error inside the one method
+    #: that promises never to raise.
+    status = models.IntegerField(null=True, blank=True)
     actor = models.CharField(max_length=255, null=True, blank=True)
+
+    #: ``request`` or ``response.completion``. Without these three the mirror could not
+    #: express either field v2.0.0 added - so the ORM and the read-only admin, which are
+    #: the query surface Django users are told to use, could not answer "which entries are
+    #: still only promises" or "which settlement belongs to which request".
+    kind = models.CharField(max_length=32, db_index=True, default="request")
+
+    #: Whether ``status`` is a fact or a promise.
+    completion = models.CharField(max_length=16, db_index=True, default="final")
+
+    #: Ties a settlement entry to the request entry it settles.
+    request_id = models.CharField(max_length=64, db_index=True, default="")
 
     class Meta:
         app_label = "signledger_django"
