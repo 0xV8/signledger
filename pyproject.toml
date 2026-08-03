@@ -110,7 +110,7 @@ test = [
     'httpx2>=2.9; python_version >= "3.10"',
 ]
 dev = [
-    "mutmut>=2.4.0",
+    "mutmut>=3.0",
     "mypy>=1.5.0",
     "ruff>=0.1.0",
     "bandit>=1.7.5",
@@ -169,13 +169,36 @@ parallel = true
 fail_under = 100
 show_missing = true
 skip_covered = false
+# Every entry here is a line *regex*, and coverage.py drops the whole multi-line
+# construct a matching line belongs to. Three of the six rules this list used to carry
+# were therefore deleting far more than they named, and the gate above was measuring a
+# denominator nobody had checked. Measured against one data file (TOTAL statements/
+# branches): no exclusions at all 4323/992; the bare three-dot rule cost -129/-62 and the
+# Protocol rule -29/-36, while `@overload` matched nothing in the package at all.
+#
+# The three-dot rule was the expensive one. PEP 484 signatures contain a literal `...`
+# (`Callable[..., Any]`, `Tuple[str, ...]`), so it matched the *def line* of ordinary
+# functions and took their entire bodies out of measurement - the whole `audited()`
+# decorator and `_call_record()` in contrib/fastapi.py among them. Anchored, it now
+# matches only a line that is nothing but an ellipsis, which is the protocol-stub case it
+# was added for.
+#
+# The Protocol rule stays, and that decision was made by measurement rather than taste.
+# Removing it looked free - the 29 statements it hides are all "covered", because a `def`
+# line executes at import. What it actually hides is 23 *partial branches*: with the body
+# of `def resolve(self, key_id: str) -> Optional[PublicKey]: ...` excluded by the rule
+# above, coverage still sees a `def -> exit` arc it can never complete. Those arcs are an
+# artifact of a type declaration, not a gap in the tests, and no test can close them.
+# Excluding the protocol bodies is the honest scope: they declare shapes, they do not run.
+#
+# `@overload` is gone as a dead rule - it matched nothing anywhere in the package, which
+# is itself evidence the list had never been validated against the source it filters.
 exclude_lines = [
     "pragma: no cover",
     "raise NotImplementedError",
     "if TYPE_CHECKING:",
-    "@overload",
     "class .*\\(Protocol\\):",
-    "\\.\\.\\.",
+    "^\\s*\\.\\.\\.\\s*$",
 ]
 
 [tool.mypy]

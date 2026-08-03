@@ -64,7 +64,7 @@ jobs:
   # This job is why that claim is now checkable by anyone, including us.
   #
   # The databases are services rather than something a developer is trusted to
-  # start: without them 582 tests skip and coverage silently falls to ~91%.
+  # start: without them 645 tests skip and coverage silently falls to ~91%.
   # ---------------------------------------------------------------------------
   test:
     name: test py${{ matrix.python-version }} + live DBs
@@ -127,6 +127,12 @@ jobs:
 
       - name: Assert no database test was skipped
         run: |
+          # pipefail, because GitHub's default shell is `bash -e {0}` and -e only sees the
+          # LAST command of a pipeline - `tee`, which always succeeds. Without it a pytest
+          # run that FAILED was swallowed whole and the step could only fail on the literal
+          # word "skipped". Measured: a stand-in exiting 1 while printing "1 failed,
+          # 5 passed" reached the end of this step with exit 0.
+          set -o pipefail
           pytest -m "postgres or mongo" -q --no-cov -rs 2>&1 | tee db.log
           if grep -qE '[0-9]+ skipped' db.log; then
             echo "::error::database tests were skipped - the coverage figure is not real"
@@ -459,6 +465,9 @@ jobs:
       - name: No build-time deprecation warnings
         # A deprecation with a stated removal date is a future build failure.
         run: |
+          # Same shape, same reason: without pipefail a build that FAILED still reached the
+          # grep and passed the step.
+          set -o pipefail
           rm -rf dist build
           python -m build 2>&1 | tee build.log
           if grep -qi "SetuptoolsDeprecationWarning" build.log; then
@@ -516,41 +525,74 @@ jobs:
           cache-dependency-path: pyproject.toml
       - run: pip install -e '.[all,test,dev]'
       - name: Run mutation testing
-        # No `|| true`, and no `--no-progress` - that flag does not exist in mutmut 3.x,
-        # so the command failed on the flag alone and the `|| true` swallowed it. Both
-        # together meant this job passed without generating a mutant. mutmut exits
-        # non-zero when mutants survive, which is information rather than an error here,
-        # so the survivor count is the gate and a crash still fails the step.
+        # Any non-zero exit fails the step. The previous version tolerated exit 1 on the
+        # stated grounds that "mutmut exits non-zero when mutants survive". That is false
+        # in mutmut 3.x: `_run` returns 0 however many mutants survive - measured, a sweep
+        # with 360 of 360 surviving exited 0 - and 1 is what it uses for every *setup*
+        # failure. So the tolerance swallowed precisely the failure it was meant to catch,
+        # which is the one this repository actually had.
         run: |
           set -o pipefail
-          mutmut run || rc=$?
-          if [ "${rc:-0}" -gt 1 ]; then
-            echo "::error::mutmut did not run - exit ${rc}"
-            exit 1
-          fi
+          mutmut run
       - name: Report
         run: |
           set -o pipefail
-          mutmut results | tee mutmut.txt
+          # `--all true` and not `--all`: the option is declared with `default=False` and
+          # no `is_flag=True`, so it takes a VALUE - a bare `--all` exits with
+          # "Option '--all' requires an argument."
+          #
+          # Without it, `mutmut results` prints only NON-killed mutants. The previous
+          # guard counted the lines of that output which did not say "not checked" and
+          # demanded at least 100, which counts SURVIVORS: a perfect sweep printed
+          # nothing, scored 0 and FAILED, while a sweep leaving 200 mutants alive PASSED.
+          # The better the suite got, the more certainly this job broke.
+          mutmut results --all true | tee mutmut.txt
 
-          # A non-empty file is NOT evidence that anything ran. The previous version of
-          # this guard checked only `-s`, and passed on a 40 KB report in which every
-          # single line read "not checked" - mutmut had generated mutants, failed its
-          # own clean baseline, and refused to execute any of them. That is the same
-          # green-over-nothing this job was already caught doing once.
-          checked=$(grep -cvE 'not checked' mutmut.txt || true)
-          notchecked=$(grep -cE 'not checked' mutmut.txt || true)
-          echo "mutants with a verdict: ${checked}; not checked: ${notchecked}"
-          if [ "${checked}" -lt 100 ]; then
-            echo "::error::only ${checked} mutants were actually checked - the sweep did not run"
-            exit 1
-          fi
-          {
-            echo "### Mutation results"
-            echo '```'
-            tail -50 mutmut.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          # The verdict is counted from the per-mutant lines above, NOT from
+          # mutants/mutmut-stats.json. That file was the obvious place to look and it
+          # does not hold verdicts at all - measured on a real five-mutant sweep, it
+          # carries only `tests_by_mangled_function_name`, `duration_by_test` and
+          # `stats_time`. A guard reading it would have failed every run while looking
+          # careful, which is the exact failure mode this job already had once.
+          #
+          # A bare "how many were checked" floor is not a gate either: 100 against the
+          # ~9,600 mutants this package generates would pass a sweep reaching 1% of them.
+          # The floor is a score.
+          python - <<'PY'
+          import os, pathlib, re, sys
+
+          VERDICT = re.compile(r":\s*(killed|survived|timeout|suspicious|skipped|not checked)\s*$")
+          counts = {}
+          for line in pathlib.Path("mutmut.txt").read_text().splitlines():
+              found = VERDICT.search(line.strip())
+              if found:
+                  counts[found.group(1)] = counts.get(found.group(1), 0) + 1
+
+          killed = counts.get("killed", 0)
+          survived = counts.get("survived", 0)
+          timeout = counts.get("timeout", 0)
+          suspicious = counts.get("suspicious", 0)
+          checked = killed + survived + timeout + suspicious
+
+          if checked == 0:
+              print("::error::zero mutants carry a verdict - the sweep did not run")
+              sys.exit(1)
+
+          score = 100.0 * (killed + timeout) / checked
+          floor = float(os.environ.get("MUTATION_SCORE_FLOOR", "90"))
+          print(f"checked {checked}: killed {killed}, survived {survived}, "
+                f"timeout {timeout}, suspicious {suspicious} - score {score:.2f}%")
+
+          summary = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a") as handle:
+              handle.write(f"### Mutation score {score:.2f}% over {checked} mutants\n\n")
+              handle.write(f"killed {killed} - survived {survived} - "
+                           f"timeout {timeout} - suspicious {suspicious}\n")
+
+          if score < floor:
+              print(f"::error::mutation score {score:.2f}% is below the {floor:.0f}% floor")
+              sys.exit(1)
+          PY
       - uses: actions/upload-artifact@v6
         with:
           name: mutmut-results
