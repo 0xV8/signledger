@@ -1275,45 +1275,12 @@ def test_the_fork_warning_says_what_to_do_instead(filename: str) -> None:
     assert "post-fork" in doc or "per worker" in doc or "per-worker" in doc
 
 
-def test_a_django_entry_has_the_same_shape_as_a_flask_one() -> None:
-    """``build_audit_record`` promises one shape for all three integrations.
-
-    Its docstring says so in as many words: "One shape for all three frameworks, so a
-    query an auditor writes against a Flask service still works against the Django one."
-    It did not hold. Flask and FastAPI each stamped ``kind`` and ``request_id`` onto the
-    record *after* the shared builder returned it; Django did not, so an auditor querying
-    on ``kind`` saw every Flask and FastAPI request and no Django one.
-
-    Two of three call sites adding the same two fields is the shape of the bug - the
-    builder exists precisely so that cannot happen, so the fields belong inside it.
-    """
-    from flask import Flask
-
-    from signledger.backends.memory import MemoryBackend
-    from signledger.contrib.flask import SignLedgerAudit
-    from signledger.core.ledger import Ledger
-
-    flask_backend = MemoryBackend()
-    flask_ledger = Ledger(flask_backend, ledger_id="shape-flask")
-    app = Flask(__name__)
-    app.config["PROPAGATE_EXCEPTIONS"] = False
-    SignLedgerAudit(app, ledger=flask_ledger)
-
-    @app.get("/thing")
-    def thing() -> dict:
-        return {"ok": True}
-
-    try:
-        app.test_client().get("/thing?page=2")
-        flask_keys = set(next(iter(flask_ledger.iter_entries())).data)
-    finally:
-        flask_ledger.close()
-
-    with audited():
-        Client().get("/items?page=2")
-        django_keys = set(entries()[0].data)
-
-    assert django_keys == flask_keys
+# The cross-framework shape check that used to live here is now
+# ``tests/test_contrib_parity.py``. It compared ``set(...)`` of the *keys* of ``entries[0]``
+# between Flask and Django, for one 200 GET, with FastAPI absent, through in-process test
+# clients - which never close a response iterable, and closing it is the only moment a
+# streamed response's outcome is knowable. It could not have caught any of the divergences
+# that shipped, all of which were about values, later entries, or streaming.
 
 
 # ======================================================================================
