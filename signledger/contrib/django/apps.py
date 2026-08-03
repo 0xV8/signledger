@@ -12,12 +12,19 @@ rather than at the first byte of production traffic.
 ``USER_RESOLVER`` gets the identical treatment, for the identical reason. It is optional,
 but a misconfigured one is exactly as fatal as a missing factory - every request raises -
 and it used to have no check at all.
+
+The third check is the only warning here rather than an error: ``MAX_BODY_BYTES`` and
+Django's ``DATA_UPLOAD_MAX_MEMORY_SIZE`` describe the same limit and were never compared,
+so a deployment could ask for body capture and get markers instead. Survivable, and
+therefore not allowed to stop a deploy - but not something an operator should have to
+discover from the ledger.
 """
 
 from typing import Any, List, Optional, Sequence
 
 from django.apps import AppConfig
-from django.core.checks import Error, Tags, register
+from django.conf import settings
+from django.core.checks import Error, Tags, Warning, register
 
 # ``_resolve`` is imported rather than reimplemented on purpose. A check that decides
 # "importable" by different rules than the code that later does the importing is worse
@@ -29,7 +36,12 @@ from signledger.contrib.django import (
     get_settings,
 )
 
-__all__ = ["SignLedgerConfig", "check_ledger_factory", "check_user_resolver"]
+__all__ = [
+    "SignLedgerConfig",
+    "check_body_capture_limits",
+    "check_ledger_factory",
+    "check_user_resolver",
+]
 
 #: Stable ids. These are the handles a deployment puts in ``SILENCED_SYSTEM_CHECKS``,
 #: so they are public API and must not be renumbered.
@@ -38,6 +50,7 @@ UNIMPORTABLE_FACTORY_ID = "signledger_django.E002"
 WRONG_TYPE_FACTORY_ID = "signledger_django.E003"
 UNIMPORTABLE_RESOLVER_ID = "signledger_django.E004"
 WRONG_TYPE_RESOLVER_ID = "signledger_django.E005"
+INCOMPATIBLE_BODY_LIMITS_ID = "signledger_django.W001"
 
 _HINT = (
     f"Set {SETTINGS_KEY}['LEDGER_FACTORY'] to a zero-argument callable, or to the dotted "
@@ -134,6 +147,55 @@ def check_user_resolver(
     return []
 
 
+def check_body_capture_limits(
+    app_configs: Optional[Sequence[Any]] = None, **kwargs: Any
+) -> List[Any]:
+    """Report two body-size limits that cannot both be satisfied.
+
+    ``SIGNLEDGER['MAX_BODY_BYTES']`` and Django's ``DATA_UPLOAD_MAX_MEMORY_SIZE`` are
+    independent numbers that describe the same thing, and nothing has ever compared them.
+    Set the Django one lower - hardening it is standard advice - and every request whose
+    body falls between the two passes SignLedger's check and is then refused by Django on
+    the very line that reads it. The middleware no longer turns that into an unaudited
+    400, but it still cannot capture those bodies, so a deployment that asked for
+    ``CAPTURE_BODY`` is silently getting less than it configured. That is worth saying out
+    loud once, at deploy time, rather than leaving an operator to infer it from markers.
+
+    A ``Warning`` and not an ``Error``: the configuration is survivable, and a check that
+    can stop ``manage.py migrate`` has to be reserved for the ones that are not.
+
+    Both numbers are named in the message, unlike every other check in this module. The
+    rule they follow is the same one - contract section 10 forbids echoing a settings
+    *value* back, because that is where credentials live - and a byte count is the one
+    kind of settings value that cannot carry one. Naming them is also the entire point:
+    the operator's next action is to reconcile two numbers, and a message that withheld
+    them would send them looking for both.
+    """
+    config = get_settings()
+    if not config.get("CAPTURE_BODY"):
+        return []
+    django_limit = getattr(settings, "DATA_UPLOAD_MAX_MEMORY_SIZE", None)
+    if django_limit is None:
+        return []
+    max_body_bytes = int(config["MAX_BODY_BYTES"])
+    if max_body_bytes <= django_limit:
+        return []
+    return [
+        Warning(
+            f"{SETTINGS_KEY}['MAX_BODY_BYTES'] is {max_body_bytes} but "
+            f"DATA_UPLOAD_MAX_MEMORY_SIZE is {django_limit}, so a body between the two "
+            "is admitted by SignLedger and then refused by Django.",
+            hint=(
+                f"Lower {SETTINGS_KEY}['MAX_BODY_BYTES'] to at most "
+                f"{django_limit}, or raise DATA_UPLOAD_MAX_MEMORY_SIZE. Until then those "
+                "requests are audited with body [OMITTED:over-request-limit], and any "
+                "view that reads the body still gets Django's 400."
+            ),
+            id=INCOMPATIBLE_BODY_LIMITS_ID,
+        )
+    ]
+
+
 class SignLedgerConfig(AppConfig):  # type: ignore[misc]
     """Registers the audit index model, its shipped migration, and the config check.
 
@@ -157,3 +219,4 @@ class SignLedgerConfig(AppConfig):  # type: ignore[misc]
         """
         register(check_ledger_factory, Tags.compatibility)
         register(check_user_resolver, Tags.compatibility)
+        register(check_body_capture_limits, Tags.compatibility)
