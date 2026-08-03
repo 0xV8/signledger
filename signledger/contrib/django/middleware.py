@@ -5,16 +5,28 @@ searched with the ORM and the admin. The ledger is the evidence; the index is a
 convenience, and it is never allowed to be the reason a request fails.
 """
 
+import functools
 import logging
+import sys
+import uuid
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from django.core.signals import got_request_exception
 from django.db import IntegrityError, transaction
 
 from signledger.contrib import (
+    COMPLETION_FINAL,
+    COMPLETION_PROVISIONAL,
     FAIL_CLOSED,
+    KIND_COMPLETION,
+    KIND_REQUEST,
+    OUTCOME_COMPLETE,
+    OUTCOME_INCOMPLETE,
     AuditRecorder,
+    SettlingBody,
     build_audit_record,
     is_skipped,
+    will_send_body,
 )
 from signledger.contrib.django import _resolve, get_ledger, get_settings
 from signledger.contrib.django.models import AuditIndex
@@ -27,6 +39,33 @@ INTEGRATION = "django"
 
 #: A child of the ``signledger`` logger, so one logging config covers the whole library.
 logger = logging.getLogger("signledger.contrib.django")
+
+#: Where :func:`_note_exception` leaves the exception name for ``__call__`` to read.
+_ERROR_ATTR = "_signledger_error"
+
+
+def _note_exception(sender: Any, request: Any = None, **kwargs: Any) -> None:
+    """Remember what failed, while it is still knowable.
+
+    Django's exception middleware turns an unhandled exception into a 500 response
+    *inside* ``get_response``, so the ``except`` in ``__call__`` never sees the ordinary
+    case - the entry was written for a 500 that named no cause, and
+    ``WHERE error IS NOT NULL`` came back structurally zero however many views had blown
+    up. This signal covers that path; the ``except`` covers the propagating one.
+
+    ``got_request_exception`` does not pass the exception, by design: receivers are
+    expected to read it from ``sys.exc_info()``, which is still set while the signal is
+    being sent.
+    """
+    exception = sys.exc_info()[1]
+    if exception is not None and request is not None:
+        setattr(request, _ERROR_ATTR, type(exception).__name__)
+
+
+# Module-level and stateless, with a dispatch_uid, so that however many middleware
+# instances Django builds there is exactly one receiver and nothing holds a reference to
+# a handler that has gone away.
+got_request_exception.connect(_note_exception, dispatch_uid="signledger.audit")
 
 
 class SignLedgerAuditMiddleware:
@@ -71,23 +110,76 @@ class SignLedgerAuditMiddleware:
         # Decided and read *before* the view runs. Django caches ``request.body``, so
         # the view still gets its own copy - auditing must not consume the request.
         body, reason = self._body(request)
-
-        response = self.get_response(request)
-
-        record = build_audit_record(
-            integration=INTEGRATION,
-            method=request.method,
-            path=request.path,
-            status=response.status_code,
-            client_ip=self.redaction.client_ip(
+        shape = {
+            "client_ip": self.redaction.client_ip(
                 peer=request.META.get("REMOTE_ADDR"),
                 forwarded_for=request.META.get("HTTP_X_FORWARDED_FOR"),
             ),
-            headers=self.redaction.headers(dict(request.headers)),
-            query=self.redaction.query(dict(request.GET.lists())),
-            body=body,
-            body_reason=reason,
-            user=self._user(request),
+            "headers": self.redaction.headers(dict(request.headers)),
+            "query": self.redaction.query(dict(request.GET.lists())),
+            "body": body,
+            "body_reason": reason,
+            "user": self._user(request),
+        }
+        context: Dict[str, Any] = {
+            "request_id": uuid.uuid4().hex,
+            "method": request.method,
+            "path": request.path,
+            "shape": shape,
+        }
+
+        try:
+            response = self.get_response(request)
+        except Exception as err:
+            # The failed requests are the ones an audit trail exists for. Without this,
+            # DEBUG_PROPAGATE_EXCEPTIONS served a real 500 over TCP while the ledger
+            # gained nothing at all - and check_integrity() went on reporting ok about a
+            # chain with no memory of the request.
+            #
+            # Deliberately not ``process_exception``: on Django 5.2 that hook fires *and*
+            # the exception still propagates past get_response, so recording in both
+            # places double-counts. It is also never called for an exception raised by a
+            # middleware below this one, which this ``except`` does catch.
+            self._record(context, status=500, error=type(err).__name__)
+            raise
+
+        streamed = self._will_stream(request, response)
+        self._record(
+            context,
+            status=response.status_code,
+            error=getattr(request, _ERROR_ATTR, None),
+            completion=COMPLETION_PROVISIONAL if streamed else COMPLETION_FINAL,
+        )
+        if streamed:
+            response.streaming_content = SettlingBody(
+                response.streaming_content,
+                functools.partial(self._settle, context, response.status_code),
+            )
+        return response
+
+    # -- recording ---------------------------------------------------------------------
+
+    def _record(
+        self,
+        context: Dict[str, Any],
+        *,
+        status: Optional[int],
+        error: Optional[str] = None,
+        completion: str = COMPLETION_FINAL,
+        kind: str = KIND_REQUEST,
+        outcome: Optional[str] = None,
+    ) -> Any:
+        record = build_audit_record(
+            integration=INTEGRATION,
+            method=context["method"],
+            path=context["path"],
+            status=status,
+            error=error,
+            kind=kind,
+            request_id=context["request_id"],
+            completion=completion,
+            outcome=outcome,
+            **context["shape"],
         )
         # Looked up per request, built once. The lookup has to be late rather than done
         # in __init__: a ledger built before a WSGI server forks would hand every worker
@@ -98,7 +190,60 @@ class SignLedgerAuditMiddleware:
         entry = self.recorder.record(record, {"integration": INTEGRATION})
         if entry is not None and self.index_entries:
             self._index(entry, record)
-        return response
+        return entry
+
+    def _settle(
+        self,
+        context: Dict[str, Any],
+        status: int,
+        complete: bool,
+        error: Optional[str],
+    ) -> None:
+        """Record how a promised response actually ended.
+
+        No failing closed here: the client has had the response since the first chunk, so
+        there is nothing left to refuse. The recorder counts and names the failure, and it
+        is logged, because unlike Flask's extension this middleware instance is owned by
+        Django's ``BaseHandler`` and is unreachable from application code - a counter
+        nobody can read is not an observable.
+        """
+        try:
+            self._record(
+                context,
+                status=status,
+                error=error,
+                kind=KIND_COMPLETION,
+                completion=COMPLETION_FINAL,
+                outcome=OUTCOME_COMPLETE if complete else OUTCOME_INCOMPLETE,
+            )
+        except Exception as err:  # noqa: BLE001 - counted and logged, never swallowed
+            self.recorder.audit_failures += 1
+            self.recorder.last_audit_error = type(err).__name__
+            logger.warning(
+                "a streamed response could not be settled (%s). Its request entry stays "
+                "completion=provisional, which is the honest record: the status was "
+                "promised and how it ended is not known.",
+                type(err).__name__,
+            )
+
+    def _will_stream(self, request: Any, response: Any) -> bool:
+        """Whether this response's body still has to be produced.
+
+        ``FileResponse`` is deliberately excluded. Assigning a wrapper to
+        ``streaming_content`` sets ``file_to_stream`` to ``None``, and Django's WSGI
+        handler takes the ``wsgi.file_wrapper`` zero-copy path only while that attribute
+        is set - so settling a download would quietly take every download off ``sendfile``.
+        Where ``file_wrapper`` *is* used the server iterates the raw file object and never
+        enters the wrapper at all, which would settle a fully delivered file as
+        ``incomplete``. It is recorded ``final``, on the same footing as Flask's
+        ``send_file``: a body sent under a declared length shows its own truncation to the
+        client as a short read.
+        """
+        if not getattr(response, "streaming", False):
+            return False
+        if getattr(response, "file_to_stream", None) is not None:
+            return False
+        return will_send_body(request.method, response.status_code)
 
     # -- internals ---------------------------------------------------------------------
 
@@ -140,19 +285,28 @@ class SignLedgerAuditMiddleware:
         served. That is the promise in this module's docstring: the index is a
         convenience, and it is never allowed to be the reason a request fails.
         """
-        row = {
-            "ledger_id": entry.ledger_id,
-            "sequence": entry.sequence,
-            "entry_id": entry.entry_id,
-            "entry_hash": entry.hash,
-            "timestamp": entry.timestamp,
-            "method": record["method"],
-            "path": record["path"][:512],
-            "status": record["status"],
-            "actor": record["user"],
-        }
         try:
-            self._write_index_row(row)
+            # Built *inside* the try. It used to sit above it, reading record["user"] and
+            # three of its neighbours, which made the "never raises" promise false for any
+            # record shaped differently from the one call site that existed - and the
+            # first settlement record would then have taken every streamed request down
+            # with a KeyError, on the default INDEX_ENTRIES=True.
+            self._write_index_row(
+                {
+                    "ledger_id": entry.ledger_id,
+                    "sequence": entry.sequence,
+                    "entry_id": entry.entry_id,
+                    "entry_hash": entry.hash,
+                    "timestamp": entry.timestamp,
+                    "method": record["method"],
+                    "path": record["path"][:512],
+                    "status": record["status"],
+                    "actor": record["user"],
+                    "kind": record["kind"],
+                    "completion": record["completion"],
+                    "request_id": record["request_id"],
+                }
+            )
         except Exception as err:  # noqa: BLE001 - counted and logged, never swallowed
             self.recorder.audit_failures += 1
             self.recorder.last_audit_error = type(err).__name__

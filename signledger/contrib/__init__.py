@@ -51,10 +51,63 @@ __all__ = [
     "AuditRecorder",
     "AuditWriteError",
     "RedactionPolicy",
+    "SettlingBody",
     "build_audit_record",
     "is_skipped",
     "will_send_body",
 ]
+
+
+class SettlingBody:
+    """A streamed response body that reports how it ended.
+
+    Shared, because the moment a streamed response's outcome becomes knowable is the same
+    moment in both server models: WSGI requires ``close()`` "upon completion of the current
+    request, whether the request was completed normally or terminated early due to an
+    application error", and Django registers the same call through ``_resource_closers``.
+    That call happens after the framework has torn the request down, so everything the
+    settlement needs is captured in the closure and nothing here touches request state.
+
+    Wrapping the body rather than using a close callback is deliberate: a callback cannot
+    tell a body that finished from one that died.
+    """
+
+    def __init__(
+        self,
+        body: Any,
+        settle: Any,
+    ) -> None:
+        # Not ``Iterable[bytes]``: werkzeug allows a body to yield ``str`` and encodes it
+        # later, and every chunk passes through untouched, so its type is genuinely none
+        # of this class's business.
+        self._body = body
+        self._settle = settle
+        self._complete = False
+        self._error: Optional[str] = None
+        self._settled = False
+
+    def __iter__(self) -> Any:
+        try:
+            yield from self._body
+        except Exception as err:
+            # Named, not swallowed: it is re-raised into the server unchanged, and the
+            # audit record is the only place it would otherwise leave no trace.
+            self._error = type(err).__name__
+            raise
+        self._complete = True
+
+    def close(self) -> None:
+        if self._settled:
+            # Servers and test clients both close responses more than once. A second
+            # settlement entry for one response would be a second claim, not a repeat.
+            return
+        self._settled = True
+        close = getattr(self._body, "close", None)
+        if close is not None:
+            # A generator holds a file handle open until it is closed. Wrapping a body
+            # must not be what leaks it.
+            close()
+        self._settle(self._complete, self._error)
 
 
 def will_send_body(method: str, status: int) -> bool:
