@@ -817,11 +817,22 @@ def audit_router(
     # route added to this router later and left unstamped would audit itself again, and
     # nothing would say so. The stamp is the path *within* ``prefix``, because that is
     # what stays true when ``include_router`` moves the whole router somewhere else.
+    # No `if endpoint is not None` guard. Every route on this router was just created by
+    # the decorators above, so each is an ``APIRoute`` carrying an endpoint; the guard was
+    # a branch no input could reach, and an unreachable branch is a line no test can ever
+    # justify. If a future change puts something else on this router - a Mount, a
+    # WebSocketRoute - this raises immediately rather than silently leaving it unstamped
+    # and auditing itself, which is the failure the loop exists to prevent.
     for route in router.routes:
-        endpoint = getattr(route, "endpoint", None)
         registered: str = getattr(route, "path", "")
-        if endpoint is not None:
-            setattr(endpoint, _AUDIT_ROUTE_PATH, registered[len(prefix) :])
+        # Attribute access, not a guarded lookup, so a route carrying no endpoint raises
+        # here rather than being skipped. Starlette types ``routes`` as ``BaseRoute``,
+        # which declares no ``endpoint``; every route on this router is an ``APIRoute``
+        # created by the decorators above, and the day that stops being true is the day
+        # this must be looked at rather than quietly stamped over - an unstamped
+        # inspection route audits itself, which is the defect this loop exists to close.
+        endpoint = route.endpoint  # type: ignore[attr-defined]
+        setattr(endpoint, _AUDIT_ROUTE_PATH, registered[len(prefix) :])
 
     return router
 

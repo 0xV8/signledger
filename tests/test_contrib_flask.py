@@ -1313,3 +1313,36 @@ def test_an_unrouted_probe_under_the_console_prefix_is_still_excluded(
     assert app.test_client().get("/_audit/bogus").status_code == 404
 
     assert ledger.count() == before
+
+
+def test_registering_the_console_twice_records_its_mount_once(ledger: Ledger) -> None:
+    """The mount list must not grow every time the blueprint is registered.
+
+    The registration hook is ``@blueprint.record`` and not ``record_once``, deliberately -
+    one blueprint may be mounted on several applications, or twice on one under different
+    names, and a mount that went unclaimed would audit itself again. That makes a duplicate
+    entirely possible, so the list dedupes.
+    """
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+    console = audit_blueprint(ledger, authenticator=lambda request: True)
+    app.register_blueprint(console, name="audit_one")
+    app.register_blueprint(console, name="audit_two")
+
+    from signledger.contrib.flask import INSPECTION_PREFIXES_KEY
+
+    assert app.extensions[INSPECTION_PREFIXES_KEY].prefixes == ["/_audit"]
+
+
+def test_a_console_registered_twice_is_still_excluded(ledger: Ledger) -> None:
+    """The dedup must not cost the exclusion it exists to keep tidy."""
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+    console = audit_blueprint(ledger, authenticator=lambda request: True)
+    app.register_blueprint(console, name="audit_one")
+    app.register_blueprint(console, name="audit_two")
+
+    before = ledger.count()
+    assert app.test_client().get("/_audit/status").status_code == 200
+
+    assert ledger.count() == before

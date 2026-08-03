@@ -98,7 +98,7 @@ from django.http import (  # noqa: E402
     JsonResponse,
     StreamingHttpResponse,
 )
-from django.test import Client, override_settings  # noqa: E402
+from django.test import Client, RequestFactory, override_settings  # noqa: E402
 from django.urls import path, reverse  # noqa: E402
 
 from signledger.backends.memory import MemoryBackend  # noqa: E402
@@ -115,7 +115,10 @@ from signledger.contrib.django.middleware import (  # noqa: E402
 )
 from signledger.contrib.django.models import AuditIndex  # noqa: E402
 from signledger.contrib.redaction import REDACTED  # noqa: E402
-from signledger.core.exceptions import ConfigurationError  # noqa: E402
+from signledger.core.exceptions import (  # noqa: E402
+    ConfigurationError,
+    StorageError,
+)
 from signledger.core.ledger import Ledger  # noqa: E402
 
 # --------------------------------------------------------------------------------------
@@ -1304,7 +1307,14 @@ def broken_stream_view(request: Any) -> HttpResponse:
     return StreamingHttpResponse(body(), content_type="application/x-ndjson")
 
 
+def download_view(request: Any) -> HttpResponse:
+    from django.http import FileResponse
+
+    return FileResponse(open(CURRENT["download"], "rb"), content_type="text/plain")
+
+
 urlpatterns += [
+    path("download", download_view),
     path("stream", stream_view),
     path("broken-stream", broken_stream_view),
 ]
@@ -1928,3 +1938,105 @@ def test_an_async_settlement_reaches_the_orm_mirror(audited_ledger: Ledger) -> N
         "request",
         "response.completion",
     ]
+
+
+# --------------------------------------------------------------------------------------
+# the paths that only fire when something else has already gone wrong
+# --------------------------------------------------------------------------------------
+
+
+def test_the_exception_receiver_stamps_nothing_when_there_is_no_exception() -> None:
+    """``got_request_exception`` hands receivers no exception - Django expects them to read
+    it from ``sys.exc_info()``. Called outside an ``except`` block there is none, and the
+    receiver must leave the request alone rather than stamp ``NoneType`` on it and have
+    every entry claim an error that never happened."""
+    from signledger.contrib.django.middleware import _ERROR_ATTR, _note_exception
+
+    request = RequestFactory().get("/items")
+
+    _note_exception(sender=None, request=request)
+
+    assert not hasattr(request, _ERROR_ATTR)
+
+
+def test_a_file_response_is_recorded_final_and_not_settled(
+    audited_ledger: Ledger, tmp_path: Any
+) -> None:
+    """A ``FileResponse`` stays on the ``wsgi.file_wrapper`` zero-copy path.
+
+    Wrapping it would settle it, and would also set ``file_to_stream`` to ``None``, which
+    takes every download off ``sendfile``; and where ``file_wrapper`` *is* used the server
+    iterates the raw file object and never enters the wrapper at all, so a fully delivered
+    file would settle as ``incomplete``. It is recorded as a fact instead, on the same
+    footing as Flask's ``send_file``: a body sent under a declared length shows its own
+    truncation to the client as a short read.
+    """
+    path = tmp_path / "statement.txt"
+    path.write_text("hello file body")
+    CURRENT["download"] = str(path)
+
+    body = run_wsgi("/download")
+
+    assert b"".join(body) == b"hello file body"
+    assert [row["kind"] for row in data_of(audited_ledger)] == ["request"]
+    assert data_of(audited_ledger)[0]["completion"] == "final"
+
+
+def test_a_settlement_that_cannot_be_written_is_counted_and_logged(
+    audited_ledger: Ledger, caplog: Any
+) -> None:
+    """The only observable there is.
+
+    Unlike Flask's extension, this middleware instance is owned by Django's
+    ``BaseHandler`` and is unreachable from application code, so a counter nobody can read
+    is not an observable. The client has had the response since the first chunk, so there
+    is nothing left to refuse - the failure is counted, named and logged instead.
+    """
+    backend = audited_ledger.backend
+    real_append = backend.append_atomic
+    calls = {"n": 0}
+
+    def fail_on_the_settlement(build: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise StorageError("the store went away mid-stream")
+        return real_append(build)
+
+    backend.append_atomic = fail_on_the_settlement  # type: ignore[method-assign]
+    try:
+        with caplog.at_level(logging.WARNING, logger="signledger.contrib.django"):
+            run_wsgi("/stream")
+    finally:
+        backend.append_atomic = real_append  # type: ignore[method-assign]
+
+    assert "could not be settled" in caplog.text
+    # The recorder wraps a backend failure in AuditWriteError before it reaches _settle,
+    # so that is the type the log names - and naming the type is the whole contract here:
+    # contract section 10 forbids a message that could quote the row it refused.
+    assert "AuditWriteError" in caplog.text
+
+
+def test_a_failed_settlement_leaves_the_request_entry_honest(
+    audited_ledger: Ledger,
+) -> None:
+    """No settlement means the promise stands unsettled, which is the true record: the
+    status was promised and how it ended is not known."""
+    backend = audited_ledger.backend
+    real_append = backend.append_atomic
+    calls = {"n": 0}
+
+    def fail_on_the_settlement(build: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise StorageError("the store went away mid-stream")
+        return real_append(build)
+
+    backend.append_atomic = fail_on_the_settlement  # type: ignore[method-assign]
+    try:
+        run_wsgi("/stream")
+    finally:
+        backend.append_atomic = real_append  # type: ignore[method-assign]
+
+    rows = data_of(audited_ledger)
+    assert [row["kind"] for row in rows] == ["request"]
+    assert rows[0]["completion"] == "provisional"

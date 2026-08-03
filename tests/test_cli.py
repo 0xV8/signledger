@@ -4522,3 +4522,58 @@ def test_a_real_host_is_still_refused_after_the_fragment_fix() -> None:
         _sqlite_path("sqlite://somehost/path.db")
     with pytest.raises(ConfigurationError):
         _sqlite_path("sqlite://backup:pw@fileserver/audit.db")
+
+
+def test_a_bundle_carrying_a_checkpoint_verifies_its_merkle_root_offline(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """The point of a bundle is that a third party can check it with no database at all.
+
+    Checkpoint verification recomputes the Merkle root over the entries up to the
+    checkpointed sequence, which asks the offline view for a bounded window. That window
+    is the one read ``_BundleView`` did not serve when it was written - it accepted only a
+    lower bound - so an offline check of a bundle that carried a checkpoint raised
+    ``TypeError`` at exactly the moment it was asked to do the work bundles exist for.
+    """
+    path = tmp_path / "ledger.db"
+    bundle = tmp_path / "bundle.json"
+    ledger = Ledger(SQLiteBackend(str(path)))
+    try:
+        for index in range(5):
+            ledger.append({"event": "created", "index": index})
+        ledger.checkpoint()
+    finally:
+        ledger.close()
+    export_bundle(path, bundle, capsys)
+
+    code, out, _ = run(["verify-bundle", str(bundle)], capsys)
+
+    assert code == EXIT_OK
+    assert "VERIFIED" in out
+
+
+def test_an_offline_bundle_check_notices_a_checkpoint_that_does_not_match(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """And the window has to be the *right* one, not merely accepted."""
+    import json as _json
+
+    path = tmp_path / "ledger.db"
+    bundle = tmp_path / "bundle.json"
+    ledger = Ledger(SQLiteBackend(str(path)))
+    try:
+        for index in range(5):
+            ledger.append({"event": "created", "index": index})
+        ledger.checkpoint()
+    finally:
+        ledger.close()
+    export_bundle(path, bundle, capsys)
+
+    doctored = _json.loads(bundle.read_text())
+    doctored["checkpoint"]["merkle_root"] = "00" * 32
+    bundle.write_text(_json.dumps(doctored))
+
+    code, out, _ = run(["verify-bundle", str(bundle)], capsys)
+
+    assert code != EXIT_OK
+    assert "merkle" in out.lower() or "merkle" in capsys.readouterr().err.lower()
