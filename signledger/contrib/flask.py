@@ -91,6 +91,38 @@ A settlement that cannot be written is counted on ``recorder.audit_failures`` ra
 raised: the client has had the response since the first chunk, and there is no failing
 closed after that.
 
+The settlement does not depend on the server keeping its side of PEP 3333
+-------------------------------------------------------------------------
+
+PEP 3333 requires the server to call ``close()`` on the iterable it was handed, and the
+case above is written against that promise. ``werkzeug.serving`` breaks it on the one
+event the ``"the client hung up"`` sentence exists for: ``run_wsgi`` drains the request
+socket and closes the application iterable inside a single ``finally``, drain first, and
+a peer RST makes the drain raise before the close is reached. Measured against a real
+server - a 400x64KB stream, the client reading 4KB and then resetting the connection -
+the request entry stayed ``provisional`` with no settlement, permanently.
+
+So a streamed body is settled when it is closed **or** when it is dropped, through one
+guard that cannot fire twice. The second half is a finalizer and is described as one:
+under CPython the last reference to the body dies with the server's request frame, so the
+settlement is written there and then, in that thread - measured over a real socket, not
+reasoned about. It is a backstop, not a guarantee. An implementation without reference
+counting settles whenever it next collects, and a body still alive at process exit
+settles never. The two alternatives were measured and neither works:
+``Response.call_on_close`` is driven by the same ``close()`` the server skipped, and
+``teardown_request`` fires before the first byte of a streamed body exists, which is
+before its outcome is knowable.
+
+The inspection endpoints are not part of the trail
+--------------------------------------------------
+
+:func:`audit_blueprint` records the path it was mounted at as one this extension does not
+audit, so reading the ledger is not a write to it. Measured before that: every inspection
+request appended an entry, including ``/verify`` - which reported ``entries_verified=5``
+while appending the sixth, making each verification cost more than the last - and
+including the ``401`` returned to a caller with no credential, which let an anonymous
+prober append a signed row to an append-only store on every rejected attempt.
+
 A request that fails is still a request
 ---------------------------------------
 
@@ -113,9 +145,9 @@ blown up.
 import contextlib
 import functools
 import uuid
-from typing import Any, Callable, Dict, Iterable, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from flask import Blueprint, Flask, Response, g, jsonify, request
+from flask import Blueprint, Flask, Response, current_app, g, jsonify, request
 from flask.signals import got_request_exception
 
 from signledger import contrib as _shared
@@ -160,6 +192,13 @@ COMPLETION_PROVISIONAL = _shared.COMPLETION_PROVISIONAL
 
 #: Key under which the extension registers itself in ``app.extensions``.
 EXTENSION_KEY = "signledger"
+
+#: Key under which the paths :func:`audit_blueprint` was mounted at are kept, so the
+#: extension can leave them out of the trail. They live on the application rather than on
+#: the extension because either half may be installed first - an application factory is
+#: free to register the blueprint before it constructs the extension - and a deployer who
+#: happened to pick the order that audits itself would have no way of telling.
+INSPECTION_PREFIXES_KEY = "signledger_inspection_prefixes"
 
 #: Default ceiling on how many entries one inspection request may return.
 DEFAULT_MAX_PAGE_SIZE = 100
@@ -230,7 +269,16 @@ class SignLedgerAudit:
     # -- hooks -------------------------------------------------------------------------
 
     def _skip(self, path: str) -> bool:
-        return is_skipped(path, self.skip_paths)
+        """Whether this request is outside the trail.
+
+        The configured prefixes, plus wherever the inspection blueprint was mounted on
+        the application handling this request. The extension can be shared between
+        applications - one instance, several ``init_app`` calls - so the mount points are
+        read from the application in play rather than held on ``self``.
+        """
+        return is_skipped(path, self.skip_paths) or is_skipped(
+            path, _inspection_prefixes(current_app)
+        )
 
     def _before_request(self) -> None:
         """Decide about the body *before* the view has a chance to consume it.
@@ -309,7 +357,7 @@ class SignLedgerAudit:
         self.recorder.record(record, {"integration": INTEGRATION})
         setattr(g, _RECORDED_KEY, True)
         if streamed:
-            response.response = SettlingBody(
+            response.response = _AbandonableBody(
                 response.response, functools.partial(self._settle, context)
             )
         return response
@@ -400,6 +448,47 @@ class SignLedgerAudit:
         return None if resolved is None else str(resolved)
 
 
+class _AbandonableBody(SettlingBody):
+    """A streamed body that settles when it is closed *or* when it is let go of.
+
+    The shared :class:`~signledger.contrib.SettlingBody` settles in ``close()``, which
+    PEP 3333 obliges a server to call "upon completion of the current request, whether the
+    request was completed normally or terminated early". ``werkzeug.serving`` does not,
+    on precisely the case a settlement matters most for: ``WSGIRequestHandler.run_wsgi``
+    puts the request-socket drain (``self.rfile.read(10_000_000)``) and the
+    ``application_iter.close()`` in one ``finally`` block with the drain first, and a peer
+    RST makes the drain raise before the close is reached. Measured against a real server
+    over a real socket - a 400x64KB body, the client reading 4KB and then resetting with
+    ``SO_LINGER(1, 0)`` - the request entry was left ``provisional`` with no settlement
+    entry, for as long as the ledger exists.
+
+    ``close()`` already refuses to settle twice, so routing the finalizer through it is
+    the whole implementation: whichever of the two happens first writes the entry and the
+    other becomes a no-op. A body dropped mid-iteration has ``_complete`` false and no
+    error, which is the documented shape of "the client hung up"; one dropped after the
+    last chunk settles ``complete``, which is what happened.
+
+    This is a backstop and not a guarantee, and it is the only one available: measured on
+    the same RST, ``Response.call_on_close`` never fires - it hangs off the same
+    ``close()`` the server skipped - and ``teardown_request`` fires with no exception
+    *before* the body has produced a byte, which is before there is an outcome to record.
+    Finalization is what is left. Under CPython the last reference dies with the server's
+    request frame and the entry is written there, in that thread, before the next request
+    is accepted; an implementation without reference counting settles whenever it next
+    collects, and a body still alive when the process exits settles never.
+    """
+
+    def __del__(self) -> None:
+        self.close()
+
+
+def _inspection_prefixes(app: Flask) -> List[str]:
+    """Paths on ``app`` that :func:`audit_blueprint` answers on, and this extension does
+    not audit."""
+    prefixes: List[str] = app.extensions.setdefault(INSPECTION_PREFIXES_KEY, [])
+    return prefixes
+
+
 def _will_stream(response: Response) -> bool:
     """Whether this response's body still has to be produced.
 
@@ -437,6 +526,12 @@ def audit_blueprint(
     Even an authenticated caller cannot ask for the whole ledger: ``limit`` is capped at
     ``max_page_size``, and rows carry identifiers and digests only - never entry
     payloads, which are the part with the disclosure risk in them.
+
+    Registering this blueprint tells :class:`SignLedgerAudit` on the same application not
+    to audit the path it was mounted at, so that reading the trail is not a write to it.
+    That is not something a deployer has to remember, and it is not something they could
+    get right by hand either: ``skip_paths=("/_audit",)`` would be wrong the moment
+    ``url_prefix`` or ``register_blueprint(..., url_prefix=...)`` moved the endpoints.
     """
     if authenticator is None:
         raise ConfigurationError(
@@ -447,6 +542,37 @@ def audit_blueprint(
         raise ConfigurationError(f"max_page_size must be at least 1, got {max_page_size}")
 
     blueprint = Blueprint("signledger_audit", __name__, url_prefix=url_prefix)
+
+    @blueprint.record
+    def _keep_out_of_the_trail(state: Any) -> None:
+        """Claim the mounted prefix as unaudited, at registration.
+
+        ``state.url_prefix`` rather than the argument above: ``register_blueprint`` may
+        override it, and the path the endpoints actually answer on is the only one worth
+        excluding. ``record`` rather than ``record_once`` so that every mount is claimed -
+        one blueprint may be registered on several applications, or twice on one under
+        different names, and a mount that went unclaimed would audit itself again.
+
+        Every inspection request used to append an entry - measured: ``/status`` 200 +1,
+        ``/entries`` 200 +1, ``/entries`` with no credential 401 +1, a malformed ``limit``
+        400 +1, and ``/verify`` 200 +1 reporting ``entries_verified=5`` while appending
+        the sixth. So each read cost more than the last, and the ``401`` meant an
+        unauthenticated caller could append a signed, unprunable row by being turned away
+        - against an endpoint whose docstring justifies its authenticator on the grounds
+        that an open one is a denial-of-service surface.
+        """
+        mount = (state.url_prefix or "").rstrip("/")
+        if not mount:
+            # Excluding "" would exclude every path on the application: `is_skipped`
+            # matches a prefix against the start of the path, and every path starts with
+            # "/". Silently auditing the inspection endpoints is bad; silently auditing
+            # nothing at all is unrecoverable, and a mount at the root cannot be
+            # distinguished from the rest of the site by prefix. Refuse instead.
+            raise ConfigurationError(
+                "audit_blueprint must be mounted under a url_prefix so that its own "
+                "requests can be kept out of the trail it serves"
+            )
+        _inspection_prefixes(state.app).append(mount)
 
     @blueprint.before_request
     def _authenticate() -> Optional[Response]:
@@ -542,6 +668,6 @@ def _as_int(raw: Optional[str], default: int) -> int:
         raise ValueError("expected an integer") from None
 
 
-#: The shared implementation, under the name this module used to define it with, for
-#: anything that reached in and patched it.
-_SettlingBody: Any = SettlingBody
+#: The body wrapper, under the name this module used to define it with, for anything that
+#: reached in and patched it.
+_SettlingBody: Any = _AbandonableBody
