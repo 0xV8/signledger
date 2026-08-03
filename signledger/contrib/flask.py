@@ -145,7 +145,7 @@ blown up.
 import contextlib
 import functools
 import uuid
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from flask import Blueprint, Flask, Response, current_app, g, jsonify, request
 from flask.signals import got_request_exception
@@ -271,14 +271,37 @@ class SignLedgerAudit:
     def _skip(self, path: str) -> bool:
         """Whether this request is outside the trail.
 
-        The configured prefixes, plus wherever the inspection blueprint was mounted on
-        the application handling this request. The extension can be shared between
-        applications - one instance, several ``init_app`` calls - so the mount points are
-        read from the application in play rather than held on ``self``.
+        The configured prefixes, plus the inspection console - and the console is
+        identified by *what answered*, not by where it sits. The extension can be shared
+        between applications, so anything about the console is read from the application
+        in play rather than held on ``self``.
         """
-        return is_skipped(path, self.skip_paths) or is_skipped(
-            path, _inspection_prefixes(current_app)
-        )
+        return is_skipped(path, self.skip_paths) or self._is_inspection(path)
+
+    def _is_inspection(self, path: str) -> bool:
+        """Whether the audit console answered this request.
+
+        Two questions, in order, and both are load-bearing.
+
+        **Did one of the console's own views handle it?** ``request.blueprint`` is the
+        exact answer Flask already has, and using the mount path instead was a real
+        defect: excluding by prefix excludes the *path*, not the *console*, so an
+        application route at ``/_audit/export`` returned 200 and wrote nothing at all.
+        Quietly dropping trail is worse than the double-write the exclusion replaced,
+        which is why the blueprint is asked first.
+
+        **Failing that, did nothing route it at a path under the mount?** A probe at
+        ``/_audit/bogus`` matches no rule, so there is no blueprint to name it with - and
+        it needs no credential, which makes it the cheapest way to append a row to an
+        append-only store. It is only reached when ``url_rule`` is ``None``, so an
+        application route that *does* match keeps its entry.
+        """
+        console = _inspection_mounts(current_app)
+        if not console:
+            return False
+        if request.blueprint is not None and request.blueprint in console.names:
+            return True
+        return request.url_rule is None and is_skipped(path, console.prefixes)
 
     def _before_request(self) -> None:
         """Decide about the body *before* the view has a chance to consume it.
@@ -482,11 +505,34 @@ class _AbandonableBody(SettlingBody):
         self.close()
 
 
-def _inspection_prefixes(app: Flask) -> List[str]:
-    """Paths on ``app`` that :func:`audit_blueprint` answers on, and this extension does
-    not audit."""
-    prefixes: List[str] = app.extensions.setdefault(INSPECTION_PREFIXES_KEY, [])
-    return prefixes
+class _Console:
+    """Where the audit console is mounted on one application, and what it is called.
+
+    Both halves are needed. The registered blueprint *names* answer "did the console
+    handle this request", which is the question that matters for anything that routed;
+    the *prefixes* answer "is this a probe at a path nothing claims", which is the only
+    thing left to go on when no rule matched.
+    """
+
+    __slots__ = ("names", "prefixes")
+
+    def __init__(self) -> None:
+        self.names: Set[str] = set()
+        self.prefixes: List[str] = []
+
+    def __bool__(self) -> bool:
+        return bool(self.names or self.prefixes)
+
+
+#: Returned for an application that has no console, so that reading never mutates
+#: ``app.extensions`` - the previous version did a ``setdefault`` on every request.
+_NO_CONSOLE = _Console()
+
+
+def _inspection_mounts(app: Flask) -> _Console:
+    """The audit console registered on ``app``, if any."""
+    console = app.extensions.get(INSPECTION_PREFIXES_KEY)
+    return console if isinstance(console, _Console) else _NO_CONSOLE
 
 
 def _will_stream(response: Response) -> bool:
@@ -561,6 +607,15 @@ def audit_blueprint(
         - against an endpoint whose docstring justifies its authenticator on the grounds
         that an open one is a denial-of-service surface.
         """
+        console = state.app.extensions.setdefault(INSPECTION_PREFIXES_KEY, _Console())
+        if not isinstance(console, _Console):  # pragma: no cover - defensive
+            console = _Console()
+            state.app.extensions[INSPECTION_PREFIXES_KEY] = console
+        # The name Flask will report as ``request.blueprint``, which is what identifies
+        # the console for anything that actually routed.
+        prefix = getattr(state, "name_prefix", "")
+        console.names.add(f"{prefix}{getattr(state, 'name', blueprint.name)}")
+
         mount = (state.url_prefix or "").rstrip("/")
         if not mount:
             # Excluding "" would exclude every path on the application: `is_skipped`
@@ -572,7 +627,8 @@ def audit_blueprint(
                 "audit_blueprint must be mounted under a url_prefix so that its own "
                 "requests can be kept out of the trail it serves"
             )
-        _inspection_prefixes(state.app).append(mount)
+        if mount not in console.prefixes:
+            console.prefixes.append(mount)
 
     @blueprint.before_request
     def _authenticate() -> Optional[Response]:

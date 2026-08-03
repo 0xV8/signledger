@@ -51,6 +51,7 @@ WRONG_TYPE_FACTORY_ID = "signledger_django.E003"
 UNIMPORTABLE_RESOLVER_ID = "signledger_django.E004"
 WRONG_TYPE_RESOLVER_ID = "signledger_django.E005"
 INCOMPATIBLE_BODY_LIMITS_ID = "signledger_django.W001"
+UNUSABLE_BODY_LIMITS_ID = "signledger_django.E006"
 
 _HINT = (
     f"Set {SETTINGS_KEY}['LEDGER_FACTORY'] to a zero-argument callable, or to the dotted "
@@ -177,7 +178,32 @@ def check_body_capture_limits(
     django_limit = getattr(settings, "DATA_UPLOAD_MAX_MEMORY_SIZE", None)
     if django_limit is None:
         return []
-    max_body_bytes = int(config["MAX_BODY_BYTES"])
+
+    # Both numbers are converted defensively, because this check runs inside
+    # ``manage.py check`` and therefore inside ``manage.py migrate``. An unguarded
+    # ``int()`` turns a typo in either setting into a traceback out of the deploy command -
+    # exactly the blast radius the module docstring argues a warning-only check must never
+    # have. The two sibling checks already type-check and return an ``Error``; this one
+    # did not, and one of the two settings is not even this app's to make assumptions
+    # about. Neither value is echoed: contract section 10.
+    try:
+        max_body_bytes = int(config["MAX_BODY_BYTES"])
+        django_limit = int(django_limit)
+    except (TypeError, ValueError):
+        return [
+            Error(
+                f"{SETTINGS_KEY}['MAX_BODY_BYTES'] and DATA_UPLOAD_MAX_MEMORY_SIZE must "
+                "both be whole numbers of bytes; one of them is not.",
+                hint=(
+                    f"Set {SETTINGS_KEY}['MAX_BODY_BYTES'] and "
+                    "DATA_UPLOAD_MAX_MEMORY_SIZE to integers. The middleware converts "
+                    "MAX_BODY_BYTES the same way at startup, so this would otherwise "
+                    "surface as a failure on the first request instead."
+                ),
+                id=UNUSABLE_BODY_LIMITS_ID,
+            )
+        ]
+
     if max_body_bytes <= django_limit:
         return []
     return [
