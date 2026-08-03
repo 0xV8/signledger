@@ -7,7 +7,7 @@ from typing import Any, FrozenSet, List, Optional, Tuple
 
 from signledger.backends.base import CAP_APPEND_ONLY_ENFORCED
 from signledger.core.entry import CURRENT_FORMAT_VERSION
-from signledger.core.exceptions import ValidationError
+from signledger.core.exceptions import SignLedgerError, ValidationError
 
 __all__ = [
     "AssuranceLevel",
@@ -255,9 +255,16 @@ def _check_checkpoint_authenticity(
 
     try:
         payload = checkpoint_signing_payload(checkpoint)
-    except (ValidationError, TypeError, ValueError):
-        # A doctored field that cannot even be canonicalised. Raising here would let an
-        # attacker turn verification into a crash, which is a denial of the answer.
+    except (SignLedgerError, TypeError, ValueError):
+        # A doctored field that cannot even be canonicalised - an anchor file is JSON, and
+        # JSON carries a lone surrogate happily while UTF-8 cannot encode one. Raising here
+        # would let an attacker turn verification into a crash, which denies the answer as
+        # effectively as a forged pass.
+        #
+        # ``SignLedgerError`` and not ``ValidationError``: canonicalisation raises
+        # ``CanonicalizationError``, which is a sibling of ``ValidationError`` under
+        # ``SignLedgerError``, not a subclass of it. Catching the narrower one looked
+        # careful and caught nothing.
         return [
             VerificationFailure(
                 kind=FailureKind.CHECKPOINT_BAD_SIGNATURE,
@@ -306,13 +313,16 @@ def _check_merkle_root(backend: Any, checkpoint: Any, chain: Any) -> List[Verifi
             for entry in backend.iter_entries(end_seq=checkpoint.sequence)
         ]
     except ValueError:
-        # A tampered digest that is not hex. The entry-level BAD_HASH check reports the
-        # damage precisely; there is no tree to build over it.
-        return []
-    if not leaves:
-        # Nothing to summarise. The head check above has already reported the absence.
+        # A tampered digest that is not hex, somewhere at or below the checkpointed
+        # sequence. The entry-level BAD_HASH check reports that damage precisely, and a
+        # tree cannot be built over it; reporting a Merkle mismatch as well would name a
+        # symptom rather than the cause.
         return []
 
+    # No `if not leaves` guard: this function runs only when the head check passed, which
+    # means `get_by_sequence(checkpoint.sequence)` returned an entry, which means the
+    # window below it is never empty. A branch no input can reach is a line no test can
+    # justify, and dead code in a verifier is worse than none.
     recomputed = MerkleTree(leaves, algorithm=chain.algorithm).root
     if _same_digest(recomputed, checkpoint.merkle_root):
         return []

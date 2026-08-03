@@ -22,6 +22,28 @@ import pytest
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 EXAMPLES = REPO_ROOT / "examples"
 
+#: Skipped wholesale when the examples are not beside the tests.
+#:
+#: mutmut is the case this exists for. It copies ``source_paths`` and ``tests/`` into a
+#: ``mutants/`` tree and runs a clean baseline there; ``examples/`` does not come along, so
+#: every test below died on ``can't open file '.../mutants/examples/quickstart.py'``, the
+#: baseline failed, and mutmut refused to check a single mutant while the CI job reported
+#: success. That is the identical defect commit 6681640 fixed in the sibling
+#: ``test_docs_execute.py`` and left standing here.
+#:
+#: The sibling walks up to find the real repository root. That is deliberately *not* done
+#: here: it would make these tests run the real ``examples/`` against the real installed
+#: package, so under mutmut they would execute unmutated source and could never kill a
+#: mutant - a baseline that passes by testing the wrong tree. Being honestly absent from
+#: the sweep beats being present and meaningless.
+pytestmark = pytest.mark.skipif(
+    not EXAMPLES.is_dir(),
+    reason=(
+        "examples/ is not beside the test suite; this tree was copied without it "
+        "(mutmut does exactly that)"
+    ),
+)
+
 #: Every example, with the stdout markers it promises to print. The markers are the
 #: example's contract with this test: they name the *behaviour* being demonstrated, so a
 #: script that still exits 0 while having quietly stopped verifying anything still fails.

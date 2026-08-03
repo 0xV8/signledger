@@ -58,6 +58,12 @@ class MemoryAdversary:
     def clear_checkpoints(self):
         self.backend._checkpoints.clear()
 
+    def corrupt_digest(self, sequence, digest):
+        original = self.backend._entries[sequence]
+        forged = original.model_copy(update={"hash": digest})
+        self.backend._entries[sequence] = forged
+        self.backend._by_entry_id[forged.entry_id] = forged
+
 
 class SQLiteAdversary:
     """A DBA with UPDATE and DELETE on the table, plus the DDL rights to unlock it."""
@@ -96,6 +102,12 @@ class SQLiteAdversary:
         # itself why a local checkpoint is not evidence against the insider.
         self.backend._connection().execute(
             f"DELETE FROM {self.backend.checkpoints_table}"  # noqa: S608
+        )
+
+    def corrupt_digest(self, sequence, digest):
+        self.backend._connection().execute(
+            f"UPDATE {self.table} SET hash = ? WHERE sequence = ?",  # noqa: S608
+            (digest, sequence),
         )
 
 
@@ -932,3 +944,47 @@ def test_an_attacker_holding_both_the_store_and_the_anchor_is_not_detected(
     adversary.clear_checkpoints()
 
     assert ledger.check_integrity().ok is True
+
+
+def test_an_anchor_holding_an_unencodable_field_is_refused_not_crashed(
+    store, adversary, reachable_sink, signer
+):
+    """Verification must answer, not raise.
+
+    JSON carries a lone surrogate happily - ``"\\ud800"`` is a valid escape - and CPython
+    holds the string, but UTF-8 cannot encode it, so such a checkpoint cannot be
+    canonicalised into a signing payload at all. The anchor file is the reachable way in:
+    a store refuses the value on the way down, and an attacker who can rewrite the anchor
+    does not have to go through one. Letting the encode error propagate would turn
+    tampering into a crash, which denies the answer as effectively as a forged pass.
+    """
+    ledger = signed_ledger(store, reachable_sink, signer, count=4)
+    ledger.checkpoint()
+
+    record = json.loads(anchor_lines(reachable_sink.path)[0])
+    record["head_hash"] = "\ud800"
+    adversary.clear_checkpoints()
+    rewrite_anchor(reachable_sink.path, [json.dumps(record, sort_keys=True)])
+
+    assert FailureKind.CHECKPOINT_BAD_SIGNATURE in kinds(ledger.check_integrity())
+
+
+def test_a_non_hex_digest_below_the_checkpoint_is_not_reported_as_a_merkle_mismatch(
+    store, adversary, signer
+):
+    """The entry-level check already names that damage exactly.
+
+    A digest that is not hex cannot be turned into a Merkle leaf, so the tree cannot be
+    built. Reporting a Merkle mismatch on top of the BAD_HASH would name a symptom of the
+    corruption rather than the corruption, and send an operator to the wrong field.
+    """
+    ledger = Ledger(store, enable_signatures=True, signer=signer)
+    for index in range(4):
+        ledger.append({"n": index})
+    ledger.checkpoint()
+
+    adversary.corrupt_digest(1, "zz" * 32)
+
+    report = ledger.check_integrity()
+    assert FailureKind.CHECKPOINT_MERKLE_MISMATCH not in kinds(report)
+    assert FailureKind.BAD_HASH in kinds(report)
