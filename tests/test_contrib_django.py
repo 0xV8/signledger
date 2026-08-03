@@ -12,11 +12,14 @@ does not match its models breaks every ``manage.py migrate`` that installs it.
 """
 
 import ast
+import asyncio
 import contextlib
+import gc
 import json
 import logging
 import pathlib
-from typing import Any, Dict, Iterator, List
+import warnings
+from typing import Any, AsyncIterator, Dict, Iterator, List
 
 import django
 import pytest
@@ -32,8 +35,21 @@ if not settings.configured:
         SECRET_KEY="signledger-test-key",
         ALLOWED_HOSTS=["*"],
         USE_TZ=True,
+        # A shared-cache in-memory database rather than a bare ``":memory:"``, which is
+        # private to the connection that opened it. Django's connections are thread-local,
+        # and under ASGI the sync middleware and the settlement both run in the
+        # thread-sensitive executor rather than in the thread that ran ``migrate`` - so
+        # with a private database every ORM write from there hits a second, empty file and
+        # comes back "no such table". That is a property of this harness and not of the
+        # code under test, and it would have hidden whether the audit index mirror works
+        # under ASGI at all. This is the same URI Django's own test runner uses for
+        # in-memory databases.
         DATABASES={
-            "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}
+            "default": {
+                "ENGINE": "django.db.backends.sqlite3",
+                "NAME": "file:signledger_test?mode=memory&cache=shared",
+                "OPTIONS": {"uri": True},
+            }
         },
         # ``django.contrib.admin`` and its dependencies are installed deliberately.
         # ``models.py`` promises an operator "can use the ORM and the Django admin to
@@ -1462,3 +1478,441 @@ def test_indexing_a_settlement_record_does_not_break_the_request(
     middleware._index(entry, {})
 
     assert middleware.recorder.audit_failures == 1
+
+
+# ======================================================================================
+# Reading the body for audit is never the reason a request fails unaudited
+#
+# ``RedactionPolicy.max_body_bytes`` and Django's ``DATA_UPLOAD_MAX_MEMORY_SIZE`` are two
+# independent limits with nothing holding them together. Harden the Django one below
+# MAX_BODY_BYTES - or raise MAX_BODY_BYTES above Django's 2.5 MB default - and
+# ``request.body`` raises ``RequestDataTooBig`` inside the middleware, *before*
+# ``get_response``, so the ``except`` around it never runs. Measured on the shipped code:
+# three requests, two ledger entries, and the 400 the auditor itself caused had no entry
+# at all. The README's own Django snippet sets ``"CAPTURE_BODY": True``.
+# ======================================================================================
+
+
+def read_the_stream_first(get_response: Any) -> Any:
+    """A middleware that consumes part of the request stream before the auditor does.
+
+    This is what any streaming-upload middleware looks like. Once ``request.read()`` has
+    started, Django refuses ``request.body`` with ``RawPostDataException`` for the rest of
+    the request - and the auditor asks for it unconditionally.
+    """
+
+    def middleware(request: Any) -> Any:
+        request.read(1)
+        return get_response(request)
+
+    return middleware
+
+
+def test_a_body_django_refuses_to_hand_over_is_still_audited() -> None:
+    """The headline. The audit middleware was the cause of an unaudited failed request."""
+    with audited(CAPTURE_BODY=True), override_settings(DATA_UPLOAD_MAX_MEMORY_SIZE=1024):
+        Client(raise_request_exception=False).post(
+            "/echo",
+            data=json.dumps({"blob": "a" * 2000}),
+            content_type="application/json",
+        )
+        assert len(entries()) == 1
+
+
+def test_a_body_django_refuses_to_hand_over_is_recorded_as_a_marker() -> None:
+    """The established pattern for "capture was refused and here is why", and the reason
+    names the limit that refused rather than SignLedger's own, which admitted it."""
+    with audited(CAPTURE_BODY=True), override_settings(DATA_UPLOAD_MAX_MEMORY_SIZE=1024):
+        Client(raise_request_exception=False).post(
+            "/echo",
+            data=json.dumps({"blob": "a" * 2000}),
+            content_type="application/json",
+        )
+        assert entries()[0].data["body"] == "[OMITTED:over-request-limit]"
+
+
+def test_the_recorded_status_is_the_one_django_actually_served() -> None:
+    """Django's limit is real policy and is still honoured: the view asks for the body,
+    Django refuses it, the client gets its 400 - and now the ledger says so."""
+    with audited(CAPTURE_BODY=True), override_settings(DATA_UPLOAD_MAX_MEMORY_SIZE=1024):
+        response = Client(raise_request_exception=False).post(
+            "/echo",
+            data=json.dumps({"blob": "a" * 2000}),
+            content_type="application/json",
+        )
+        assert (response.status_code, entries()[0].data["status"]) == (400, 400)
+
+
+def test_a_view_that_never_reads_the_body_is_served_normally() -> None:
+    """The auditor must be invisible to the outcome. ``DATA_UPLOAD_MAX_MEMORY_SIZE``
+    only ever applies to code that asks for the body, and an audit middleware asking on
+    the view's behalf turned requests that would have succeeded into 400s."""
+    with audited(CAPTURE_BODY=True), override_settings(DATA_UPLOAD_MAX_MEMORY_SIZE=1024):
+        response = Client(raise_request_exception=False).post(
+            "/login",
+            data=json.dumps({"blob": "a" * 2000}),
+            content_type="application/json",
+        )
+        assert response.status_code == 200
+
+
+def test_a_body_that_was_already_read_is_recorded_rather_than_raised() -> None:
+    """``RawPostDataException`` is not a 400, it is a 500 - and it was raised from inside
+    the middleware, so the request that produced it went unrecorded too."""
+    with audited(CAPTURE_BODY=True), override_settings(
+        MIDDLEWARE=["test_contrib_django.read_the_stream_first", AUDIT_MIDDLEWARE]
+    ):
+        Client(raise_request_exception=False).post(
+            "/login",
+            data=json.dumps({"user": "ada"}),
+            content_type="application/json",
+        )
+        assert entries()[0].data["body"] == "[OMITTED:unreadable]"
+
+
+def test_a_body_that_could_not_be_read_says_so_in_the_log(caplog: Any) -> None:
+    """Counted and named, never swallowed - and the type only, never the payload.
+
+    Filtered to this library's own logger. Django logs the 500 it used to produce here
+    with a full traceback, so an assertion against the whole of ``caplog`` passes on the
+    broken code and proves nothing.
+    """
+    with audited(CAPTURE_BODY=True), override_settings(
+        MIDDLEWARE=["test_contrib_django.read_the_stream_first", AUDIT_MIDDLEWARE]
+    ):
+        with caplog.at_level(logging.WARNING, logger="signledger"):
+            Client(raise_request_exception=False).post(
+                "/login",
+                data=json.dumps({"user": "ada", "password": "hunter2"}),
+                content_type="application/json",
+            )
+    ours = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith("signledger")
+    ]
+    assert any("RawPostDataException" in message for message in ours)
+    assert "hunter2" not in " ".join(ours)
+
+
+def test_a_chunked_upload_is_not_recorded_as_if_nothing_was_sent() -> None:
+    """``Transfer-Encoding: chunked`` with no declared length is how a client suppresses
+    body capture, and it recorded ``[OMITTED:no-content-length]`` - the same marker a
+    plain GET gets, so the entry read like a policy decision rather than a withheld
+    length. Reachable on gunicorn and uWSGI, which dechunk without setting
+    ``CONTENT_LENGTH``."""
+    with audited(CAPTURE_BODY=True):
+        Client().post(
+            "/login",
+            data=json.dumps({"user": "ada"}),
+            content_type="application/json",
+            CONTENT_LENGTH="",
+            HTTP_TRANSFER_ENCODING="chunked",
+        )
+        assert entries()[0].data["body"] == "[OMITTED:undeclared-length]"
+
+
+def test_a_request_with_no_body_at_all_still_says_no_content_length() -> None:
+    """And the marker for "nothing was sent" does not move: it is the one the other two
+    integrations write for the same traffic."""
+    with audited(CAPTURE_BODY=True):
+        Client().get("/items")
+        assert entries()[0].data["body"] == "[OMITTED:no-content-length]"
+
+
+# --------------------------------------------------------------------------------------
+# ... and a system check, so the two limits are reconciled before any traffic arrives
+# --------------------------------------------------------------------------------------
+
+
+def test_manage_py_check_warns_when_the_two_body_limits_disagree() -> None:
+    from signledger.contrib.django.apps import check_body_capture_limits
+
+    with audited(CAPTURE_BODY=True, MAX_BODY_BYTES=8192), override_settings(
+        DATA_UPLOAD_MAX_MEMORY_SIZE=1024
+    ):
+        assert [warning.id for warning in check_body_capture_limits(None)] == [
+            "signledger_django.W001"
+        ]
+
+
+def test_the_body_limit_warning_names_both_numbers_to_reconcile() -> None:
+    from signledger.contrib.django.apps import check_body_capture_limits
+
+    with audited(CAPTURE_BODY=True, MAX_BODY_BYTES=8192), override_settings(
+        DATA_UPLOAD_MAX_MEMORY_SIZE=1024
+    ):
+        rendered = " ".join(str(warning) for warning in check_body_capture_limits(None))
+    assert "8192" in rendered
+    assert "1024" in rendered
+
+
+def test_the_body_limit_check_is_silent_when_the_limits_are_compatible() -> None:
+    from signledger.contrib.django.apps import check_body_capture_limits
+
+    with audited(CAPTURE_BODY=True, MAX_BODY_BYTES=1024), override_settings(
+        DATA_UPLOAD_MAX_MEMORY_SIZE=8192
+    ):
+        assert check_body_capture_limits(None) == []
+
+
+def test_the_body_limit_check_is_silent_when_no_body_is_captured() -> None:
+    """Nothing is read, so there is nothing to reconcile."""
+    from signledger.contrib.django.apps import check_body_capture_limits
+
+    with audited(MAX_BODY_BYTES=8192), override_settings(DATA_UPLOAD_MAX_MEMORY_SIZE=1024):
+        assert check_body_capture_limits(None) == []
+
+
+def test_the_body_limit_check_is_silent_when_django_has_no_limit() -> None:
+    """``DATA_UPLOAD_MAX_MEMORY_SIZE = None`` disables Django's limit entirely."""
+    from signledger.contrib.django.apps import check_body_capture_limits
+
+    with audited(CAPTURE_BODY=True, MAX_BODY_BYTES=8192), override_settings(
+        DATA_UPLOAD_MAX_MEMORY_SIZE=None
+    ):
+        assert check_body_capture_limits(None) == []
+
+
+def test_the_body_limit_warning_does_not_fail_manage_py_check() -> None:
+    """It is a Warning and not an Error on purpose: the configuration is survivable now -
+    the body is recorded as a marker - so it must not stop a deploy."""
+    with audited(CAPTURE_BODY=True, MAX_BODY_BYTES=8192), override_settings(
+        DATA_UPLOAD_MAX_MEMORY_SIZE=1024
+    ):
+        call_command("check")
+
+
+def test_the_body_limit_check_is_registered_under_the_compatibility_tag() -> None:
+    from django.core.checks.registry import registry
+
+    from signledger.contrib.django.apps import check_body_capture_limits
+
+    assert check_body_capture_limits in registry.get_checks(
+        include_deployment_checks=False
+    )
+
+
+# ======================================================================================
+# ASGI
+#
+# ``grep -rE "asgi|ASGI|async" tests/test_contrib_django.py`` used to return nothing, on
+# an integration whose middleware is installed by every Django project template and whose
+# supported Django versions have all shipped ASGI. Two things were true of it:
+#
+# * an async ``StreamingHttpResponse`` has an *async* iterator, and ``SettlingBody`` is a
+#   sync iterable. Django's ``_set_streaming_content`` decides which kind it has by
+#   trying ``iter(value)``, which succeeds on ``SettlingBody``, so the response was
+#   flipped to ``is_async = False`` and ``ASGIHandler`` then died with
+#   ``TypeError: 'async_generator' object is not iterable`` - after the 200 status line
+#   had already gone out and before a single byte of the body did;
+# * before that, the same response produced one entry saying
+#   ``status=200, completion=final, error=None``: the identical overclaim the WSGI path
+#   was rebuilt to remove.
+#
+# The middleware stays sync-only. Under ASGI Django wraps it in
+# ``sync_to_async(thread_sensitive=True)``, and that was measured not to serialise
+# requests - four concurrent async views sleeping 0.3s finish in 0.31s - so there is no
+# throughput problem here to fix, only a correctness one.
+# ======================================================================================
+
+
+async def async_view(request: Any) -> HttpResponse:
+    return JsonResponse({"ok": True})
+
+
+async def async_stream_view(request: Any) -> HttpResponse:
+    async def body() -> AsyncIterator[bytes]:
+        yield b'{"row": 0}\n'
+        yield b'{"row": 1}\n'
+
+    return StreamingHttpResponse(body(), content_type="application/x-ndjson")
+
+
+async def broken_async_stream_view(request: Any) -> HttpResponse:
+    async def body() -> AsyncIterator[bytes]:
+        yield b'{"row": 0}\n'
+        raise RuntimeError("async feed died mid-stream")
+
+    return StreamingHttpResponse(body(), content_type="application/x-ndjson")
+
+
+urlpatterns += [
+    path("async", async_view),
+    path("async-stream", async_stream_view),
+    path("broken-async-stream", broken_async_stream_view),
+]
+
+
+def run_asgi(path_info: str, method: str = "GET") -> List[Dict[str, Any]]:
+    """Drive one request through Django's real ``ASGIHandler`` and return what it sent.
+
+    ``django.test.AsyncClient`` does not go near ``ASGIHandler``: it builds an
+    ``ASGIRequest`` by hand and calls the middleware chain, so the entire response-sending
+    half - which is where an async streamed body is consumed, and where every defect this
+    section covers lives - is not exercised by it at all. This drives the same application
+    object ``asgi.py`` hands to daphne or uvicorn.
+
+    The application's own exception is swallowed for the same reason :func:`run_wsgi`
+    swallows one: a stream that dies is the scenario under test, not a failure of the
+    harness. What was sent before it died is returned, because that is what the client
+    got and what the ledger has to agree with.
+    """
+    from asgiref.testing import ApplicationCommunicator
+    from django.core.handlers.asgi import ASGIHandler
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.1"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path_info,
+        "raw_path": path_info.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"testserver")],
+        "client": ("127.0.0.1", 54321),
+        "server": ("testserver", 80),
+    }
+
+    async def drive() -> List[Dict[str, Any]]:
+        communicator = ApplicationCommunicator(ASGIHandler(), scope)
+        await communicator.send_input(
+            {"type": "http.request", "body": b"", "more_body": False}
+        )
+        messages: List[Dict[str, Any]] = []
+        with contextlib.suppress(RuntimeError, TypeError, asyncio.TimeoutError):
+            while True:
+                message = await communicator.receive_output(timeout=1)
+                messages.append(message)
+                if message["type"] == "http.response.body" and not message.get(
+                    "more_body"
+                ):
+                    break
+        # Waited on separately, and after the body: ``handle()`` closes the response -
+        # which is one of the two moments a settlement can happen in - only once
+        # ``send_response`` has returned, so returning at the last chunk would read the
+        # ledger before it had been written.
+        with contextlib.suppress(RuntimeError, TypeError, asyncio.TimeoutError):
+            await communicator.wait(timeout=1)
+        return messages
+
+    # ``handle()`` closes the request's ``SpooledTemporaryFile`` on its very last line,
+    # which an exception escaping the response body skips - so a dying stream leaks a file
+    # object that emits a ResourceWarning from ``__del__`` at whatever later moment the
+    # collector happens to run. Under ``filterwarnings = ["error"]`` that surfaces as an
+    # unraisable exception charged to whichever test was unlucky enough to be running.
+    # It is Django's own error path and not this library's, so it is made deterministic
+    # here rather than left to land on a stranger.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        messages = asyncio.run(drive())
+        gc.collect()
+    return messages
+
+
+def body_of(messages: List[Dict[str, Any]]) -> bytes:
+    return b"".join(message.get("body", b"") for message in messages)
+
+
+def test_a_plain_async_view_is_audited(audited_ledger: Ledger) -> None:
+    run_asgi("/async")
+
+    assert [row["path"] for row in data_of(audited_ledger)] == ["/async"]
+
+
+def test_a_plain_async_view_is_recorded_final(audited_ledger: Ledger) -> None:
+    """Nothing is promised, so nothing is provisional."""
+    run_asgi("/async")
+
+    assert data_of(audited_ledger)[0]["completion"] == "final"
+
+
+def test_a_plain_async_view_still_answers(audited_ledger: Ledger) -> None:
+    messages = run_asgi("/async")
+
+    assert body_of(messages) == b'{"ok": true}'
+
+
+def test_an_async_stream_still_delivers_its_whole_body(audited_ledger: Ledger) -> None:
+    """The blocker, and it is not subtle: wrapping the body in the sync ``SettlingBody``
+    convinced Django the response was synchronous, and ``ASGIHandler`` then raised
+    ``TypeError: 'async_generator' object is not iterable`` with the 200 already sent and
+    no body behind it. An audit middleware that breaks streaming has stopped being an
+    audit middleware."""
+    messages = run_asgi("/async-stream")
+
+    assert body_of(messages) == b'{"row": 0}\n{"row": 1}\n'
+
+
+def test_a_completed_async_stream_is_recorded_provisional_then_settled(
+    audited_ledger: Ledger,
+) -> None:
+    run_asgi("/async-stream")
+
+    assert [row["kind"] for row in data_of(audited_ledger)] == [
+        "request",
+        "response.completion",
+    ]
+
+
+def test_a_completed_async_stream_settles_as_complete(audited_ledger: Ledger) -> None:
+    run_asgi("/async-stream")
+
+    assert data_of(audited_ledger)[1]["outcome"] == "complete"
+
+
+def test_an_async_stream_that_dies_delivers_only_what_it_managed(
+    audited_ledger: Ledger,
+) -> None:
+    messages = run_asgi("/broken-async-stream")
+
+    assert body_of(messages) == b'{"row": 0}\n'
+
+
+def test_an_async_stream_that_dies_is_not_recorded_as_a_finished_200(
+    audited_ledger: Ledger,
+) -> None:
+    """The same overclaim the WSGI path was rebuilt to remove, on the path nobody tested:
+    ``{'status': 200, 'completion': 'final', 'error': None}`` for a response the client
+    received one chunk of."""
+    run_asgi("/broken-async-stream")
+
+    rows = data_of(audited_ledger)
+    assert rows[0]["completion"] == "provisional"
+
+
+def test_an_async_stream_that_dies_settles_as_incomplete(
+    audited_ledger: Ledger,
+) -> None:
+    run_asgi("/broken-async-stream")
+
+    assert data_of(audited_ledger)[1]["outcome"] == "incomplete"
+
+
+def test_an_async_stream_that_dies_names_the_exception(audited_ledger: Ledger) -> None:
+    run_asgi("/broken-async-stream")
+
+    assert data_of(audited_ledger)[1]["error"] == "RuntimeError"
+
+
+def test_an_async_stream_settles_exactly_once(audited_ledger: Ledger) -> None:
+    """``ASGIHandler`` closes the response *and* ``aclosing()`` closes the iterator, so
+    there are two plausible moments to settle in and a second settlement entry would be a
+    second claim rather than a repeat."""
+    run_asgi("/async-stream")
+
+    assert [row["kind"] for row in data_of(audited_ledger)].count("response.completion") == 1
+
+
+def test_an_async_settlement_reaches_the_orm_mirror(audited_ledger: Ledger) -> None:
+    """The settlement is recorded from inside the event loop, and the mirror is the ORM.
+    Writing to it from there raises ``SynchronousOnlyOperation`` unless the settle is put
+    back on a thread Django considers safe."""
+    run_asgi("/async-stream")
+
+    assert list(AuditIndex.objects.order_by("sequence").values_list("kind", flat=True)) == [
+        "request",
+        "response.completion",
+    ]
