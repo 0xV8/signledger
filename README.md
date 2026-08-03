@@ -168,6 +168,12 @@ Failures name what broke and where: `broken_link`, `bad_hash`, `bad_signature`,
 `missing_signature`, `sequence_gap`, `genesis_mismatch`, `head_mismatch`,
 `count_mismatch`, `unknown_key`, `format_unsupported`.
 
+A checkpoint gets its own six, because a checkpoint is the only thing that sees a truncated
+tail and is therefore the next thing an attacker goes for — collapsing them into
+`head_mismatch` would say the chain is wrong when what is wrong is the record being compared
+against it: `checkpoint_unsigned`, `checkpoint_unknown_key`, `checkpoint_bad_signature`,
+`checkpoint_ledger_mismatch`, `checkpoint_format_unsupported`, `checkpoint_merkle_mismatch`.
+
 An empty range is reported as **not ok**. A verifier that returns success having checked
 nothing is worse than no verifier.
 
@@ -593,9 +599,11 @@ to retire that ledger and start a new one, not to edit it.
 
 ## Deployment
 
-Everything below was measured, on **macOS arm64** (CPython 3.12, gunicorn 26.0.0,
-uvicorn 0.52, PostgreSQL 14). There is no Linux measurement yet, so nothing here is
-claimed for Linux. Topologies that are not in the table were not tested.
+The rules below are properties of `fork()` and of process identity, and they hold wherever
+you deploy. The one *number* in this section comes from a job that runs on every push, on
+GitHub's `ubuntu-latest` runner under CPython 3.12, so you can read it rather than take it
+on trust. The by-hand runs it replaces were on **macOS arm64** and are not reproduced here,
+so treat any topology outside the table as one you have to measure yourself.
 
 ### Every worker must be given the same `ledger_id`
 
@@ -621,8 +629,9 @@ with Ledger(SQLiteBackend(store), ledger_id=LEDGER_ID) as ledger:
 print(report.ok, report.entries_verified)  # True 4
 ```
 
-Every clean run in the table below started against a store that already held entry 0.
-Deploy the same way: create the ledger once, then start the workers.
+Creating the ledger once and then starting the workers is the cheaper habit, and it is no
+longer required: four workers racing to create one store is the case the table below
+measures.
 
 ### Open the database connection inside the worker, never before the fork
 
@@ -630,51 +639,57 @@ A PostgreSQL connection is not usable from more than one process. Under
 `gunicorn --preload` a module-level backend is created in the master and inherited by
 every child, which puts several processes on one socket.
 
-That configuration used to fail outright — 139 of 300 requests served, with failed
-appends and read timeouts — and it no longer does: the pool became fork-aware, and three
-`--preload` runs on the current build came out clean (300/300 at `-w 4`, 300/300 at
-`-w 12`, 800/800 at `-w 4`, chains contiguous and verifying). **Follow the rule anyway.**
-It is a property of `fork()` rather than of any pooling, so it holds whatever a backend
-does internally, and the version that made it safe is one you have to keep:
+That configuration used to fail outright, and the pool becoming fork-aware is what stopped
+it. **Follow the rule anyway.** It is a property of `fork()` rather than of any pooling, so
+it holds whatever a backend does internally, and nothing in CI re-measures `--preload`
+against PostgreSQL — so the version that made it safe is one you would be trusting rather
+than checking:
 
 - with gunicorn, either drop `--preload`, or build the backend in a `post_fork` hook;
-- uvicorn `--workers` was clean against PostgreSQL — each worker imports the application
-  itself instead of inheriting an open connection.
+- uvicorn `--workers` does not have the problem, because each worker imports the
+  application itself instead of inheriting an open connection.
 
-SQLite is unaffected — `gunicorn --preload -w 8` on SQLite was clean at 800/800 — but
-the rule costs nothing there either.
+SQLite is unaffected — a file handle survives `fork()` in a way a socket does not — but the
+rule costs nothing there either.
 
 ### Verified clean
 
 Chain verified means `check_integrity()` returned ok, sequences were contiguous from 0,
 one `ledger_id`, and no duplicate `sequence` or `previous_hash`.
 
+One topology is re-measured on every push, by the `multi-worker cold start` job in
+[`.github/workflows/ci.yml`](https://github.com/0xV8/signledger/blob/main/.github/workflows/ci.yml).
+It writes a Flask `wsgi.py`, starts `gunicorn -w 4` against a SQLite file that **does not
+exist yet**, drives 300 POSTs through a 32-thread pool, and fails the build unless every
+column below holds:
+
 | Server | Workers | Store | Requests | 2xx | Chain |
 |---|---|---|---|---|---|
-| gunicorn / Flask | `-w 1 --threads 8` | SQLite | 300 | 300 | 301 verified |
-| gunicorn / Flask | `-w 4` | SQLite | 300 | 300 | 301 verified |
-| gunicorn / Flask | `-w 8` | SQLite | 800 | 800 | 801 verified |
-| gunicorn / Flask | `-w 12` | PostgreSQL | 300 | 300 | 301 verified |
-| uvicorn / FastAPI | `--workers 4` | SQLite | 300 | 300 | 301 verified |
-| uvicorn / FastAPI | `--workers 4` | PostgreSQL | 1000 | 1000 | 1001 verified |
-| gunicorn / Django | `-w 4` | PostgreSQL | 300 | 300 | 301 verified |
+| gunicorn / Flask | `-w 4` | SQLite | 300 | 300 | 300 verified |
 
-The Django row also had 300 distinct rows in its `AuditIndex` table, each tying back to a
-chain hash.
+There is no seeded entry 0, which is why the chain is 300 long and not 301: four workers
+racing to create one store is the point of the job. It was a total outage before — a
+WAL-pragma race halted the master, and the three workers that lost the race to write entry
+0 returned 500 for the life of the process.
 
-A cold start — `gunicorn -w 4` against a database file that **did not exist yet** — was
-also measured clean at 300/300. It was not, before: two separate defects meant four
-workers racing to create one store produced a total outage. Both are fixed and both are
-pinned by tests, but seeding the store first is still the cheaper habit.
+Other shapes — `--threads`, `-w 8`, `-w 12`, uvicorn/FastAPI, Django, and PostgreSQL under a
+pre-forking server — were exercised by hand while this release was built, and several
+entries in [CHANGELOG.md](https://github.com/0xV8/signledger/blob/main/CHANGELOG.md) came
+out of doing so. Their numbers are not printed here, because
+nothing in this repository reproduces them and a measurement nobody can re-run is a claim
+rather than evidence. This project has shipped enough of those. Treat any topology other
+than the row above as untested until you have tested it.
 
 ### Which store
 
-SQLite is a real answer for multi-worker on **one host**: the `-w 4` and `-w 8` rows above
-are separate processes writing one file, and the chain came out intact. It stops being an
-answer the moment a second host writes — a network filesystem does not give SQLite the
-locking it depends on.
+SQLite is a real answer for multi-worker on **one host**: the row above is four separate
+processes writing one file, and the chain came out intact. It stops being an answer the
+moment a second host writes — a network filesystem does not give SQLite the locking it
+depends on.
 
-PostgreSQL is the answer across hosts, and the only one tested for that.
+PostgreSQL is the answer across hosts. Its concurrency is covered at the library level by
+the suite, against a live server rather than a mock; it is not covered under a pre-forking
+web server by anything you can re-run.
 
 ## Compatibility
 
@@ -722,9 +737,17 @@ Every fenced `python` block in this file is executed by `tests/test_docs_execute
 every `signledger` line in a `bash` block is parsed and run there too — a renamed flag
 breaks the suite instead of breaking the docs.
 
-Coverage is gated at 100% line *and* branch. That figure is only real with both databases
-running — without them 582 tests skip and it falls to ~91%, so CI runs them as services
-and fails if any database test is skipped.
+Coverage is gated at 100% line *and* branch — `fail_under = 100` in `pyproject.toml`, over
+line and branch alike — and that gate only means anything with both databases running:
+**653 of the 4,087 collected tests** carry the `postgres` or `mongo` marker and skip
+themselves when that server is not reachable. So CI runs both as services and fails if any
+database test is skipped — a skipped test and a passing one look the same in the summary
+line, which is exactly how a suite comes to be believed about code it never ran.
+
+Both figures are counts from this tree rather than estimates:
+`python -m pytest --collect-only -q` for the total, and the same command with
+`-m "postgres or mongo"` for the database subset. How many of those 653 actually skip
+depends on what is running on your machine; in CI the answer has to be none.
 
 ## Security
 
