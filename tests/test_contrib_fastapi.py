@@ -22,6 +22,7 @@ import pytest
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
+from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 
 from signledger.backends.memory import MemoryBackend
@@ -356,6 +357,34 @@ def test_the_factory_form_still_records_an_endpoint_that_raised(ledger: Ledger) 
     with pytest.raises(RuntimeError):
         anyio.run(audited(lambda: ledger)(endpoint))
     assert entries(ledger)[0].data["error"] == "RuntimeError"
+
+
+def test_a_synchronous_endpoint_that_raises_is_audited_by_the_server_that_ran_it(
+    ledger: Ledger,
+) -> None:
+    """Driven through a real application, not by calling the wrapper.
+
+    FastAPI runs a ``def`` endpoint in a threadpool and an ``async def`` one on the
+    loop, and the decorator deliberately keeps those apart - promoting a sync endpoint
+    to a coroutine would move a blocking call onto the event loop. Every raising
+    endpoint in this suite was ``async def``, so the sync wrapper's failure path had
+    never been executed by a server at all. Calling ``audited(...)(fn)()`` by hand would
+    execute the line without ever asking whether FastAPI still gets its exception.
+    """
+    app = FastAPI()
+
+    @app.get("/sync-boom")
+    @audited(ledger, action="sync-boom")
+    def sync_boom() -> Dict[str, Any]:
+        raise ValueError("sync endpoint exploded")
+
+    with TestClient(app) as client:
+        with pytest.raises(ValueError):
+            client.get("/sync-boom")
+
+    assert [
+        (entry.data["action"], entry.data.get("error")) for entry in entries(ledger)
+    ] == [("sync-boom", "ValueError")]
 
 
 def test_a_bad_failure_policy_is_rejected_at_decoration_time_with_a_factory(
@@ -1039,6 +1068,326 @@ def test_the_router_can_be_mounted_under_a_different_prefix(ledger: Ledger) -> N
 def test_a_zero_max_page_size_is_rejected(ledger: Ledger) -> None:
     with pytest.raises(ConfigurationError):
         audit_router(ledger, authenticator=token_auth, max_page_size=0)
+
+
+# ======================================================================================
+# Reading the trail is not a write to it
+#
+# Every application here carries *both* halves - the middleware and the router it must
+# not audit - because that is the only arrangement in which the defect exists. Each test
+# drives a real ASGI stack and then counts what the ledger gained.
+# ======================================================================================
+
+
+def audited_inspect_app(ledger: Ledger, **kwargs: Any) -> FastAPI:
+    """An application whose audit trail is both written and served by itself."""
+    app = FastAPI()
+    app.add_middleware(SignLedgerAuditMiddleware, ledger=ledger)
+    app.include_router(audit_router(ledger, authenticator=token_auth, **kwargs))
+
+    @app.get("/items")
+    async def items() -> Dict[str, Any]:
+        return {"items": []}
+
+    return app
+
+
+AUTH = {"x-audit-token": "let-me-in"}
+
+
+def test_reading_the_status_endpoint_appends_nothing(ledger: Ledger) -> None:
+    app = audited_inspect_app(ledger)
+    with TestClient(app) as client:
+        assert client.get("/_audit/status", headers=AUTH).status_code == 200
+    assert ledger.count() == 0
+
+
+def test_reading_the_entries_endpoint_appends_nothing(ledger: Ledger) -> None:
+    app = audited_inspect_app(ledger)
+    with TestClient(app) as client:
+        assert client.get("/_audit/entries", headers=AUTH).status_code == 200
+    assert ledger.count() == 0
+
+
+def test_an_unauthenticated_probe_appends_nothing(ledger: Ledger) -> None:
+    """The 401 is the cheapest authenticated-endpoint probe there is, and letting it
+    write means an anonymous caller can grow an unprunable store at will - against the
+    docstring that justifies the mandatory authenticator as protection from exactly
+    that."""
+    app = audited_inspect_app(ledger)
+    with TestClient(app) as client:
+        assert client.get("/_audit/entries").status_code == 401
+    assert ledger.count() == 0
+
+
+def test_a_rejected_query_parameter_appends_nothing(ledger: Ledger) -> None:
+    """A 422 from ``Query(ge=1)`` never enters the endpoint, and must still not be
+    audited: the route answered, which is what settles it."""
+    app = audited_inspect_app(ledger)
+    with TestClient(app) as client:
+        assert client.get("/_audit/entries?limit=0", headers=AUTH).status_code == 422
+    assert ledger.count() == 0
+
+
+def test_an_unrouted_path_under_the_mount_appends_nothing(ledger: Ledger) -> None:
+    """The cheapest probe on the whole application: no credential, no route, no
+    endpoint ever entered. It is why the exclusion cannot be a list of the paths the
+    router registered."""
+    app = audited_inspect_app(ledger)
+    with TestClient(app) as client:
+        assert client.get("/_audit/bogus").status_code == 404
+    assert ledger.count() == 0
+
+
+def test_a_method_the_inspection_route_does_not_serve_appends_nothing(
+    ledger: Ledger,
+) -> None:
+    app = audited_inspect_app(ledger)
+    with TestClient(app) as client:
+        assert client.post("/_audit/status", headers=AUTH).status_code == 405
+    assert ledger.count() == 0
+
+
+def test_verify_reports_the_ledger_it_leaves_behind(ledger: Ledger) -> None:
+    """It used to answer ``entries_verified=n`` while appending the n+1th, so every
+    verification cost more than the one before it."""
+    app = audited_inspect_app(ledger)
+    with TestClient(app) as client:
+        client.get("/items")
+        client.get("/items")
+        report = client.get("/_audit/verify", headers=AUTH).json()
+    assert (report["entries_verified"], ledger.count()) == (2, 2)
+
+
+def test_the_exclusion_survives_a_mounted_sub_application(ledger: Ledger) -> None:
+    """``route.path`` is application-relative and ``scope["path"]`` is not. Under a
+    mount the two differ by exactly the mount point, and an exclusion that compares them
+    directly silently does nothing."""
+    root = FastAPI()
+    root.mount("/api", audited_inspect_app(ledger))
+    with TestClient(root) as client:
+        assert client.get("/api/_audit/status", headers=AUTH).status_code == 200
+    assert ledger.count() == 0
+
+
+def test_an_unrouted_probe_under_a_mounted_sub_application_appends_nothing(
+    ledger: Ledger,
+) -> None:
+    """Starlette names the *mounted application* as the endpoint of a request its own
+    router then failed to route, so "something answered" is not the same question as
+    "one of ours answered"."""
+    root = FastAPI()
+    root.mount("/api", audited_inspect_app(ledger))
+    with TestClient(root) as client:
+        assert client.get("/api/_audit/bogus").status_code == 404
+    assert ledger.count() == 0
+
+
+def test_the_exclusion_survives_a_root_path(ledger: Ledger) -> None:
+    """``root_path`` travels with the request instead of being stripped from it, so the
+    path the client asked for is not the path the router was registered at."""
+    app = FastAPI(root_path="/gw")
+    app.add_middleware(SignLedgerAuditMiddleware, ledger=ledger)
+    app.include_router(audit_router(ledger, authenticator=token_auth))
+    with TestClient(app, root_path="/gw") as client:
+        assert client.get("/gw/_audit/status", headers=AUTH).status_code == 200
+    assert ledger.count() == 0
+
+
+def test_an_unrouted_probe_under_a_root_path_appends_nothing(ledger: Ledger) -> None:
+    app = FastAPI(root_path="/gw")
+    app.add_middleware(SignLedgerAuditMiddleware, ledger=ledger)
+    app.include_router(audit_router(ledger, authenticator=token_auth))
+    with TestClient(app, root_path="/gw") as client:
+        assert client.get("/gw/_audit/bogus").status_code == 404
+    assert ledger.count() == 0
+
+
+def test_an_application_route_sharing_the_prefix_is_still_audited(ledger: Ledger) -> None:
+    """Quietly dropping part of the trail is a worse defect than the one being fixed,
+    and unlike it, invisible from outside. The prefix belongs to the router's own
+    endpoints, not to every path that starts with it."""
+    app = audited_inspect_app(ledger)
+
+    @app.get("/_audit/dashboard")
+    async def dashboard() -> Dict[str, Any]:
+        return {"ok": True}
+
+    with TestClient(app) as client:
+        assert client.get("/_audit/dashboard").status_code == 200
+    assert [entry.data["path"] for entry in entries(ledger)] == ["/_audit/dashboard"]
+
+
+def test_a_method_an_application_route_under_the_prefix_refuses_is_still_audited(
+    ledger: Ledger,
+) -> None:
+    app = audited_inspect_app(ledger)
+
+    @app.get("/_audit/dashboard")
+    async def dashboard() -> Dict[str, Any]:
+        return {"ok": True}
+
+    with TestClient(app) as client:
+        assert client.post("/_audit/dashboard").status_code == 405
+    assert [entry.data["status"] for entry in entries(ledger)] == [405]
+
+
+def test_an_inspection_route_wins_against_an_application_catch_all(
+    ledger: Ledger,
+) -> None:
+    """The single-page-application fallback, which claims every path there is.
+
+    "Does the application have a route here?" is the wrong question on its own: with a
+    catch-all registered, the answer is always yes, and every inspection request would be
+    audited again. What settles it is that one of the router's *own* endpoints answered.
+    """
+    app = audited_inspect_app(ledger)
+
+    @app.get("/{spa_path:path}")
+    async def spa(spa_path: str) -> Dict[str, Any]:
+        return {"path": spa_path}
+
+    with TestClient(app) as client:
+        assert client.get("/_audit/status", headers=AUTH).status_code == 200
+        assert client.get("/_audit/entries").status_code == 401
+    assert ledger.count() == 0
+
+
+def test_a_catch_all_answering_under_the_prefix_is_audited_like_any_other_route(
+    ledger: Ledger,
+) -> None:
+    """The other half of the same question. A path under the mount that the *application*
+    answers is the application answering, whatever it looks like from the URL."""
+    app = audited_inspect_app(ledger)
+
+    @app.get("/{spa_path:path}")
+    async def spa(spa_path: str) -> Dict[str, Any]:
+        return {"path": spa_path}
+
+    with TestClient(app) as client:
+        assert client.get("/_audit/bogus").status_code == 200
+    assert [entry.data["path"] for entry in entries(ledger)] == ["/_audit/bogus"]
+
+
+def test_an_empty_prefix_is_refused_rather_than_disabling_the_trail(
+    ledger: Ledger,
+) -> None:
+    """A router at the root cannot be told apart from the site it reports on. Refusing
+    is recoverable; silently auditing nothing at all is not. Flask refuses the same
+    thing for the same reason."""
+    with pytest.raises(ConfigurationError):
+        audit_router(ledger, authenticator=token_auth, prefix="")
+
+
+def test_a_prefix_of_only_slashes_is_refused_too(ledger: Ledger) -> None:
+    with pytest.raises(ConfigurationError):
+        audit_router(ledger, authenticator=token_auth, prefix="/")
+
+
+def test_a_custom_prefix_is_the_one_excluded(ledger: Ledger) -> None:
+    app = audited_inspect_app(ledger, prefix="/internal/audit")
+    with TestClient(app) as client:
+        assert client.get("/internal/audit/status", headers=AUTH).status_code == 200
+        assert client.get("/internal/audit/bogus").status_code == 404
+    assert ledger.count() == 0
+
+
+def test_a_prefix_added_by_include_router_is_the_one_excluded(ledger: Ledger) -> None:
+    """``include_router(..., prefix=...)`` moves the endpoints after the router was
+    built, so the argument :func:`audit_router` was given is not where they answer."""
+    app = FastAPI()
+    app.add_middleware(SignLedgerAuditMiddleware, ledger=ledger)
+    app.include_router(audit_router(ledger, authenticator=token_auth), prefix="/ops")
+    with TestClient(app) as client:
+        assert client.get("/ops/_audit/status", headers=AUTH).status_code == 200
+        assert client.get("/ops/_audit/bogus").status_code == 404
+    assert ledger.count() == 0
+
+
+def test_a_router_included_after_the_first_request_is_still_excluded(
+    ledger: Ledger,
+) -> None:
+    """A factory is free to include the router late, and an answer worked out once and
+    kept would be wrong for as long as the process lives."""
+    app = FastAPI()
+    app.add_middleware(SignLedgerAuditMiddleware, ledger=ledger)
+
+    @app.get("/items")
+    async def items() -> Dict[str, Any]:
+        return {"items": []}
+
+    with TestClient(app) as client:
+        client.get("/items")
+        app.include_router(audit_router(ledger, authenticator=token_auth))
+        assert client.get("/_audit/status", headers=AUTH).status_code == 200
+        assert client.get("/_audit/bogus").status_code == 404
+    assert ledger.count() == 1
+
+
+def test_the_exclusion_holds_when_the_middleware_is_not_the_direct_wrapper(
+    ledger: Ledger,
+) -> None:
+    """The ``--preload`` shape the module documents: the thing the middleware holds is
+    another middleware, which has no routes and is not the application."""
+    inner = FastAPI()
+    inner.include_router(audit_router(ledger, authenticator=token_auth))
+
+    @inner.get("/items")
+    async def items() -> Dict[str, Any]:
+        return {"items": []}
+
+    app = SignLedgerAuditMiddleware(
+        CORSMiddleware(inner, allow_origins=["*"]), ledger=ledger
+    )
+    with TestClient(app) as client:
+        assert client.get("/_audit/status", headers=AUTH).status_code == 200
+        assert client.get("/_audit/bogus").status_code == 404
+        assert client.get("/items").status_code == 200
+    assert [entry.data["path"] for entry in entries(ledger)] == ["/items"]
+
+
+def test_ordinary_application_routes_are_still_audited(ledger: Ledger) -> None:
+    """The exclusion is the router's own mount and nothing else."""
+    app = audited_inspect_app(ledger)
+    with TestClient(app) as client:
+        client.get("/items")
+        client.get("/nowhere")
+    assert [entry.data["path"] for entry in entries(ledger)] == ["/items", "/nowhere"]
+
+
+def test_an_inspection_request_that_raises_is_still_not_in_the_trail(
+    ledger: Ledger,
+) -> None:
+    """An inspection request is no more part of the trail for having blown up than it
+    would have been for succeeding."""
+
+    class Broken:
+        def count(self) -> int:
+            raise RuntimeError("backend gone")
+
+        def get_stats_snapshot(self) -> Dict[str, Any]:
+            return {}
+
+    app = FastAPI()
+    app.add_middleware(SignLedgerAuditMiddleware, ledger=ledger)
+    app.include_router(audit_router(Broken(), authenticator=token_auth))
+    with TestClient(app) as client:
+        with pytest.raises(RuntimeError):
+            client.get("/_audit/status", headers=AUTH)
+    assert ledger.count() == 0
+
+
+def test_an_application_with_no_audit_router_audits_every_path(ledger: Ledger) -> None:
+    """Nothing about this exclusion applies to an application that does not serve its
+    own trail."""
+    app = make_app(ledger)
+    with TestClient(app) as client:
+        client.get("/_audit/status")
+        client.get("/items")
+    assert [entry.data["path"] for entry in entries(ledger)] == [
+        "/_audit/status",
+        "/items",
+    ]
 
 
 # ======================================================================================

@@ -111,6 +111,54 @@ Every entry carries a ``kind`` and a ``request_id``.
 ``kind="response.completion"``
     Written when a **streamed** response finishes, and only then.
 
+The inspection endpoints are not part of the trail
+--------------------------------------------------
+
+Requests answered by :func:`audit_router` are not audited, so reading the ledger is not a
+write to it. Measured over a real uvicorn socket before that, on an application carrying
+both halves: ``/_audit/status`` +1 entry, ``/_audit/entries`` +1, an unauthenticated
+``401`` +1, a ``422`` from ``Query(ge=1)`` +1, and ``GET /_audit/bogus`` - a 404 needing
+no credential at all - +1. ``/verify`` then answered ``entries_verified=5`` while
+appending the sixth, so each verification cost more than the last, and the cheapest probe
+on the application let an anonymous caller append a signed row to a store that by design
+cannot be pruned - against a docstring justifying the mandatory ``authenticator`` as
+protection from exactly that.
+
+The decision is taken **after** the request has been routed, as the status is being sent,
+because that is the first moment it can be answered correctly. ``route.path`` is
+application-relative and ``scope["path"]`` is not: under ``app.mount("/api", subapp)`` or
+``FastAPI(root_path="/gw")`` the two differ by exactly the mount, and an exclusion derived
+from one up front and matched against the other silently does nothing - which is worse
+than no exclusion at all, because the deployer has been told it is automatic and so does
+not set ``skip_paths`` either. By response time Starlette has reconciled the two itself:
+``root_path`` has travelled with the request, ``get_route_path`` undoes it, and
+``scope["endpoint"]`` names whatever answered.
+
+So two questions, in order. *Did one of the router's own endpoints answer?* That settles
+the 200s, the ``401`` from the guard, the ``422`` from parameter validation and the ``405``
+a matched route answers without ever being entered - under any mount, at any
+``root_path``, however the middleware was installed, with no path arithmetic at all. It is
+also the only question that survives a single-page-application catch-all, which claims
+every path there is. *Failing that, did nothing route this request, at a path under the
+mount?* That is the ``/_audit/bogus`` probe, and it is why the exclusion has to be
+prefix-shaped rather than a list of the paths the router registered. A prefix match on its
+own is **not** taken as evidence: an application is free to serve ``/_audit/dashboard``
+itself, so Starlette's own matcher is asked whether it does. Quietly dropping part of the
+trail is a worse defect than the one being prevented, and unlike it, invisible from
+outside.
+
+Nothing is cached and nothing has to be configured. The route table is read per request -
+the Flask sibling reads its mounts from ``current_app`` the same way - so a router
+included by a factory after the first request is excluded from the next one, and the
+``--preload`` shape above works, where the middleware wraps another middleware and the
+thing it holds is not the application and has no routes at all. The application comes from
+the scope instead.
+
+An empty ``prefix`` is a :class:`~signledger.core.exceptions.ConfigurationError` at
+construction, as it is in Flask: a router at the root cannot be told apart from the site it
+reports on, and excluding everything is unrecoverable in a way that auditing a handful of
+inspection requests is not.
+
 ``completion``: ``"final"`` or ``"provisional"``
 -------------------------------------------------
 
@@ -149,6 +197,16 @@ from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from starlette.concurrency import run_in_threadpool
+
+# ``get_route_path`` is defined in ``starlette._utils`` and re-exported from
+# ``starlette.routing``, which ``--strict`` reads as an implicit re-export - hence the
+# ignore. Importing the private module instead would bind to something Starlette is free
+# to move, and reimplementing the subtraction of ``root_path`` from ``path`` is precisely
+# how this exclusion goes quietly wrong under a mount.
+from starlette.routing import (  # type: ignore[attr-defined]
+    Match,
+    get_route_path,
+)
 
 from signledger import contrib as _shared
 from signledger.contrib import (
@@ -198,6 +256,14 @@ COMPLETION_PROVISIONAL = _shared.COMPLETION_PROVISIONAL
 DEFAULT_MAX_PAGE_SIZE = 100
 
 _AUDIT_FAILED_BODY = b'{"detail":"audit write failed"}'
+
+#: Stamped on every endpoint :func:`audit_router` registers, carrying the path that
+#: endpoint answers on *relative to the router*. Taking it off the end of the path the
+#: application ended up serving that route at leaves the mount point - whatever ``prefix``
+#: the router was built with, and whatever ``include_router`` then did to it. The
+#: endpoints are closures built per call, so two routers, or one router included twice,
+#: stamp independently.
+_AUDIT_ROUTE_PATH = "__signledger_audit_path__"
 
 #: The request the current task is serving, for :func:`audited` to correlate against.
 #: Set by the middleware; ``None`` in a decorated call that no request reached.
@@ -290,23 +356,27 @@ class SignLedgerAuditMiddleware:
 
         async def auditing_send(message: Dict[str, Any]) -> None:
             if message["type"] == "http.response.start" and not state["recorded"]:
+                # "Recorded" in the sense of "decided about": an inspection request has
+                # been dealt with by writing nothing, and the exception path below must
+                # not reconsider it.
                 state["recorded"] = True
-                state["status"] = message["status"]
-                state["provisional"] = _is_streamed(scope.get("method", ""), message)
-                try:
-                    await self._record(
-                        scope, headers, decision, chunks, message["status"], None,
-                        overflow=state["overflow"], context=context,
-                        provisional=state["provisional"],
-                    )
-                except AuditWriteError:
-                    # fail_closed, and the client has not been told anything yet. This is
-                    # the only moment at which refusing is still possible. Nothing was
-                    # promised, so there will be nothing to settle either.
-                    state["refused"] = True
-                    state["provisional"] = False
-                    await _send_audit_failure(send)
-                    return
+                if not _is_inspection(scope):
+                    state["status"] = message["status"]
+                    state["provisional"] = _is_streamed(scope.get("method", ""), message)
+                    try:
+                        await self._record(
+                            scope, headers, decision, chunks, message["status"], None,
+                            overflow=state["overflow"], context=context,
+                            provisional=state["provisional"],
+                        )
+                    except AuditWriteError:
+                        # fail_closed, and the client has not been told anything yet.
+                        # This is the only moment at which refusing is still possible.
+                        # Nothing was promised, so there is nothing to settle either.
+                        state["refused"] = True
+                        state["provisional"] = False
+                        await _send_audit_failure(send)
+                        return
             if state["refused"]:
                 # The endpoint's own body must not follow our 500 down the wire.
                 return
@@ -321,11 +391,14 @@ class SignLedgerAuditMiddleware:
         except Exception as err:
             if not state["recorded"]:
                 state["recorded"] = True
-                # The failed requests are the ones an audit trail exists for.
-                await self._record(
-                    scope, headers, decision, chunks, 500, type(err).__name__,
-                    overflow=state["overflow"], context=context, provisional=False,
-                )
+                # The failed requests are the ones an audit trail exists for - unless
+                # this was an inspection request, which is no more part of the trail for
+                # having blown up than it would have been for succeeding.
+                if not _is_inspection(scope):
+                    await self._record(
+                        scope, headers, decision, chunks, 500, type(err).__name__,
+                        overflow=state["overflow"], context=context, provisional=False,
+                    )
             else:
                 # The status went out before this happened and cannot be withdrawn. It
                 # can be settled, which is the whole point of the second entry.
@@ -547,6 +620,99 @@ def _call_record(label: str, func: Callable[..., Any], error: Optional[str]) -> 
     return record
 
 
+def _is_inspection(scope: Dict[str, Any]) -> bool:
+    """Whether this request belongs to an :func:`audit_router` on this application.
+
+    Asked *after* the request has been routed - the scope is the same dict the router has
+    been writing into, so by the time a status is on its way out it says which endpoint
+    answered, and ``root_path`` has been advanced by every mount the request passed
+    through. That timing is the whole design. ``route.path`` is application-relative and
+    ``scope["path"]`` is not; under ``app.mount("/api", subapp)`` or
+    ``FastAPI(root_path="/gw")`` the two differ by exactly the mount, and an exclusion
+    derived from one up front and compared against the other silently does nothing at
+    all. Deciding late means Starlette has already reconciled the two itself, and
+    :func:`get_route_path` - Starlette's own comparator, not a reimplementation of the
+    subtraction - undoes the rest.
+
+    Two questions, in this order.
+
+    *Did one of the router's own endpoints answer?* ``scope["endpoint"]`` says so, with no
+    path arithmetic at all, which settles the 200s, the ``401`` the guard raises, the
+    ``422`` from ``Query(ge=1)`` and the ``405`` a matched route answers without ever
+    being entered. It is also the only question that survives a single-page-application
+    catch-all: with ``@app.get("/{path:path}")`` registered, "does the application have a
+    route here?" is always yes, and asking that alone would audit every inspection request
+    again.
+
+    *Failing that, did nothing route this request, at a path under the mount?* That is
+    ``GET /_audit/bogus``: no credential, no route, no endpoint, and so the cheapest probe
+    on the application - which is why the exclusion has to be prefix-shaped rather than a
+    list of the paths the router registered. A prefix match is not on its own taken as
+    evidence, because an application is free to serve ``/_audit/dashboard`` itself and
+    quietly dropping part of the trail is a worse defect than the one being prevented.
+    Starlette's own matcher is asked whether the application claims the path first.
+
+    That second question is not merely the 404 case dressed up. Starlette names a
+    *mounted application* as the endpoint of a request its own router then failed to
+    route, so under ``app.mount("/api", subapp)`` an unrouted probe arrives here with an
+    endpoint set that is nobody's route - "something answered" and "one of ours answered"
+    are different questions and only the second one is asked above.
+    """
+    if _audit_relative_path(scope.get("endpoint")) is not None:
+        return True
+    app = scope.get("app")
+    mounts = _inspection_mounts(app)
+    if not mounts or not is_skipped(get_route_path(scope), mounts):
+        return False
+    return not _claimed_by_application(app, scope)
+
+
+def _inspection_mounts(app: Any) -> List[str]:
+    """Paths on ``app`` that :func:`audit_router` answers on.
+
+    Read from the live route table on every request rather than worked out once and kept.
+    A cached answer is wrong for exactly as long as the process runs whenever a factory
+    includes the router after the first request has been served, and the Flask sibling
+    reads its own mounts from ``current_app`` per request for the same reason. The cost
+    is a pass of ``getattr`` over the route table, against an audit write that may fsync
+    a disk.
+
+    ``app`` comes from the scope rather than from ``self.app``, because the two are not
+    the same object in the ``--preload`` shape this module documents: there the
+    middleware holds another middleware, which has no routes and is not the application.
+    """
+    mounts: List[str] = []
+    for route in getattr(app, "routes", ()):
+        relative = _audit_relative_path(getattr(route, "endpoint", None))
+        path: str = getattr(route, "path", "")
+        if relative is None or not path.endswith(relative):
+            continue
+        mounts.append(path[: len(path) - len(relative)])
+    return mounts
+
+
+def _claimed_by_application(app: Any, scope: Dict[str, Any]) -> bool:
+    """Whether one of ``app``'s own routes - not the audit router's - answers this.
+
+    Starlette's own matcher, so a path that merely shares the mount's prefix is treated
+    as a probe only when the application really has nothing there. ``Match.PARTIAL``
+    counts: a ``405`` from an application route is the application answering, and belongs
+    in the trail.
+    """
+    for route in getattr(app, "routes", ()):
+        if _audit_relative_path(getattr(route, "endpoint", None)) is not None:
+            continue
+        if route.matches(scope)[0] != Match.NONE:
+            return True
+    return False
+
+
+def _audit_relative_path(endpoint: Any) -> Optional[str]:
+    """The router-relative path stamped on ``endpoint``, if it is an audit one."""
+    relative = getattr(endpoint, _AUDIT_ROUTE_PATH, None)
+    return relative if isinstance(relative, str) else None
+
+
 def _is_streamed(method: str, message: Dict[str, Any]) -> bool:
     """Whether a body is still to come that the status has already been promised for.
 
@@ -577,11 +743,31 @@ def audit_router(
 
     Even authenticated, ``limit`` is capped at ``max_page_size`` and rows carry
     identifiers and digests only, never entry payloads.
+
+    Including this router tells :class:`SignLedgerAuditMiddleware` on the same application
+    not to audit the requests it answers, so that reading the trail is not a write to it.
+    That is not something a deployer has to remember, and not something they could get
+    right by hand either: ``skip_paths=("/_audit",)`` is wrong the moment ``prefix`` or
+    ``include_router(..., prefix=...)`` moves the endpoints, and wrong again under a mount
+    or a ``root_path``, where the path the client asked for is not the path the router was
+    registered at.
+
+    ``prefix`` may not be empty, and that is a
+    :class:`~signledger.core.exceptions.ConfigurationError` here rather than a surprise
+    later. Excluding the mount is what stops a read being a write, and there is no prefix
+    meaning "the root" that does not also mean every other path on the application - a
+    router at the root could not be told apart from the site it reports on. The Flask
+    sibling refuses the same thing for the same reason.
     """
     if authenticator is None:
         raise ConfigurationError(
             "audit_router requires an authenticator; an unauthenticated audit endpoint "
             "exposes the whole ledger to anyone who can reach it"
+        )
+    if not prefix.strip("/"):
+        raise ConfigurationError(
+            "audit_router must be mounted under a non-empty prefix so that its own "
+            "requests can be kept out of the trail it serves"
         )
     if max_page_size < 1:
         raise ConfigurationError(f"max_page_size must be at least 1, got {max_page_size}")
@@ -626,6 +812,16 @@ def audit_router(
     ) -> Dict[str, Any]:
         rows = ledger.iter_entries(limit=min(limit, max_page_size), offset=offset)
         return {"entries": [_summarise(entry) for entry in rows]}
+
+    # Claim every route on the way out, rather than each endpoint at its definition: a
+    # route added to this router later and left unstamped would audit itself again, and
+    # nothing would say so. The stamp is the path *within* ``prefix``, because that is
+    # what stays true when ``include_router`` moves the whole router somewhere else.
+    for route in router.routes:
+        endpoint = getattr(route, "endpoint", None)
+        registered: str = getattr(route, "path", "")
+        if endpoint is not None:
+            setattr(endpoint, _AUDIT_ROUTE_PATH, registered[len(prefix) :])
 
     return router
 
