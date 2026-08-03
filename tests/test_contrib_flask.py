@@ -12,14 +12,20 @@ real backend.
 """
 
 import contextlib
+import gc
 import json
+import socket
+import struct
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, List
 
 import pytest
 from flask import Flask, Response, abort
+from werkzeug.serving import make_server
 from werkzeug.test import EnvironBuilder
 
 from signledger.backends.memory import MemoryBackend
@@ -509,6 +515,143 @@ def test_a_settlement_that_cannot_be_written_is_counted_not_raised(
 
 
 # ======================================================================================
+# The client that hangs up, over a real socket
+#
+# ``werkzeug.serving.WSGIRequestHandler.run_wsgi`` drains the request socket
+# (``self.rfile.read(10_000_000)``) and closes the application iterable in the *same*
+# ``finally`` block, drain first. A peer RST makes the drain raise, so the close line is
+# never reached and nothing settles: measured over a real socket, a 400x64KB stream that
+# the client reset after 4KB left exactly one entry, ``provisional``, forever.
+#
+# The socket tests are the traffic that produced the defect; the in-process ones are the
+# same abandonment without a server, which is what makes them cheap enough to keep
+# unmarked. The distinction matters, because the older test for this case hand-calls
+# ``iterable.close()`` - the one thing werkzeug does not do here - and so passed
+# throughout.
+# ======================================================================================
+
+
+@contextlib.contextmanager
+def serving(app: Flask) -> Iterator[int]:
+    """A real ``werkzeug.serving`` server on a real port, for the duration of one test."""
+    server = make_server("127.0.0.1", 0, app, threaded=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield int(server.port)
+    finally:
+        server.shutdown()
+        thread.join(timeout=10)
+        server.server_close()
+
+
+def firehose_app(ledger: Ledger) -> Flask:
+    """A body far larger than any socket buffer, so a client can abort in the middle."""
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+
+    @app.get("/firehose")
+    def firehose() -> Response:
+        def body() -> Iterator[bytes]:
+            for _ in range(400):
+                yield b"x" * 65536
+
+        return Response(body(), mimetype="application/octet-stream")
+
+    return app
+
+
+def reset_mid_stream(port: int, path: str) -> None:
+    """Read one buffer's worth of the body and then reset the connection.
+
+    ``SO_LINGER`` with a zero timeout is the whole point: it makes ``close()`` send an
+    RST rather than a FIN, and only the RST makes werkzeug's drain raise. A polite FIN
+    leaves the read channel drainable, the drain returns, and ``close()`` is reached as
+    normal - so a test that merely closed the socket would prove nothing.
+    """
+    request_line = f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    try:
+        sock.sendall(request_line.encode())
+        sock.recv(4096)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    finally:
+        sock.close()
+
+
+def wait_for_entries(ledger: Ledger, expected: int, timeout: float = 15.0) -> List[Any]:
+    """Poll until the ledger holds ``expected`` entries, or give up and let the assertion
+    report what is actually there.
+
+    The settlement is written by the server's request thread, not this one, so there is
+    nothing in-process to join on.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and ledger.count() < expected:
+        time.sleep(0.02)
+    return entries(ledger)
+
+
+@pytest.mark.slow
+def test_a_stream_reset_by_the_client_is_still_settled(ledger: Ledger) -> None:
+    with serving(firehose_app(ledger)) as port:
+        reset_mid_stream(port, "/firehose")
+        recorded = wait_for_entries(ledger, 2)
+
+    assert [entry.data["kind"] for entry in recorded] == ["request", "response.completion"]
+
+
+@pytest.mark.slow
+def test_a_stream_reset_by_the_client_settles_as_incomplete_naming_nobody(
+    ledger: Ledger,
+) -> None:
+    """Nothing raised - the client left - so inventing an ``error`` would be its own lie."""
+    with serving(firehose_app(ledger)) as port:
+        reset_mid_stream(port, "/firehose")
+        recorded = wait_for_entries(ledger, 2)
+
+    data = recorded[-1].data
+    assert (data["outcome"], "error" not in data) == ("incomplete", True)
+
+
+def test_a_body_the_server_never_closes_is_settled_when_it_is_dropped(
+    ledger: Ledger,
+) -> None:
+    """The in-process shape of the same abandonment: consumed once, then let go of.
+
+    No ``close()`` anywhere, which is exactly what werkzeug does after an RST.
+    """
+    iterable = wsgi_request(streaming_app(ledger), "/stream")
+    next(iter(iterable))
+    del iterable
+    gc.collect()
+
+    assert kinds(ledger) == ["request", "response.completion"]
+
+
+def test_a_dropped_body_is_settled_as_incomplete(ledger: Ledger) -> None:
+    iterable = wsgi_request(streaming_app(ledger), "/stream")
+    next(iter(iterable))
+    del iterable
+    gc.collect()
+
+    data = entries(ledger)[1].data
+    assert (data["outcome"], "error" not in data) == ("incomplete", True)
+
+
+def test_a_body_that_was_closed_is_not_settled_a_second_time_when_it_is_dropped(
+    ledger: Ledger,
+) -> None:
+    """The control on the fallback. A settlement written twice is a second claim about
+    one response, and the fallback runs on every streamed body - including every one the
+    server closed properly."""
+    run_wsgi(streaming_app(ledger), "/stream")
+    gc.collect()
+
+    assert kinds(ledger) == ["request", "response.completion"]
+
+
+# ======================================================================================
 # Body capture
 # ======================================================================================
 
@@ -812,6 +955,128 @@ def test_the_audit_endpoints_can_be_mounted_under_a_different_prefix(
 def test_a_zero_max_page_size_is_rejected_at_registration(ledger: Ledger) -> None:
     with pytest.raises(ConfigurationError):
         audit_blueprint(ledger, authenticator=token_auth, max_page_size=0)
+
+
+# --------------------------------------------------------------------------------------
+# reading the trail must not write to it
+#
+# Measured over a real socket against an application carrying both halves: every
+# inspection request appended an entry - ``/status``, ``/entries``, a 401 from an
+# unauthenticated probe, a 400 from a malformed ``limit``, and ``/verify``, which
+# reported entries_verified=5 while appending the sixth. So the count and the O(n)
+# verification cost strictly increased per inspection, and an anonymous caller could
+# append a signed row to an append-only store by being refused.
+# --------------------------------------------------------------------------------------
+
+
+def audited_inspect_app(ledger: Ledger, **kwargs: Any) -> Flask:
+    """Both halves on one application, which is the only way the blueprint is deployed."""
+    app = Flask(__name__)
+    app.config["PROPAGATE_EXCEPTIONS"] = False
+    SignLedgerAudit(app, ledger=ledger)
+    app.register_blueprint(audit_blueprint(ledger, authenticator=token_auth, **kwargs))
+
+    @app.get("/items")
+    def items() -> Dict[str, Any]:
+        return {"items": []}
+
+    return app
+
+
+def test_an_inspection_request_does_not_append_to_the_trail_it_reads(
+    ledger: Ledger,
+) -> None:
+    client = audited_inspect_app(ledger).test_client()
+    response = client.get("/_audit/status", headers={"X-Audit-Token": "let-me-in"})
+    assert (response.status_code, ledger.count()) == (200, 0)
+
+
+def test_a_rejected_inspection_probe_appends_nothing(ledger: Ledger) -> None:
+    """The blueprint requires an authenticator because an open endpoint is a
+    denial-of-service surface. Auditing its own 401 handed the same surface back: one
+    signed, unprunable row per rejected probe, from a caller who never got in."""
+    client = audited_inspect_app(ledger).test_client()
+    response = client.get("/_audit/entries")
+    assert (response.status_code, ledger.count()) == (401, 0)
+
+
+def test_a_malformed_inspection_request_appends_nothing(ledger: Ledger) -> None:
+    client = audited_inspect_app(ledger).test_client()
+    response = client.get("/_audit/entries?limit=abc", headers={"X-Audit-Token": "let-me-in"})
+    assert (response.status_code, ledger.count()) == (400, 0)
+
+
+def test_verification_does_not_change_what_it_verified(ledger: Ledger) -> None:
+    """``entries_verified`` reported one fewer than the ledger held the moment it
+    answered, because answering appended."""
+    ledger.append({"a": 1})
+    client = audited_inspect_app(ledger).test_client()
+    response = client.get("/_audit/verify", headers={"X-Audit-Token": "let-me-in"})
+    assert (response.get_json()["entries_verified"], ledger.count()) == (1, 1)
+
+
+def test_an_application_route_is_still_audited_when_the_blueprint_is_registered(
+    ledger: Ledger,
+) -> None:
+    """The control: excluding the inspection prefix must not exclude anything else."""
+    client = audited_inspect_app(ledger).test_client()
+    client.get("/items")
+    assert ledger.count() == 1
+
+
+def test_the_exclusion_follows_a_custom_url_prefix(ledger: Ledger) -> None:
+    """The prefix is configurable, so a hard-coded ``/_audit`` would silently stop
+    excluding anything the moment a deployment moved the endpoints."""
+    client = audited_inspect_app(ledger, url_prefix="/internal/audit").test_client()
+    client.get("/internal/audit/status", headers={"X-Audit-Token": "let-me-in"})
+    assert ledger.count() == 0
+
+
+def test_the_exclusion_follows_a_prefix_given_at_registration(ledger: Ledger) -> None:
+    """``register_blueprint`` overrides the blueprint's own prefix, so the mounted path is
+    the only one worth believing."""
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+    app.register_blueprint(
+        audit_blueprint(ledger, authenticator=token_auth), url_prefix="/elsewhere"
+    )
+    app.test_client().get("/elsewhere/status", headers={"X-Audit-Token": "let-me-in"})
+    assert ledger.count() == 0
+
+
+def test_a_second_mount_of_the_same_blueprint_is_excluded_as_well(ledger: Ledger) -> None:
+    """Flask lets one blueprint be registered again under another name, and the exclusion
+    is claimed per registration rather than once per blueprint - a mount that went
+    unclaimed would go straight back to auditing itself."""
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+    blueprint = audit_blueprint(ledger, authenticator=token_auth)
+    app.register_blueprint(blueprint)
+    app.register_blueprint(blueprint, name="signledger_ops", url_prefix="/ops/audit")
+    app.test_client().get("/ops/audit/status", headers={"X-Audit-Token": "let-me-in"})
+    assert ledger.count() == 0
+
+
+def test_the_inspection_endpoints_cannot_be_mounted_at_the_root(ledger: Ledger) -> None:
+    """Excluding the mount point is what stops a read being a write, and there is no
+    prefix that means "the root" without also meaning every other path on the site.
+    Auditing the inspection endpoints is bad; excluding everything would be worse."""
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+    with pytest.raises(ConfigurationError):
+        app.register_blueprint(audit_blueprint(ledger, authenticator=token_auth), url_prefix="/")
+
+
+def test_the_exclusion_holds_when_the_blueprint_is_registered_first(
+    ledger: Ledger,
+) -> None:
+    """An application factory may install either half first, and a deployer who got the
+    order that audits itself would have no way of telling."""
+    app = Flask(__name__)
+    app.register_blueprint(audit_blueprint(ledger, authenticator=token_auth))
+    SignLedgerAudit(app, ledger=ledger)
+    app.test_client().get("/_audit/status", headers={"X-Audit-Token": "let-me-in"})
+    assert ledger.count() == 0
 
 
 # ======================================================================================
