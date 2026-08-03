@@ -20,7 +20,11 @@ license-files = ["LICENSE"]
 authors = [{ name = "Vipin Kumar", email = "vipin@buffercode.in" }]
 keywords = ["audit", "logging", "immutable", "ledger", "tamper-evident", "cryptography", "compliance"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    # 1.0.0 is on PyPI declaring `5 - Production/Stable`. Shipping 2.0.0 as Beta would be
+    # a maturity DOWNGRADE that every index, resolver and corporate policy filter reads,
+    # on the release whose whole purpose is to be the trustworthy replacement for a
+    # withdrawn one.
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Logging",

@@ -209,7 +209,8 @@ Rules:
 2. `sequence` must start at the range start and increment by exactly 1 — gaps are `SEQUENCE_GAP`.
 3. Entry 0 must link to the genesis hash.
 4. When a checkpoint exists, head hash and entry count must match it — **this is what detects
-   tail truncation**, which a bare chain cannot see.
+   tail truncation**, which a bare chain cannot see. The checkpoint itself is authenticated
+   first; see section 8.
 5. When `enable_signatures`, a missing signature is `MISSING_SIGNATURE`, not a pass.
 6. `check_integrity(from_sequence=…)` seeds `previous_hash` from that entry's own
    `previous_hash` and verifies the start entry itself.
@@ -300,8 +301,29 @@ Shipped sinks: `FileAnchorSink` (append-only JSONL, fsync), `NullAnchorSink` (te
 `HTTPAnchorSink` / notarization are documented extension points.
 
 `Ledger.checkpoint()` creates + signs + persists + publishes.
-`check_integrity()` compares the head against the newest **anchored** checkpoint:
-a truncated tail yields `HEAD_MISMATCH` + `COUNT_MISMATCH`.
+
+`check_integrity()` compares the head against a checkpoint, and a truncated tail yields
+`HEAD_MISMATCH` + `COUNT_MISMATCH`. Two rules govern *which* checkpoint and *whether it is
+believed*:
+
+- **Both copies are consulted — the store's and the anchor's — and the newer wins.**
+  Preferring the anchor unconditionally is a downgrade oracle: anyone who can reach the
+  anchor rolls it back to an older genuine checkpoint and the store's contradicting copy is
+  discarded unread. Requiring both to be rolled back is the point.
+- **The checkpoint is authenticated before anything is compared against it.** `key_id`
+  resolves, the signature verifies over the signing payload, `ledger_id` must be this
+  chain's, `format_version` must be one this build reads, and `merkle_root` is recomputed
+  over the entries up to the checkpointed sequence. Each has its own `FailureKind`
+  (`CHECKPOINT_*`) rather than collapsing into `HEAD_MISMATCH`, which would report the
+  chain as damaged when the damage is in the record it is being measured against.
+
+An anchor that is behind, or empty, is **not** a failure — the commonest cause is a publish
+that did not land, and an integrity report is the wrong place for an operational alarm. It
+costs the `ANCHORED`/`WORM` label instead.
+
+Limit, stated in `SECURITY.md` too: an attacker holding *both* the store and the anchor can
+roll both back with nothing to detect it. Freshness cannot be established from inside a
+system the attacker fully controls.
 
 ---
 

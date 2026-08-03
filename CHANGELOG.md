@@ -41,6 +41,33 @@ number would have left `pip install signledger` serving the withdrawn release.
 - **Backend construction errors are translated.** `SQLiteBackend(...)` raised raw
   `sqlite3.OperationalError`, which `except SignLedgerError` did not catch and
   whose message disclosed the database path.
+- **Checkpoints are verified, not believed.** A checkpoint is the only record that
+  sees a truncated tail, which makes it the next thing an attacker goes for — and
+  it was signed on the way out and taken on sight on the way back in.
+  Verification now resolves the `key_id`, checks the signature over the signing
+  payload, requires the `ledger_id` to be this chain's and the `format_version` to
+  be one this build can read, and recomputes the `merkle_root` over the entries up
+  to the checkpointed sequence. Six new `FailureKind` members name which part gave
+  way, instead of collapsing into `head_mismatch` and blaming the chain for a
+  fault in the record being compared against it.
+- **Both copies of a checkpoint are read, and the newer wins.** Preferring the
+  anchor unconditionally made anyone who could reach it a downgrade oracle:
+  replace it with an older, genuinely signed checkpoint and the store's
+  contradicting copy was discarded unread. [SECURITY.md](SECURITY.md) states the
+  limit that remains — an attacker holding *both* the store and the anchor can
+  roll both back with nothing to detect it, because what is left is a true
+  statement about a chain that really did exist.
+- **The audit console is excluded from the trail it serves.** On all three
+  integrations the read-only console was installed on the same application as the
+  auditor and was never excluded from it, so every read of the ledger was a write
+  to it: `/verify` answered `entries_verified=5` while appending the sixth, and a
+  caller with no credential appended a signed, unprunable row on every rejected
+  probe — against the docstring that requires an authenticator precisely because an
+  open endpoint is a denial-of-service surface.
+- **`skip_paths` is matched by path segment.** All three integrations used a bare
+  `str.startswith`, so with the value the README recommends —
+  `skip_paths=("/health",)` — a request to `/healthz-admin-secret` was served with
+  real data and written nowhere at all.
 
 ### Added
 
@@ -75,6 +102,28 @@ number would have left `pip install signledger` serving the withdrawn release.
   dead-letter path.
 - `signledger.observability`: metrics and structured events that report real
   verification state rather than a hardcoded `True`.
+- Streamed responses settle. The entry written when the status line goes out says
+  `completion="provisional"`, because the status is a promise at that moment and
+  the generator may still raise on its third chunk; a second entry
+  (`kind="response.completion"`, same `request_id`) records how it actually ended.
+  All three integrations agree on which responses get one, and
+  `tests/test_contrib_shared.py` exists to keep that true.
+- Django runs under ASGI, and an async streamed response settles there too. The
+  hook is not the WSGI one and this was established by execution rather than by
+  reading: `send_response` closes Django's own iterator wrapper rather than ours
+  and awaits `response.close()` only afterwards, so on the one path where a
+  settlement matters most there is no close call at all. The outcome is recorded
+  from inside the iteration, in a `finally`, and put back on a thread because it
+  writes an ORM row.
+- Migration `0002` gives the Django `AuditIndex` mirror the fields this release
+  added — `kind`, `completion` and `request_id` — and makes `status` nullable,
+  which the record builder has always typed it as. `models.py` is documented as
+  the queryable mirror and ships a read-only admin, so the ORM is the surface
+  Django users are told to use, and it could express none of those fields.
+- A Django system check warns when `RedactionPolicy.max_body_bytes` and
+  `DATA_UPLOAD_MAX_MEMORY_SIZE` disagree. It is a warning and not an error because
+  the configuration is survivable, and a check that can stop `manage.py migrate`
+  has to be reserved for the ones that are not.
 - `docs/ARCHITECTURE.md` — the normative contract. Every guarantee, encoding rule
   and interface in this release is specified there first.
 
@@ -95,6 +144,14 @@ number would have left `pip install signledger` serving the withdrawn release.
   Verified working: CPython 3.9 through 3.14. PyPy is **not** supported.
 - Each backend has exactly one module name (`signledger.backends.postgresql`,
   `signledger.backends.mongodb`) — no aliases.
+- Settlement entries go through `build_audit_record` like every other entry. Both
+  `_settle` implementations hand-assembled a dict, so a
+  `kind="response.completion"` row carried no `completion`, `client_ip`, `headers`,
+  `query`, `body` or `user` — refuting the identical comment above both of them
+  promising completion is never absent so an auditor need not know which framework
+  wrote the entry. It also skipped `redact_payload`, the one choke point that
+  closes the unpaired-surrogate hole, on exactly the entries written after the
+  response has gone and a refused write has nowhere left to be reported.
 
 ### Removed
 
@@ -163,14 +220,90 @@ reproduced by execution.
   `manage.py migrate` created no table and every audited request failed under the
   default fail-closed policy.
 - The Django admin registration the models promised but never shipped.
+- **Flask recorded every error response as provisional and then settled it.** The
+  predicate was `Response.is_streamed`, which werkzeug defines as "`len()` raises",
+  and `make_response` runs every `HTTPException` through `force_type`, which swaps
+  the body list for a `ClosingIterator`. So every 400, 404, 405 and 500 from an
+  error handler was two signed rows from any anonymous caller hitting bad URLs, the
+  first of them untrue because the body went out under a `Content-Length`. A
+  declared `Content-Length` is the test now, which is what FastAPI already applied.
+- **A Flask exception that propagated left no record at all.** `after_request` does
+  not run when an exception leaves the application, and `TESTING`, `DEBUG` and
+  `PROPAGATE_EXCEPTIONS` each arrange that. Measured over a real socket: the client
+  got a 500, the ledger gained nothing, and `check_integrity()` reported ok on a
+  chain with no memory of the request. `fail_closed` cannot help, because the
+  failure is upstream of the audit write; `teardown_request` is the backstop, and
+  it fires only when there is an exception and nothing has been recorded yet.
+- **`error` reached `build_audit_record` from one Flask call site out of three**, so
+  `WHERE error IS NOT NULL` was structurally empty however many times a view had
+  blown up — even the handled 500 that did earn an entry named no cause.
+- **A Flask client that hung up mid-stream left a provisional entry forever.**
+  werkzeug puts the request-socket drain and `application_iter.close()` in one
+  `finally` block, drain first, so a peer RST makes the drain raise and `close()`
+  is never reached. Measured against a real server: a 400×64 KB stream, the client
+  reading 4 KB and then closing with `SO_LINGER(1, 0)`, left exactly one
+  `completion="provisional"` entry for as long as the ledger existed. A finalizer
+  on the body wrapper is the fallback, routed through the `close()` that already
+  refuses to settle twice — a backstop rather than a guarantee, since an
+  implementation without reference counting settles whenever it next collects.
+- **A streamed Django response asserted a success the client never received.** A
+  `StreamingHttpResponse` whose generator raised on its second chunk produced one
+  entry reading `status=200`, `completion="final"`, `error=None`, and under
+  `wsgiref` the client sees a clean EOF, so both ends believed it.
+- **Django's own body limit produced a 400 that nothing audited.**
+  `RedactionPolicy.max_body_bytes` and `DATA_UPLOAD_MAX_MEMORY_SIZE` are
+  independent numbers describing the same limit with nothing comparing them, and
+  the line that reads the body runs before `get_response`, so the `except` in
+  `__call__` never saw the failure. Measured with
+  `DATA_UPLOAD_MAX_MEMORY_SIZE=1024` and a 2 KB JSON POST: three requests produced
+  two ledger entries, and the 400 the auditor itself had caused had none at all.
+  Capture degrades to a marker, which is what redaction already does for every
+  other refusal, and the request is served as it would have been with no audit
+  middleware installed.
+- **A chunked upload and an empty GET recorded the same marker**, so a client could
+  switch capture off for itself with `Transfer-Encoding: chunked` and leave an entry
+  indistinguishable from the millions of GETs around it — reachable on gunicorn and
+  uWSGI, which dechunk without setting `CONTENT_LENGTH`.
+- **The FastAPI inspection router audited itself**, under a plain application, under
+  `app.mount("/api", subapp)` and under `FastAPI(root_path="/gw")` alike. The
+  exclusion is decided after routing, from the endpoint that answered, because
+  `route.path` is application-relative and `scope["path"]` is not: deriving a prefix
+  up front and comparing the two silently excludes nothing under a mount, while the
+  deployer has been told the exclusion is automatic and so does not set `skip_paths`
+  either.
+- **The coverage gate measured a denominator nobody had checked.** Its
+  `exclude_lines` carried a bare three-dot regex, and coverage.py drops the whole
+  multi-line construct a matching line belongs to — PEP 484 signatures contain a
+  literal ellipsis, so the rule matched the `def` line of ordinary functions and
+  deleted their bodies from measurement. The entire `audited()` decorator went that
+  way. The rule is anchored to a line that is nothing but an ellipsis.
+- **The mutation gate could never have run**, in four independent ways. Its baseline
+  died because a test resolved the repository root by `parent.parent` while mutmut
+  copies only source and tests into `mutants/`. The guard counted survivors and
+  demanded at least a hundred of them, because `mutmut results` prints only
+  non-killed mutants — so a perfect sweep printed nothing, scored zero and failed.
+  The all-option it needed is not a flag and a bare `--all` exits with an error. And
+  the exit-code tolerance let 1 through on the stated grounds that mutmut exits
+  non-zero when mutants survive, which is false: it returns 0 with every mutant
+  alive and uses 1 for setup failures, which is the failure this repository had. The
+  replacement gates on a mutation score counted from the per-mutant result lines,
+  and was checked against a real sweep.
+- Two CI steps piped into `tee` without `pipefail`. GitHub runs `bash -e {0}`, and
+  `-e` sees only the last command of a pipeline, so a failing pytest and a failing
+  wheel build both reached their `grep` and passed.
 
 ### Testing
 
-3,691 tests. 100% line **and** branch coverage across every module, measured
-against live PostgreSQL and MongoDB rather than mocks — CI fails if any database
+4,087 tests, of which 653 need a live PostgreSQL or MongoDB and are marked as
+such. Coverage is **gated** at 100% line and branch across every module, measured
+with all four backends live rather than against mocks — CI fails if any database
 test is skipped, because a skipped one is indistinguishable from a passing one in
-the summary line. `ruff`, `mypy --strict` and `bandit` are clean. Property-based
-tests use Hypothesis; mutation testing runs in CI.
+the summary line. Both counts are `pytest --collect-only` on this tree rather
+than a remembered figure; the gate is `fail_under = 100` in `pyproject.toml`, so
+what the release ships is whatever that gate lets through, and it is the gate
+rather than a number in this file that is worth reading. `ruff`,
+`mypy --strict` and `bandit` are clean. Property-based tests use Hypothesis;
+mutation testing gates on a score.
 
 Two things the test suite alone did not catch, and what now covers them:
 
