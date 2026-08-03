@@ -429,6 +429,23 @@ def create_app():
     return app
 ```
 
+`audit_router(ledger, authenticator=...)` mounts the same read-only console as the Flask
+blueprint, at `/_audit/status`, `/_audit/entries` and `/_audit/verify`. The requests it
+answers are **not** audited, so reading the trail is not a write to it — and that includes
+the `401` an unauthenticated caller gets, the `422` from a malformed `limit`, and the `404`
+for any unrouted path under its mount, which is the cheapest probe on the application and
+the only one needing no credential at all. The exclusion is worked out per request from the
+path the router actually answers on, so it holds under a custom `prefix`, under
+`include_router(..., prefix=...)`, under `app.mount("/api", subapp)`, under
+`FastAPI(root_path="/gw")`, and for a router included after the server started. There is no
+`skip_paths` entry to remember, and writing one by hand would be wrong in all five of those
+shapes.
+
+A route of your own that merely shares the prefix — `/_audit/dashboard`, or a single-page
+catch-all — is still audited: the exclusion covers the router's own endpoints, not every
+path that starts with the same characters. An empty `prefix` is refused outright, because a
+console at the root cannot be told apart from the site it reports on.
+
 The `audited` decorator records a *business* event rather than an HTTP request, and composes
 with the middleware rather than replacing it:
 
@@ -463,7 +480,7 @@ fact — the generator may still raise on its third chunk — so the entry says 
 plus `error` naming the exception if one was raised.
 
 **All three integrations behave identically here**, which is what
-`tests/test_contrib_parity.py` exists to keep true. So an auditor counting successful
+`tests/test_contrib_shared.py` exists to keep true. So an auditor counting successful
 responses wants `completion="final"` plus the provisional entries that settled complete —
 `status: 200` on a provisional entry means *200 was sent*, not *200 was delivered*.
 
