@@ -94,28 +94,35 @@ jobs:
         run: |
           set -euo pipefail
           python -m twine check --strict dist/*
-          # The migration this package ships is not importable code, so nothing that only
-          # imports the wheel would notice it missing - and 1.0.0 shipped a wheel that
-          # omitted exactly that. Look inside the artifact rather than trusting the build.
+          # A migration is not importable code, so nothing that merely imports the wheel
+          # would notice one missing - and 1.0.0 shipped a wheel that omitted exactly that.
+          # Look inside the artifact rather than trusting the build.
           python - <<'PY'
           import pathlib, tarfile, zipfile
 
           wheel = next(pathlib.Path("dist").glob("*.whl"))
           sdist = next(pathlib.Path("dist").glob("*.tar.gz"))
 
-          names = zipfile.ZipFile(wheel).namelist()
-          required = [
-              "signledger/py.typed",
-              "signledger/contrib/django/migrations/0001_initial.py",
-              "signledger/contrib/django/migrations/0002_auditindex_completion_auditindex_kind_and_more.py",
-          ]
-          missing = [name for name in required if name not in names]
+          names = set(zipfile.ZipFile(wheel).namelist())
+
+          # Derived from the source tree, never listed by hand. A hardcoded list is a guard
+          # that stops guarding the moment someone adds 0003: it would still pass while the
+          # new migration was absent, which is the failure this check exists to prevent.
+          source = pathlib.Path("signledger")
+          required = {
+              str(path) for path in source.rglob("migrations/*.py")
+          } | {"signledger/py.typed"}
+          assert len(required) > 2, f"expected migrations in the source tree, found {required}"
+
+          missing = sorted(name for name in required if name not in names)
           assert not missing, f"wheel is missing {missing}"
 
           members = tarfile.open(sdist).getnames()
-          for wanted in ("CHANGELOG.md", "SECURITY.md", "LICENSE", "README.md"):
+          for wanted in ("CHANGELOG.md", "SECURITY.md", "LICENSE", "README.md",
+                         "CONTRIBUTING.md", "RELEASING.md"):
               assert any(name.endswith("/" + wanted) for name in members), f"sdist is missing {wanted}"
-          print(f"wheel holds {len(names)} members, sdist holds {len(members)}")
+          print(f"wheel holds {len(names)} members including {len(required)} required; "
+                f"sdist holds {len(members)}")
           PY
 
       - name: The artifact must install and work from a clean interpreter
