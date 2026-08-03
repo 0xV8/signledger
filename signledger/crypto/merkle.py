@@ -435,10 +435,15 @@ def _replay_consistency(
             # `fn != 0` was here and is provably dead: this branch is entered only when
             # `fn & 1 or fn == sn`, and `sn == 0` has already returned above, so `fn` is
             # never 0 at this point; and right-shifting a nonzero positive int always
-            # reaches an odd value before 0. Verified exhaustively over every valid
-            # consistency proof up to 32 leaves plus 20,000 hostile size pairs - both
-            # spellings agree on every one. Dead code in a verifier is a line no test can
+            # reaches an odd value before 0. Dead code in a verifier is a line no test can
             # ever justify, so it is gone rather than covered.
+            #
+            # The argument above is the whole justification. A previous version of this
+            # comment also claimed verification "over every valid consistency proof up to
+            # 32 leaves plus 20,000 hostile size pairs"; no such harness has ever existed
+            # in this repository. What does exist is
+            # tests/test_merkle.py::test_every_prefix_of_every_tree_size_proves_consistent,
+            # over every size pair up to 17 leaves.
             while not fn & 1:
                 fn >>= 1
                 sn >>= 1

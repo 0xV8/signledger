@@ -19,12 +19,23 @@
 # ---------------------------------------------------------------------------------
 # Documents. SECURITY.md and CHANGELOG.md are referenced from the package metadata and
 # from the threat-model tests; docs/ARCHITECTURE.md is the normative contract every
-# module is written against, and tests/test_docs_execute.py executes its code blocks.
+# module is written against.
+#
+# Note that ARCHITECTURE's code blocks are NOT executed. tests/test_docs_execute.py
+# covers README.md and examples/README.md only, and this comment claimed otherwise for
+# as long as nobody checked - which is the failure mode this whole file's header is
+# about.
+#
+# RELEASING.md and CONTRIBUTING.md ship because a packager re-verifying this source is
+# exactly the reader who needs to know how an artifact is meant to be produced and what
+# standard of evidence the project holds itself to.
 # ---------------------------------------------------------------------------------
 include LICENSE
 include README.md
 include CHANGELOG.md
 include SECURITY.md
+include CONTRIBUTING.md
+include RELEASING.md
 include MANIFEST.in
 graft docs
 

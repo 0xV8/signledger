@@ -267,7 +267,13 @@ def verify_inclusion(proof: InclusionProof, data_item: bytes, expected_root: str
 *(v1's `verify_proof(proof)` compared against `proof.root_hash` — a field of the proof being
 verified — so every forged proof returned `True`.)*
 
-Asserts `len(proof.path) == ceil(log2(n))` and that path directions match the bits of `leaf_index`.
+Asserts that path directions match the bits of `leaf_index`.
+
+*(This line used to claim `len(proof.path) == ceil(log2(n))` as well. That is false for every
+ragged tree — at n=3 the three proof paths have lengths [2, 2, 1] — and the implementation
+deliberately does not assert it; `expected_path_length` documents `ceil(log2(n))` as the
+**longest** path, not every path. Verified over sizes 1–17: every proof verifies, and the
+short paths are correct.)*
 
 ---
 
@@ -345,11 +351,12 @@ failing first.**
 | Contract | `test_backend_conformance.py` | all 4 backends behave identically (parametrized fixture) |
 | Property | `test_tamper_detection.py` | Hypothesis: mutate *any* field ⇒ detected, and the failure names it |
 | Round-trip | `test_roundtrip_hash.py` | `store → load → re-hash` is byte-identical per backend |
-| Concurrency | `test_concurrency.py` | 16 threads × 500 appends + 2-process SQLite: no gaps, no forks |
+| Concurrency | `test_concurrency.py` | 16 threads × 200 appends + 2-process SQLite: no gaps, no forks |
 | Vectors | `test_canonical_vectors.py` | SLCS/1 matches frozen `tests/vectors/*.json` |
 | Adversary | `test_threat_model.py` | truncation, rewrite, signature stripping, cache masking |
 | Packaging | `test_packaging.py` | build wheel → fresh venv → import every module → run console script |
-| Docs | `test_docs_execute.py` | every ```python block in README/docs executes |
+| Docs | `test_docs_execute.py` | every ```python block in `README.md` and `examples/README.md` executes |
+| Parity | `test_contrib_parity.py` | identical traffic against Flask, Django and FastAPI produces the same record shape |
 
 **Gates** (CI-blocking):
 - `pytest --cov=signledger --cov-branch --cov-fail-under=100`
