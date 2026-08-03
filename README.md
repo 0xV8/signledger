@@ -456,9 +456,21 @@ than a `Ledger` instance so the ledger is resolved per request, which is what le
 decorator work with a per-worker ledger.
 
 Streaming responses are audited when the status line is sent, because a fail-closed entry has
-to be written before the first byte leaves. A generator that raises *after* that point is
-therefore recorded at the status it started with; the module docstring explains the exact
-semantics.
+to be written before the first byte leaves. At that moment the status is a *promise*, not a
+fact — the generator may still raise on its third chunk — so the entry says so with
+`completion="provisional"`, and a second entry (`kind="response.completion"`, same
+`request_id`) records how it actually ended: `outcome="complete"`, or `outcome="incomplete"`
+plus `error` naming the exception if one was raised.
+
+**All three integrations behave identically here**, which is what
+`tests/test_contrib_parity.py` exists to keep true. So an auditor counting successful
+responses wants `completion="final"` plus the provisional entries that settled complete —
+`status: 200` on a provisional entry means *200 was sent*, not *200 was delivered*.
+
+A response whose body is already built is `completion="final"` and gets no second entry. So
+is one whose body a server will never send (`HEAD`, `204`, `304`), and so is a file response
+sent under a declared `Content-Length`, because a receiver can detect a truncated one itself
+as a short read.
 
 ### Django
 
@@ -543,9 +555,10 @@ print(policy.payload({"user": "alice", "password": "hunter2"}))
 Three limits worth understanding before you turn body capture on, because this data goes
 somewhere nobody can edit it afterwards:
 
-- **A name denylist can never be complete.** The rule was widened after fuzzing 146,000
-  generated field names found whole categories it missed. Yours may use a name nobody
-  anticipated. Add them with `RedactionPolicy(extra_sensitive_fields=("customer_email",))`.
+- **A name denylist can never be complete.** The rule was widened after fuzzing a generated
+  corpus of ~12,900 field names found whole categories it missed. Yours may use a name
+  nobody anticipated. Add them with
+  `RedactionPolicy(extra_sensitive_fields=("customer_email",))`.
 - **Free text is never scanned.** A field called `notes` containing *"the customer said
   their password is hunter2"* is stored verbatim. Redaction reads field names, not values.
 - **It deliberately over-redacts.** Short stems are matched as whole words, so `shipping`,

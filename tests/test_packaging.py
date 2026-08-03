@@ -964,3 +964,41 @@ class TestSdistIsSelfVerifying:
             "-q",
         )
         assert result.returncode == 0, f"{result.stdout[-4000:]}\n{result.stderr[-2000:]}"
+
+
+class TestChangelogMatchesTheVersion:
+    """The changelog is part of the artifact, not a courtesy.
+
+    ``MANIFEST.in`` grafts ``CHANGELOG.md`` into the sdist and ``pyproject.toml`` points
+    the ``Changelog`` project URL at it, which PyPI renders as a sidebar link. So a
+    release whose changelog still says ``unreleased`` publishes a page stating that the
+    version being installed does not exist - and nothing checked this, because a heading
+    is documentation and documentation here has a history of not being true.
+    """
+
+    HEADING = re.compile(r"^## \[(?P<version>[^\]]+)\](?: [—-] (?P<date>.+))?$", re.MULTILINE)
+
+    def _first_heading(self) -> "re.Match[str]":
+        text = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        match = self.HEADING.search(text)
+        assert match is not None, "CHANGELOG.md has no '## [version]' heading at all"
+        return match
+
+    def test_the_newest_changelog_entry_is_the_version_being_shipped(self) -> None:
+        import signledger
+
+        assert self._first_heading().group("version") == signledger.__version__
+
+    def test_the_newest_changelog_entry_carries_a_date_or_says_unreleased(self) -> None:
+        """Both are legitimate states; what is not legitimate is neither.
+
+        ``release.yml`` refuses to publish while it reads ``unreleased``, so this test
+        exists to catch the third case - a heading with no date and no marker, which would
+        satisfy the release guard's grep by accident.
+        """
+        date = self._first_heading().group("date")
+
+        assert date is not None, "the newest CHANGELOG heading has neither a date nor 'unreleased'"
+        assert date.strip() == "unreleased" or re.fullmatch(r"\d{4}-\d{2}-\d{2}", date.strip()), (
+            f"expected 'unreleased' or an ISO date, got {date!r}"
+        )

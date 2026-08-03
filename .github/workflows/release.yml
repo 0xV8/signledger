@@ -1,0 +1,200 @@
+# Publishing, triggered by a tag.
+#
+# Separate from ci.yml deliberately. ci.yml answers "is this branch healthy"; this answers
+# "is this artifact the thing the tag claims, and may it leave the machine". Those want
+# different triggers and very different permissions, and folding them together is how a
+# workflow ends up with `id-token: write` on every pull request.
+#
+# The order below is the point. Everything that can refuse does so *before* `publish`,
+# because a wheel on PyPI cannot be recalled - only yanked, which leaves it installable to
+# anyone who pins. This project already has one release it cannot take back.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Lets a release be rehearsed end to end without creating a tag. `publish` is gated on
+  # the tag ref, so a dispatch run builds and checks and then stops.
+  workflow_dispatch:
+
+# Read by default, granted per job. The repository default is already `read`; stating it
+# here means a change to that default cannot silently widen this workflow.
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: the tag says what the tree says
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: The tag, the package version and the changelog must agree
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(python -c 'import signledger; print(signledger.__version__)')"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match signledger.__version__ (${version})"
+            exit 1
+          fi
+          # The changelog is grafted into the sdist and is the target of the Changelog
+          # Project-URL, so publishing a version it does not mention ships a page that
+          # says the release being installed does not exist.
+          if ! grep -qE "^## \[${version}\] — [0-9]{4}-[0-9]{2}-[0-9]{2}" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no dated '## [${version}] — YYYY-MM-DD' heading"
+            grep -nE '^## \[' CHANGELOG.md | head -3
+            exit 1
+          fi
+          echo "tag, __version__ and CHANGELOG all agree on ${version}"
+
+      - name: Refuse to publish from anywhere but the default branch
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          # A tag can be pushed from any commit, including one that never passed review.
+          # Requiring the tagged commit to be an ancestor of the default branch is what
+          # makes branch protection mean anything for releases.
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${{ github.event.repository.default_branch }}"; then
+            echo "::error::${GITHUB_SHA} is not on ${{ github.event.repository.default_branch }}; refusing to publish an unreviewed commit"
+            exit 1
+          fi
+
+  build:
+    name: build and inspect the artifacts
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip build twine
+          # A stale dist/ is how a tree that has moved on gets published anyway: this
+          # project's own dist/ once predated HEAD by 39 minutes and held the exact files
+          # the top commit had fixed.
+          rm -rf dist
+          python -m build
+
+      - name: Inspect
+        run: |
+          set -euo pipefail
+          python -m twine check --strict dist/*
+          # The migration this package ships is not importable code, so nothing that only
+          # imports the wheel would notice it missing - and 1.0.0 shipped a wheel that
+          # omitted exactly that. Look inside the artifact rather than trusting the build.
+          python - <<'PY'
+          import pathlib, tarfile, zipfile
+
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          sdist = next(pathlib.Path("dist").glob("*.tar.gz"))
+
+          names = zipfile.ZipFile(wheel).namelist()
+          required = [
+              "signledger/py.typed",
+              "signledger/contrib/django/migrations/0001_initial.py",
+              "signledger/contrib/django/migrations/0002_auditindex_completion_auditindex_kind_and_more.py",
+          ]
+          missing = [name for name in required if name not in names]
+          assert not missing, f"wheel is missing {missing}"
+
+          members = tarfile.open(sdist).getnames()
+          for wanted in ("CHANGELOG.md", "SECURITY.md", "LICENSE", "README.md"):
+              assert any(name.endswith("/" + wanted) for name in members), f"sdist is missing {wanted}"
+          print(f"wheel holds {len(names)} members, sdist holds {len(members)}")
+          PY
+
+      - name: The artifact must install and work from a clean interpreter
+        run: |
+          set -euo pipefail
+          # Installed from the wheel, in a venv that has never seen the source tree, and
+          # run from / so a stray relative import cannot silently satisfy itself.
+          python -m venv /tmp/relcheck
+          /tmp/relcheck/bin/pip install --upgrade pip >/dev/null
+          /tmp/relcheck/bin/pip install "$(ls dist/*.whl)"
+          cd /
+          /tmp/relcheck/bin/python - <<'PY'
+          import signledger
+          from signledger.backends.memory import MemoryBackend
+          from signledger.core.ledger import Ledger
+
+          with Ledger(backend=MemoryBackend()) as ledger:
+              ledger.append({"event": "release-smoke"})
+              report = ledger.check_integrity()
+          assert report.ok, report.failures
+          print("installed", signledger.__version__, "verified", report.entries_verified, "entry")
+          PY
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Trusted publishing: PyPI mints a short-lived token from this workflow's OIDC
+    # identity, so there is no API token in the repository to leak or rotate. The
+    # repository's default workflow permission is `read`, so this has to be explicit.
+    permissions:
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/p/signledger
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: publish the GitHub release
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: dist
+          path: dist/
+
+      - name: Cut the release from the changelog section
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # The section for this version only, so the release notes and the changelog
+          # cannot drift apart by being written twice.
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" {inside=1; next}
+            inside && /^## \[/ {exit}
+            inside {print}
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "::error::no changelog section for ${version}"; exit 1; }
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file notes.md
