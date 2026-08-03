@@ -1636,6 +1636,51 @@ def test_manage_py_check_warns_when_the_two_body_limits_disagree() -> None:
         ]
 
 
+@pytest.mark.parametrize("bad", ["not-a-number", None, [8192]], ids=["text", "none", "list"])
+def test_a_body_limit_that_is_not_a_number_does_not_crash_the_check(bad: Any) -> None:
+    """The check runs inside ``manage.py check`` and therefore inside ``manage.py
+    migrate``, which declares ``requires_system_checks = "__all__"``. An unguarded
+    ``int()`` on a settings value turns a typo into a traceback out of the deploy command -
+    the exact blast radius this module's docstring argues a warning-only check must never
+    have. Its two sibling checks each type-check and return an ``Error``; this one did not.
+    """
+    from signledger.contrib.django.apps import check_body_capture_limits
+
+    with audited(CAPTURE_BODY=True, MAX_BODY_BYTES=bad), override_settings(
+        DATA_UPLOAD_MAX_MEMORY_SIZE=1024
+    ):
+        results = check_body_capture_limits(None)
+
+    assert [result.id for result in results] == ["signledger_django.E006"]
+
+
+def test_a_django_limit_that_is_not_a_number_does_not_crash_the_check() -> None:
+    """The same hazard from the other side: DATA_UPLOAD_MAX_MEMORY_SIZE is a Django
+    setting this app does not own, so it cannot assume the shape of it either."""
+    from signledger.contrib.django.apps import check_body_capture_limits
+
+    with audited(CAPTURE_BODY=True, MAX_BODY_BYTES=8192), override_settings(
+        DATA_UPLOAD_MAX_MEMORY_SIZE="unlimited"
+    ):
+        results = check_body_capture_limits(None)
+
+    assert [result.id for result in results] == ["signledger_django.E006"]
+
+
+def test_a_refused_body_limit_names_the_setting_but_never_its_value() -> None:
+    """Contract section 10: a settings value can carry a credential, so a check reports
+    which setting is wrong and never what was in it."""
+    from signledger.contrib.django.apps import check_body_capture_limits
+
+    with audited(CAPTURE_BODY=True, MAX_BODY_BYTES="s3cr3t-looking-typo"), override_settings(
+        DATA_UPLOAD_MAX_MEMORY_SIZE=1024
+    ):
+        message = check_body_capture_limits(None)[0]
+
+    assert "MAX_BODY_BYTES" in message.msg
+    assert "s3cr3t-looking-typo" not in message.msg + (message.hint or "")
+
+
 def test_the_body_limit_warning_names_both_numbers_to_reconcile() -> None:
     from signledger.contrib.django.apps import check_body_capture_limits
 

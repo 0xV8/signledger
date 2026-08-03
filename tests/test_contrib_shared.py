@@ -12,6 +12,8 @@ web framework:
   silently un-audited ``/healthz-admin-secret``.
 """
 
+import contextlib
+
 import pytest
 
 from signledger.contrib import (
@@ -21,6 +23,7 @@ from signledger.contrib import (
     KIND_REQUEST,
     OUTCOME_COMPLETE,
     OUTCOME_INCOMPLETE,
+    SettlingBody,
     build_audit_record,
     is_skipped,
     will_send_body,
@@ -156,3 +159,61 @@ def test_no_prefixes_skips_nothing():
 
 def test_any_one_matching_prefix_is_enough():
     assert is_skipped("/metrics", ("/health", "/metrics")) is True
+
+
+# --------------------------------------------------------------------------------------
+# settling a body whose own close() misbehaves
+# --------------------------------------------------------------------------------------
+
+
+class RaisingClose:
+    """A body that yields fine and then fails on the way out.
+
+    Not hypothetical: a generator wrapping a file, a socket or a cursor raises from
+    ``close()`` whenever the flush behind it fails, which is exactly the moment an audit
+    trail most wants a record.
+    """
+
+    def __iter__(self):
+        yield b"chunk"
+
+    def close(self):
+        raise OSError("disk full on flush")
+
+
+def test_a_body_whose_close_raises_is_still_settled():
+    """``close()`` marked itself settled, then closed the wrapped body, and only then
+    wrote the entry. A raising ``close()`` therefore skipped the write while leaving the
+    guard set - so nothing wrote the settlement and the finalizer that exists to catch
+    exactly that saw the flag and did nothing. The provisional entry stayed a promise
+    forever, which is the defect the settlement mechanism exists to remove."""
+    settled = []
+    body = SettlingBody(RaisingClose(), lambda complete, error: settled.append((complete, error)))
+    list(body)
+
+    with pytest.raises(OSError):
+        body.close()
+
+    assert settled == [(True, None)]
+
+
+def test_a_body_whose_close_raises_still_settles_only_once():
+    """The guard has to survive the fix: a server that closes twice must not get two."""
+    settled = []
+    body = SettlingBody(RaisingClose(), lambda complete, error: settled.append((complete, error)))
+    list(body)
+
+    with contextlib.suppress(OSError):
+        body.close()
+    body.close()
+
+    assert len(settled) == 1
+
+
+def test_the_failure_from_a_bodys_close_still_reaches_the_server():
+    """Settling must not swallow it - the server needs to know the response died."""
+    body = SettlingBody(RaisingClose(), lambda complete, error: None)
+    list(body)
+
+    with pytest.raises(OSError, match="disk full"):
+        body.close()

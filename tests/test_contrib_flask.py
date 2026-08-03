@@ -564,10 +564,15 @@ def firehose_app(ledger: Ledger) -> Flask:
 def reset_mid_stream(port: int, path: str) -> None:
     """Read one buffer's worth of the body and then reset the connection.
 
-    ``SO_LINGER`` with a zero timeout is the whole point: it makes ``close()`` send an
-    RST rather than a FIN, and only the RST makes werkzeug's drain raise. A polite FIN
-    leaves the read channel drainable, the drain returns, and ``close()`` is reached as
-    normal - so a test that merely closed the socket would prove nothing.
+    ``SO_LINGER`` with a zero timeout makes ``close()`` send an RST rather than a FIN,
+    which is what a client that crashes, is killed, or has its connection dropped by a
+    middlebox actually does. That is the abort worth pinning.
+
+    What is *not* claimed here: that the RST is what makes the difference. An earlier
+    version of this docstring asserted that a polite FIN would leave the drain able to
+    return and ``close()`` reached as normal. Measured, werkzeug reaches
+    ``application_iter.close()`` in neither case, so the RST is chosen for being realistic
+    rather than for being uniquely severe.
     """
     request_line = f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
     sock = socket.create_connection(("127.0.0.1", port), timeout=10)
@@ -1256,3 +1261,55 @@ def test_a_propagated_failure_is_audited_exactly_once(ledger: Ledger) -> None:
     app.test_client().get("/boom")
 
     assert len(entries(ledger)) == 1
+
+
+def test_an_application_route_under_the_console_prefix_is_still_audited(
+    ledger: Ledger,
+) -> None:
+    """The console exclusion must exclude the *console*, not everything under its path.
+
+    Excluding by path prefix silently un-audits any application route that happens to
+    live under the mount point - and quietly dropping trail is a worse defect than the
+    double-write this exclusion replaced. The FastAPI sibling was rejected for exactly
+    this over-reach.
+    """
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+    app.register_blueprint(audit_blueprint(ledger, authenticator=lambda request: True))
+
+    @app.get("/_audit/export")
+    def export() -> Dict[str, Any]:
+        return {"secret": True}
+
+    before = ledger.count()
+    assert app.test_client().get("/_audit/export").status_code == 200
+
+    assert ledger.count() == before + 1
+
+
+def test_the_console_itself_is_still_excluded(ledger: Ledger) -> None:
+    """The control: fixing the over-reach must not reinstate the self-auditing."""
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+    app.register_blueprint(audit_blueprint(ledger, authenticator=lambda request: True))
+
+    before = ledger.count()
+    assert app.test_client().get("/_audit/status").status_code == 200
+
+    assert ledger.count() == before
+
+
+def test_an_unrouted_probe_under_the_console_prefix_is_still_excluded(
+    ledger: Ledger,
+) -> None:
+    """The credential-free probe: no route matches, so nothing can identify it as the
+    console except its path. It must stay excluded, which is why the fix cannot simply
+    drop prefix matching altogether."""
+    app = Flask(__name__)
+    SignLedgerAudit(app, ledger=ledger)
+    app.register_blueprint(audit_blueprint(ledger, authenticator=lambda request: True))
+
+    before = ledger.count()
+    assert app.test_client().get("/_audit/bogus").status_code == 404
+
+    assert ledger.count() == before

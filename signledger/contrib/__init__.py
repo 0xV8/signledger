@@ -61,12 +61,21 @@ __all__ = [
 class SettlingBody:
     """A streamed response body that reports how it ended.
 
-    Shared, because the moment a streamed response's outcome becomes knowable is the same
-    moment in both server models: WSGI requires ``close()`` "upon completion of the current
-    request, whether the request was completed normally or terminated early due to an
-    application error", and Django registers the same call through ``_resource_closers``.
-    That call happens after the framework has torn the request down, so everything the
-    settlement needs is captured in the closure and nothing here touches request state.
+    Shared by the two **synchronous** server models, where the moment a streamed
+    response's outcome becomes knowable is the same: WSGI requires ``close()`` "upon
+    completion of the current request, whether the request was completed normally or
+    terminated early due to an application error", and Django registers the same call
+    through ``_resource_closers``. That call happens after the framework has torn the
+    request down, so everything the settlement needs is captured in the closure and
+    nothing here touches request state.
+
+    It is **not** the whole story, and this docstring used to say it was. An async
+    ``StreamingHttpResponse`` is driven by ``__aiter__`` and never reaches this class -
+    worse, merely being iterable was enough to make Django classify the response as
+    synchronous, after which ASGI served zero body bytes. See ``AsyncSettlingBody`` in
+    :mod:`signledger.contrib.django.middleware` for the counterpart, and note that neither
+    server model calls ``close()`` reliably when a client aborts mid-stream; Flask's
+    integration carries a finalizer for that, documented as the backstop it is.
 
     Wrapping the body rather than using a close callback is deliberate: a callback cannot
     tell a body that finished from one that died.
@@ -103,11 +112,23 @@ class SettlingBody:
             return
         self._settled = True
         close = getattr(self._body, "close", None)
-        if close is not None:
-            # A generator holds a file handle open until it is closed. Wrapping a body
-            # must not be what leaks it.
-            close()
-        self._settle(self._complete, self._error)
+        try:
+            if close is not None:
+                # A generator holds a file handle open until it is closed. Wrapping a body
+                # must not be what leaks it.
+                close()
+        finally:
+            # In a ``finally``, because the wrapped body's own ``close()`` can raise - a
+            # generator over a file, a socket or a cursor raises whenever the flush behind
+            # it fails, which is precisely the moment an audit trail most wants a record.
+            # This used to sit after the close call, so that exception skipped the write
+            # while ``_settled`` above had already been set: nothing wrote the settlement,
+            # and the finalizer that exists to catch exactly this saw the flag and did
+            # nothing. The entry stayed a promise forever.
+            #
+            # The exception is not swallowed - it propagates to the server once the record
+            # is safe, because the server does need to know the response died.
+            self._settle(self._complete, self._error)
 
 
 def will_send_body(method: str, status: int) -> bool:
