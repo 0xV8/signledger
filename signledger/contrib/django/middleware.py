@@ -127,7 +127,19 @@ class AsyncSettlingBody:
         complete = False
         error: Optional[str] = None
         try:
-            async for chunk in self._body:
+            # ``no branch``, and it is a measurement workaround rather than a claim. The
+            # loop's normal exit is real, reachable and tested - a completed async stream
+            # settles ``outcome="complete"``, and that test passes on every supported
+            # version. On 3.10 and above coverage.py records the arc and it reads as
+            # covered; on 3.9 it does not record it for an ``async for`` inside an async
+            # generator, so the same commit measured 100% locally and 99.98% on the 3.9
+            # job alone. Restructuring does not move it: hoisting the assignment into an
+            # ``else`` clause simply relocated the unrecorded arc.
+            #
+            # The cost is that this one arc stops being measured on the versions that
+            # could measure it. That is preferred over the alternative of lowering
+            # ``fail_under``, which would blind the gate everywhere to buy the same line.
+            async for chunk in self._body:  # pragma: no branch
                 yield chunk
             complete = True
         except Exception as err:
