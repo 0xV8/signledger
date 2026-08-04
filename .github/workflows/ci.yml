@@ -120,11 +120,13 @@ jobs:
           # A skipped test and a passing one are indistinguishable in a summary line, which
           # is how that went unnoticed.
           #
-          # `wheel` because the sdist tests build with `--no-isolation`, so the
-          # [build-system] requires must already be present - a modern venv does not
-          # install wheel, and without it those tests fail with "Missing dependencies:
-          # wheel" rather than skipping.
-          pip install -e '.[all,test]' build uv wheel
+          # `setuptools` and `wheel` because the sdist tests build with `--no-isolation`,
+          # so everything in [build-system] requires must already be present. Neither is
+          # guaranteed: a venv has not shipped `wheel` for years, and 3.12 dropped
+          # `setuptools` from ensurepip - which is why enabling these tests failed on
+          # exactly 3.12, 3.13 and 3.14 and passed below them. The bound is copied from
+          # [build-system] so the suite builds with the version the project declares.
+          pip install -e '.[all,test]' build uv wheel 'setuptools>=77,<84'
 
       - name: Assert both databases are reachable
         # A skipped database test looks identical to a passing one in the summary
