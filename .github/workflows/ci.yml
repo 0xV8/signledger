@@ -4,7 +4,12 @@ on:
   push:
     # Release branches run the full matrix before anything reaches main. Everything in
     # this project's history argues for finding out on a runner rather than from a user.
-    branches: [main, "rebuild/**"]
+    #
+    # `release/**` is listed because it was not, and the sentence above was false for the
+    # branch it most needed to be true of: pushing release/v2.0.0 started no run at all.
+    # A trigger list is a claim about what gets tested, and this one had drifted from the
+    # comment describing it.
+    branches: [main, "rebuild/**", "release/**"]
   pull_request:
   workflow_dispatch:
   schedule:
