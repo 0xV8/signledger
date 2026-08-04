@@ -8,8 +8,8 @@ Date: 2026-08-02
 
 An evidence-based audit of `rebuild/v2.0.0` reproduced ~40 defects by execution, across
 security, the three framework integrations, the quality gates and release mechanics. Every
-finding below was proved by running it and then independently re-run by a second agent
-instructed to refute it. Findings that did not survive refutation are recorded in
+finding below was proved by running it, and then independently re-run by a second pass
+whose brief was to refute it. Findings that did not survive refutation are recorded in
 "Refuted" so nobody spends time on them again.
 
 This repo has a documented history of shipping claims that were never true. Accordingly:

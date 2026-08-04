@@ -166,6 +166,36 @@ number would have left `pip install signledger` serving the withdrawn release.
 
 ### Fixed
 
+#### Compatibility across the supported matrix
+
+Every item here was found by CI rather than locally, and each was the same shape:
+something true in one environment and assumed universal. They are listed first
+because they are the ones a consumer on a different Python or a different FastAPI
+would have hit.
+
+- **The FastAPI inspection console stopped excluding itself on FastAPI 0.141.**
+  The exclusion found its own mount by scanning `app.routes` for a stamped
+  endpoint, which assumes `include_router` copies an included router's routes up
+  into the application's table. FastAPI 0.141 with Starlette 1.3 leaves a wrapper
+  object holding them instead, so the scan found no console, concluded there was
+  none, and audited every unrouted probe against it — which is the defect the
+  exclusion exists to prevent. The mount is now resolved through `url_path_for`,
+  public API that both generations support, and the three inspection routes carry
+  namespaced names so an application route called `status` cannot move the
+  console's apparent mount. Verified against Starlette 0.52/FastAPI 0.135 and
+  Starlette 1.3/FastAPI 0.141.
+- **`uvicorn` was imported by the test suite and declared by nothing.** It passed
+  wherever it happened to be installed and failed collection on all six supported
+  Python versions and all three operating systems at once. It is now a declared
+  `test` dependency.
+- **The coverage gate failed on Python 3.9 for a branch 3.9 cannot measure.**
+  coverage.py does not record the normal-exit arc of an `async for` inside an
+  async generator on 3.9, so the same commit measured 100% on 3.11 and 99.98%
+  there. The behaviour is reachable and tested on every version; the arc carries a
+  narrow `no branch` pragma documented as the measurement workaround it is, rather
+  than lowering the gate.
+
+
 Found by building four real consumer projects — a Flask service, a FastAPI
 service, a Django project and a plain/CLI project — installing the published
 wheel into each, and driving them with real traffic. Everything below was
@@ -327,5 +357,6 @@ while its README claimed "100% test coverage".
 
 Do not use. See [SECURITY.md](SECURITY.md).
 
+[unreleased]: https://github.com/0xV8/signledger/compare/v2.0.0...HEAD
 [2.0.0]: https://github.com/0xV8/signledger/releases/tag/v2.0.0
 [1.0.0]: https://github.com/0xV8/signledger/releases/tag/v1.0.0
