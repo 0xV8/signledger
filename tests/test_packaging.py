@@ -461,12 +461,28 @@ print("OK" if report.ok and report.entries_verified == 5 else "BROKEN")
         assert result.stdout.strip().endswith("OK")
 
 
+def _toml() -> Any:
+    """The TOML reader, from the stdlib or the backport.
+
+    ``tomllib`` is stdlib only from 3.11, and these assertions used
+    ``importorskip("tomllib")`` - so on 3.9 and 3.10, two of the six versions CI covers,
+    ten checks of this package's own metadata silently did not run. ``tomli`` is the same
+    parser under its pre-stdlib name and is declared in the test extra for those versions,
+    so the reader is resolved rather than skipped over.
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python < 3.11
+        import tomli as tomllib  # type: ignore[no-redef]
+    return tomllib
+
+
 class TestPackageMetadata:
     """The declared package list must describe the tree that actually exists."""
 
     def test_the_declared_package_list_matches_the_directories_on_disk(self) -> None:
         """An omitted entry silently drops a subpackage from every wheel ever built."""
-        tomllib = pytest.importorskip("tomllib")
+        tomllib = _toml()
         config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
         declared = set(config["tool"]["setuptools"]["packages"])
         on_disk = {
@@ -477,7 +493,7 @@ class TestPackageMetadata:
         assert declared == on_disk
 
     def test_the_console_script_target_is_importable_and_callable(self) -> None:
-        tomllib = pytest.importorskip("tomllib")
+        tomllib = _toml()
         config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
         target = config["project"]["scripts"]["signledger"]
         module_name, _, attribute = target.partition(":")
@@ -509,7 +525,7 @@ class TestPackageMetadata:
 
 
 def _pyproject() -> Dict[str, Any]:
-    tomllib = pytest.importorskip("tomllib")
+    tomllib = _toml()
     config: Dict[str, Any] = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
     return config
 

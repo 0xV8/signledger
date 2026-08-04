@@ -112,7 +112,19 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e '.[all,test]'
+          # `build` and `uv` are test *inputs*, not dev conveniences, and leaving them out
+          # silently disabled 63 tests on every run of this job: 19 that unpack and verify
+          # the sdist, and 44 TestDependencyFloors cases that resolve each declared bound
+          # at its exact minimum. pyproject.toml says of those bounds that they are
+          # "measured ... on every run" - which was false in the only place it is checked.
+          # A skipped test and a passing one are indistinguishable in a summary line, which
+          # is how that went unnoticed.
+          #
+          # `wheel` because the sdist tests build with `--no-isolation`, so the
+          # [build-system] requires must already be present - a modern venv does not
+          # install wheel, and without it those tests fail with "Missing dependencies:
+          # wheel" rather than skipping.
+          pip install -e '.[all,test]' build uv wheel
 
       - name: Assert both databases are reachable
         # A skipped database test looks identical to a passing one in the summary
@@ -128,7 +140,60 @@ jobs:
           PY
 
       - name: Test with 100% line and branch coverage
-        run: pytest --cov=signledger --cov-branch --cov-report=term-missing
+        run: |
+          set -o pipefail
+          pytest --cov=signledger --cov-branch --cov-report=term-missing -rs 2>&1 \
+            | tee run.log
+
+      - name: Assert nothing skipped itself for a reason we did not choose
+        run: |
+          set -o pipefail
+          # A skipped test and a passing one are indistinguishable in a summary line, and
+          # this job was quietly running 63 fewer tests than it looked like: 44
+          # dependency-floor cases wanted `uv`, 19 sdist cases wanted `build`, and each
+          # excused itself. pyproject.toml meanwhile said those bounds were "measured ...
+          # on every run".
+          #
+          # So the permitted reasons are enumerated and anything else fails the build. The
+          # list is deliberately short: an unavoidable skip belongs here with its reason
+          # written out, and a skip caused by a missing tool belongs fixed.
+          python - <<'PY'
+          import re, sys, pathlib
+
+          log = pathlib.Path("run.log").read_text(errors="replace")
+          log = re.sub(r"\x1b\[[0-9;]*m", "", log)
+
+          # What pytest itself reported, so the parser below can be checked against it.
+          summary = re.findall(r"(\d+) skipped", log)
+          declared = int(summary[-1]) if summary else 0
+
+          seen = re.findall(r"^SKIPPED \[(\d+)\] \S+: (.*)$", log, re.MULTILINE)
+          counted = sum(int(n) for n, _ in seen)
+
+          allowed = (
+              "this scenario sends no body",
+              "this scenario promises nothing",
+          )
+
+          print(f"pytest reported {declared} skipped; parsed {counted} across {len(seen)} reasons")
+          for n, reason in seen:
+              print(f"  [{n}] {reason}")
+
+          # A guard that silently matches nothing is the failure mode this whole file keeps
+          # having, so the parse is reconciled against pytest's own number first.
+          if counted != declared:
+              print(f"::error::could not account for every skip - pytest said {declared}, "
+                    f"these patterns found {counted}. Fix the guard, not the number.")
+              sys.exit(1)
+
+          unlisted = [r for _, r in seen if not any(r.startswith(a) for a in allowed)]
+          if unlisted:
+              for reason in unlisted:
+                  print(f"::error::a test skipped for an unlisted reason: {reason}")
+              sys.exit(1)
+
+          print("only the intentional parity skips occurred")
+          PY
 
       - name: Assert no database test was skipped
         run: |
