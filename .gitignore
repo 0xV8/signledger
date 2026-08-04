@@ -141,3 +141,9 @@ test_*.db
 # ledger.db-shm and ledger.db-wal ended up untracked-but-visible in the tree.
 *.db-shm
 *.db-wal
+
+# Local tooling state. Nothing here belongs to the project, and this repository is
+# public: assistant/editor scratch directories carry local settings, transient
+# worktrees and session notes. It has never been committed - this line is so that
+# staying uncommitted does not depend on nobody ever running `git add -A`.
+.claude/
