@@ -706,21 +706,30 @@ def _inspection_mounts(app: Any) -> List[str]:
     if resolver is None:
         return mounts
     for relative, name in _AUDIT_ROUTE_NAMES.items():
-        try:
-            path = str(resolver(name))
-        except Exception:  # noqa: BLE001, S112 - see below
-            # ``NoMatchFound`` in Starlette, but the type is not worth binding to: any
-            # failure to resolve means this application has no console mounted under that
-            # name, which is the same answer. Nothing is logged because nothing is wrong -
-            # an application without an audit console is the ordinary case, and this runs
-            # on every request.
-            continue
-        # ``removesuffix`` rather than an ``endswith`` guard: the name resolved is one of
-        # this module's own, so the path it returns ends with that route's own relative
-        # path by construction, and a branch no input can reach is a line no test can
-        # justify. Added in 3.9, which is this package's floor.
-        mounts.append(path.removesuffix(relative))
+        path = _resolved_path(resolver, name)
+        if path is not None:
+            # ``removesuffix`` rather than an ``endswith`` guard: the name resolved is one
+            # of this module's own, so the path it returns ends with that route's own
+            # relative path by construction, and a branch no input can reach is a line no
+            # test can justify. Added in 3.9, which is this package's floor.
+            mounts.append(path.removesuffix(relative))
     return mounts
+
+
+def _resolved_path(resolver: Any, name: str) -> Optional[str]:
+    """The path ``name`` is mounted at, or ``None`` if this application has no such route.
+
+    Its own function so the failure is an early ``return`` rather than a ``continue``
+    inside a ``try``, which both ruff and bandit flag as a swallowed error - fairly, in
+    general. Here there is nothing to swallow: Starlette raises ``NoMatchFound`` when no
+    route carries the name, and an application with no audit console is the ordinary case,
+    not a fault. The type is deliberately not bound: any failure to resolve means the same
+    thing, and this runs on every request.
+    """
+    try:
+        return str(resolver(name))
+    except Exception:  # noqa: BLE001 - absence is the answer, not an error
+        return None
 
 
 def _claimed_by_application(app: Any, scope: Dict[str, Any]) -> bool:
@@ -730,15 +739,18 @@ def _claimed_by_application(app: Any, scope: Dict[str, Any]) -> bool:
     as a probe only when the application really has nothing there. ``Match.PARTIAL``
     counts: a ``405`` from an application route is the application answering, and belongs
     in the trail.
+
+    The audit router's own routes are deliberately *not* filtered out of this scan. They
+    used to be, and the skip was dead weight twice over: this runs only after the endpoint
+    stamp has already said no audit route answered, so the request reaching here matched
+    nothing, and a route that matched nothing cannot match here either. It was also the one
+    line whose coverage depended on which FastAPI happened to be installed - the old one
+    copied an included router's routes up into ``app.routes`` where the skip would fire,
+    the new one leaves them inside a wrapper where it never could.
     """
-    for route in getattr(app, "routes", ()):
-        if _audit_relative_path(getattr(route, "endpoint", None)) is not None:
-            continue
-        # ``route.matches`` unguarded: it is declared on ``BaseRoute``, so everything in a
-        # route table has it, and guarding for its absence was another unreachable branch.
-        if route.matches(scope)[0] != Match.NONE:
-            return True
-    return False
+    return any(
+        route.matches(scope)[0] != Match.NONE for route in getattr(app, "routes", ())
+    )
 
 
 def _audit_relative_path(endpoint: Any) -> Optional[str]:
