@@ -17,7 +17,10 @@ requires-python = ">=3.9"
 # with a stated removal date of 2027-Feb-18.
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "Vipin Kumar", email = "vipin@buffercode.in" }]
+# Name only, no address. PEP 621 permits it, and this metadata is rendered on a public
+# package page and shipped inside every artifact - a mailbox published there is scraped,
+# and the project's contact route is the repository's issue tracker and SECURITY.md.
+authors = [{ name = "0xV8" }]
 keywords = ["audit", "logging", "immutable", "ledger", "tamper-evident", "cryptography", "compliance"]
 classifiers = [
     # 1.0.0 is on PyPI declaring `5 - Production/Stable`. Shipping 2.0.0 as Beta would be
