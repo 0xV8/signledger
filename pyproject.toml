@@ -112,6 +112,19 @@ test = [
     # cosmetic: httpx2 itself requires Python >= 3.10, and on 3.9 the fastapi extra
     # resolves to starlette 0.49, which still wants plain httpx.
     'httpx2>=2.9; python_version >= "3.10"',
+    # tests/test_contrib_parity.py drives a real uvicorn on a real socket, because the
+    # moment a streamed response's outcome becomes knowable is the moment the server
+    # closes the body, and no in-process test client ever does. It was imported without
+    # being declared, which passed on a laptop that happened to have it and failed
+    # collection on all six Python versions and all three operating systems at once - the
+    # same undeclared-ambient-state defect this package keeps being bitten by.
+    #
+    # The floor is honest about what it is. Measured: 0.20.0, 0.25.0 and 0.29.0 all serve
+    # a request from a Server run in a non-main thread, which is the only uvicorn
+    # behaviour this suite depends on, so the floor is NOT the bisected API minimum. It is
+    # set here for Python coverage instead - the matrix runs to 3.14, and a floor old
+    # enough to predate that is a floor no CI job would ever install.
+    "uvicorn>=0.29.0",
 ]
 dev = [
     "mutmut>=3.0",
