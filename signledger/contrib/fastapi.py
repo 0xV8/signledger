@@ -265,6 +265,26 @@ _AUDIT_FAILED_BODY = b'{"detail":"audit write failed"}'
 #: stamp independently.
 _AUDIT_ROUTE_PATH = "__signledger_audit_path__"
 
+#: Route names for the inspection endpoints, and the router-relative paths they answer on.
+#:
+#: Named explicitly, and namespaced, for two reasons. ``url_path_for`` is how the mount is
+#: discovered, and it is a *name* lookup - the default names would have been ``status``,
+#: ``verify`` and ``entries``, which an application is entirely free to use for its own
+#: routes, and the first one to do so would have moved the console's apparent mount.
+#:
+#: It is public Starlette API rather than a walk of the route table, which is what the
+#: first version did. That walk assumed ``include_router`` copies routes up into
+#: ``app.routes``; FastAPI 0.141 with Starlette 1.3 leaves a wrapper object holding them
+#: instead, so the walk found no console, concluded there was none, and audited every
+#: unrouted probe. It passed locally against an older resolve and failed on five Python
+#: versions at once. ``url_path_for`` answers the same question through an interface both
+#: generations support, and reports the mounted path with any prefix already applied.
+_AUDIT_ROUTE_NAMES: Dict[str, str] = {
+    "/status": "signledger_audit_status",
+    "/verify": "signledger_audit_verify",
+    "/entries": "signledger_audit_entries",
+}
+
 #: The request the current task is serving, for :func:`audited` to correlate against.
 #: Set by the middleware; ``None`` in a decorated call that no request reached.
 _REQUEST: "contextvars.ContextVar[Optional[Dict[str, Any]]]" = contextvars.ContextVar(
@@ -682,12 +702,24 @@ def _inspection_mounts(app: Any) -> List[str]:
     middleware holds another middleware, which has no routes and is not the application.
     """
     mounts: List[str] = []
-    for route in getattr(app, "routes", ()):
-        relative = _audit_relative_path(getattr(route, "endpoint", None))
-        path: str = getattr(route, "path", "")
-        if relative is None or not path.endswith(relative):
+    resolver = getattr(app, "url_path_for", None)
+    if resolver is None:
+        return mounts
+    for relative, name in _AUDIT_ROUTE_NAMES.items():
+        try:
+            path = str(resolver(name))
+        except Exception:  # noqa: BLE001, S112 - see below
+            # ``NoMatchFound`` in Starlette, but the type is not worth binding to: any
+            # failure to resolve means this application has no console mounted under that
+            # name, which is the same answer. Nothing is logged because nothing is wrong -
+            # an application without an audit console is the ordinary case, and this runs
+            # on every request.
             continue
-        mounts.append(path[: len(path) - len(relative)])
+        # ``removesuffix`` rather than an ``endswith`` guard: the name resolved is one of
+        # this module's own, so the path it returns ends with that route's own relative
+        # path by construction, and a branch no input can reach is a line no test can
+        # justify. Added in 3.9, which is this package's floor.
+        mounts.append(path.removesuffix(relative))
     return mounts
 
 
@@ -702,6 +734,8 @@ def _claimed_by_application(app: Any, scope: Dict[str, Any]) -> bool:
     for route in getattr(app, "routes", ()):
         if _audit_relative_path(getattr(route, "endpoint", None)) is not None:
             continue
+        # ``route.matches`` unguarded: it is declared on ``BaseRoute``, so everything in a
+        # route table has it, and guarding for its absence was another unreachable branch.
         if route.matches(scope)[0] != Match.NONE:
             return True
     return False
@@ -778,7 +812,7 @@ def audit_router(
 
     router = APIRouter(prefix=prefix, dependencies=[Depends(guard)])
 
-    @router.get("/status")
+    @router.get("/status", name=_AUDIT_ROUTE_NAMES["/status"])
     def status() -> Dict[str, Any]:
         """Cheap counters. Deliberately does not verify - see ``/verify``."""
         snapshot: Dict[str, Any] = ledger.get_stats_snapshot()
@@ -790,7 +824,7 @@ def audit_router(
         )
         return snapshot
 
-    @router.get("/verify")
+    @router.get("/verify", name=_AUDIT_ROUTE_NAMES["/verify"])
     def verify() -> Dict[str, Any]:
         """Run a real verification. O(n) in the ledger, hence its own route.
 
@@ -805,7 +839,7 @@ def audit_router(
             "failures": [failure.message for failure in report.failures],
         }
 
-    @router.get("/entries")
+    @router.get("/entries", name=_AUDIT_ROUTE_NAMES["/entries"])
     def entries(
         limit: int = Query(default=max_page_size, ge=1),
         offset: int = Query(default=0, ge=0),
