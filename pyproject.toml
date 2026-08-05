@@ -15,8 +15,16 @@ readme = "README.md"
 requires-python = ">=3.9"
 # PEP 639. The TOML-table spelling and the License classifier below are both deprecated
 # with a stated removal date of 2027-Feb-18.
-license = "MIT"
-license-files = ["LICENSE"]
+#
+# Apache-2.0 rather than MIT for three things MIT does not give, each of which matters for
+# a library whose product is evidence: an explicit patent grant from the author to users,
+# a NOTICE file that redistributors are obliged to reproduce (section 4(d)), and a
+# requirement that modified files carry prominent notice of the change.
+#
+# NOTICE is listed here as well as LICENSE, because a NOTICE that does not travel inside
+# the artifact imposes nothing on anyone who only ever sees the wheel.
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 # Name only, no address. PEP 621 permits it, and this metadata is rendered on a public
 # package page and shipped inside every artifact - a mailbox published there is scraped,
 # and the project's contact route is the repository's issue tracker and SECURITY.md.

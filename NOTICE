@@ -1,0 +1,36 @@
+SignLedger
+Copyright 2025-2026 0xV8
+
+This product includes software developed by the SignLedger project
+(https://github.com/0xV8/signledger).
+
+Licensed under the Apache License, Version 2.0. You may obtain a copy of the
+License in the LICENSE file distributed with this work, or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+------------------------------------------------------------------------------
+Why this file exists, and what you have to do with it
+------------------------------------------------------------------------------
+
+Section 4(d) of the License: if you redistribute this software, in source or
+binary form, and it carries a NOTICE file, then your redistribution must include
+a readable copy of the attribution notices in it. That obligation is the reason
+this file is short. Everything above is what a redistributor has to carry; adding
+anything else here would make their obligation larger, not this project's
+attribution stronger.
+
+You may add your own attribution notices alongside these, as long as they cannot
+be read as modifying the License.
+
+------------------------------------------------------------------------------
+Third-party dependencies
+------------------------------------------------------------------------------
+
+None are vendored. No third-party code is copied into this repository or into the
+built artifacts, so nothing else needs reproducing here.
+
+The runtime requirement is `pydantic`. Optional extras pull in `cryptography`,
+`psycopg`, `pymongo`, `flask`, `fastapi` and `django`. Each is installed by the
+package manager under its own licence and is not redistributed by this project,
+so their notices travel with them rather than with this file.

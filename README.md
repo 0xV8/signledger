@@ -821,4 +821,9 @@ full account of what was wrong with 1.0.0 are in [CHANGELOG.md](https://github.c
 
 ## License
 
-MIT
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Attribution is a condition, not a courtesy: redistributing this software in source or
+binary form obliges you to carry the notices in `NOTICE` (section 4(d)), and to mark any
+file you modify as changed. The licence also grants you a patent licence from the author,
+and terminates it if you bring a patent claim alleging this software infringes.

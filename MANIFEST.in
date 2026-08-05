@@ -31,6 +31,7 @@
 # standard of evidence the project holds itself to.
 # ---------------------------------------------------------------------------------
 include LICENSE
+include NOTICE
 include README.md
 include CHANGELOG.md
 include SECURITY.md
