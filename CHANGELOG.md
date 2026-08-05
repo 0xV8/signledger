@@ -3,6 +3,25 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0b1] — 2026-08-05
+
+### Changed
+
+- **Relicensed to Apache-2.0** from MIT. MIT already required attribution - its notice
+  clause obliges anyone shipping this code to reproduce the copyright notice - so the
+  change is for what MIT does not give: an explicit patent grant to users and its
+  termination on a patent claim, a `NOTICE` file that redistributors must reproduce under
+  section 4(d), and a requirement that modified files be marked as changed. For a library
+  whose product is evidence, the last of those is the difference between someone shipping
+  a fork and someone shipping a fork that still looks like this one.
+
+  `2.0b0` was published under MIT and stays that way; PyPI does not allow a version to be
+  re-uploaded, and a licence change is not retroactive. This release supersedes it.
+
+- The copyright line read `2024 Vipin Kumar`, which predates the first commit
+  (2025-10-21) and names an identity used nowhere else in the project. It is now
+  `2025-2026 0xV8`.
+
 ## [2.0b0] — 2026-08-05
 
 A complete rebuild. **1.0.0 did not provide the tamper-evidence it documented**;
@@ -357,6 +376,7 @@ while its README claimed "100% test coverage".
 
 Do not use. See [SECURITY.md](SECURITY.md).
 
-[unreleased]: https://github.com/0xV8/signledger/compare/v2.0b0...HEAD
+[unreleased]: https://github.com/0xV8/signledger/compare/v2.0b1...HEAD
+[2.0b1]: https://github.com/0xV8/signledger/releases/tag/v2.0b1
 [2.0b0]: https://github.com/0xV8/signledger/releases/tag/v2.0b0
 [1.0.0]: https://github.com/0xV8/signledger/releases/tag/v1.0.0

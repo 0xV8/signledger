@@ -55,7 +55,7 @@ from signledger.core.verification import (
 #: 2.0.0, not 0.2.0: 1.0.0 is published and withdrawn, and pip resolves to the highest
 #: version. Numbering the rebuild below the release it replaces would leave
 #: ``pip install signledger`` serving the broken one. It is also a full API break.
-__version__ = "2.0b0"
+__version__ = "2.0b1"
 
 __all__ = [
     "CURRENT_FORMAT_VERSION",
