@@ -3,7 +3,7 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.0.0] — unreleased
+## [2.0b0] — 2026-08-05
 
 A complete rebuild. **1.0.0 did not provide the tamper-evidence it documented**;
 see [SECURITY.md](SECURITY.md) for what to assume if you deployed it.
@@ -357,6 +357,6 @@ while its README claimed "100% test coverage".
 
 Do not use. See [SECURITY.md](SECURITY.md).
 
-[unreleased]: https://github.com/0xV8/signledger/compare/v2.0.0...HEAD
-[2.0.0]: https://github.com/0xV8/signledger/releases/tag/v2.0.0
+[unreleased]: https://github.com/0xV8/signledger/compare/v2.0b0...HEAD
+[2.0b0]: https://github.com/0xV8/signledger/releases/tag/v2.0b0
 [1.0.0]: https://github.com/0xV8/signledger/releases/tag/v1.0.0

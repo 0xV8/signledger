@@ -23,11 +23,14 @@ license-files = ["LICENSE"]
 authors = [{ name = "0xV8" }]
 keywords = ["audit", "logging", "immutable", "ledger", "tamper-evident", "cryptography", "compliance"]
 classifiers = [
-    # 1.0.0 is on PyPI declaring `5 - Production/Stable`. Shipping 2.0.0 as Beta would be
-    # a maturity DOWNGRADE that every index, resolver and corporate policy filter reads,
-    # on the release whose whole purpose is to be the trustworthy replacement for a
-    # withdrawn one.
-    "Development Status :: 5 - Production/Stable",
+    # Tracks the version rather than the ambition. 2.0b0 is a prerelease, so declaring
+    # `5 - Production/Stable` here would be the same kind of unearned claim this rebuild
+    # exists to remove - and pip treats it as a prerelease regardless.
+    #
+    # This goes back to `5 - Production/Stable` for the real 2.0.0, and that is when the
+    # argument for it applies: 1.0.0 is on PyPI declaring 5, so shipping its replacement
+    # as Beta would be a maturity DOWNGRADE every index and policy filter reads.
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Logging",
