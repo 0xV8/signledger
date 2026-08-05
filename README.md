@@ -356,14 +356,51 @@ pip install 'signledger[fastapi]'  # signledger.contrib.fastapi
 pip install 'signledger[django]'   # signledger.contrib.django
 ```
 
-Every example below is taken from a working project that was built against the published
-wheel and driven with real traffic under `gunicorn -w 4` or `uvicorn --workers 4`.
-
 One rule applies to all three: **build the `Ledger` inside your application factory, not at
 module scope.** A pre-forking server imports your module once and then forks, so a ledger
 built at import time hands every worker the same database handle. On PostgreSQL that
 corrupts the wire protocol between processes. Build it per worker, after the fork, and pass
 the same `ledger_id` to each — see [Deployment](#deployment).
+
+### The three integrations record the same thing
+
+An auditor's query must not depend on which framework served the request. That is checked
+rather than asserted: `tests/test_contrib_parity.py` drives the same scenario matrix against
+all three over **real sockets** — werkzeug for Flask, uvicorn for FastAPI, a real WSGI
+server for Django — and compares what comes out.
+
+| Scenario | Flask | FastAPI | Django |
+|---|---|---|---|
+| `200`, `404`, `405` | 1 entry, `completion="final"` | same | same |
+| view raises → `500` | 1 entry, `error` names the exception | same | same |
+| streamed body, completes | `provisional` + settlement `outcome="complete"` | same | same |
+| streamed body, raises mid-way | `provisional` + settlement `outcome="incomplete"` + `error` | same | same |
+| `HEAD` on a streaming route | 1 entry, `final` | same | same |
+| `204` | 1 entry, `final` | same | same |
+
+It asserts entry counts, `kind` and its order, that `completion` is never absent, whether
+`error` is present and what it names, the full key set of both entry kinds, `request_id`
+correlation, absence of orphan settlements and of unsettled promises, and chain integrity —
+per scenario, per framework.
+
+Where the three legitimately differ it says so by name rather than eliding it. **Request
+body capture:** FastAPI's ASGI middleware buffers only what the endpoint actually reads off
+`receive`, so a request answered *before* anything reads the body records
+`body: "[OMITTED:not-read]"` where Flask and Django hold the redacted body. The suite pins
+this on the `405` case; the same applies to anything else that answers without reading —
+an unrouted path, an auth dependency rejecting the request. It is deliberate: draining the
+stream inside the middleware would change ASGI semantics and can hang against a client that
+sends no body.
+
+Two behaviours are shared by all three and worth knowing:
+
+- **`skip_paths` matches whole path segments.** `skip_paths=("/health",)` covers `/health`
+  and `/health/live` and **not** `/healthz-admin-secret`. A bare prefix match once left a
+  real route serving real data with no entry at all.
+- **The audit console is never part of the trail it serves.** Registering the Flask
+  blueprint or the FastAPI router excludes its own mount automatically, including the
+  unauthenticated `401` an anonymous prober gets — otherwise every read of the ledger was a
+  write to it, and `/verify` grew more expensive each time it was called.
 
 ### Flask
 
@@ -557,6 +594,34 @@ index is a stale mirror, not a broken audit trail.
 
 If you repoint `LEDGER_FACTORY` at a fresh store while keeping the same `ledger_id`, the
 index rows from the old store are stale and are replaced as new entries arrive.
+
+The index carries `kind`, `completion` and `request_id` alongside the identifiers, so the
+questions v2 added are answerable through the ORM and the admin without walking the chain:
+
+```
+AuditIndex.objects.filter(completion="provisional")     # promises not yet settled
+AuditIndex.objects.filter(request_id=rid)               # a request and its settlement
+```
+
+**ASGI is supported.** Async views and `StreamingHttpResponse` with an async generator are
+audited and settled exactly as their sync counterparts are — an async stream that raises
+after its first chunk is recorded `provisional` and then settled `incomplete` with the
+exception named, not left claiming a completed `200`. The middleware declares neither
+`sync_capable` nor `async_capable`, so Django wraps it with
+`sync_to_async(thread_sensitive=True)`; that was measured not to serialise anything (four
+concurrent async views sleeping 0.3s finish in 0.31s), and a second async implementation
+would be a second place for the audit semantics to drift.
+
+One deliberate exception: **`FileResponse` is recorded `final` and not settled.** Wrapping
+it would set `file_to_stream` to `None` and take every download off the `sendfile`
+zero-copy path, and where `wsgi.file_wrapper` *is* used the server iterates the raw file and
+never enters the wrapper — so a fully delivered file would settle as `incomplete`. A body
+sent under a declared `Content-Length` shows its own truncation to the client as a short
+read, which is why Flask's `send_file` is treated the same way.
+
+`manage.py check` also warns when `SIGNLEDGER["MAX_BODY_BYTES"]` and Django's
+`DATA_UPLOAD_MAX_MEMORY_SIZE` are set so that a body would pass one and be refused by the
+other.
 
 ## What gets redacted, and what does not
 
